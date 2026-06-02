@@ -8,299 +8,258 @@ import {
   View
 } from "react-native";
 
-const COINS = [
-  { name: "Penny", us: true, valueCents: 1, color: "copper", old: false, fact: "The Lincoln penny has been minted since 1909 and is the most produced US coin." },
-  { name: "Wheat Penny", us: true, valueCents: 1, color: "copper", old: true, fact: "Wheat pennies were minted from 1909 to 1958 and are popular with collectors." },
-  { name: "Nickel", us: true, valueCents: 5, color: "silver", old: false, fact: "The Jefferson nickel has featured Monticello on the reverse since 1938." },
-  { name: "Dime", us: true, valueCents: 10, color: "silver", small: true, old: false, fact: "The dime is the smallest and thinnest US coin despite being worth more than a penny or nickel." },
-  { name: "Quarter", us: true, valueCents: 25, color: "silver", old: false, fact: "State quarters were released from 1999 to 2008, one for each US state." },
-  { name: "Half Dollar", us: true, valueCents: 50, color: "silver", old: false, fact: "The Kennedy half dollar was first issued in 1964 to honor the late president." },
-  { name: "Dollar Coin", us: true, valueCents: 100, color: "gold", old: false, fact: "US dollar coins include the Sacagawea and Presidential series." },
-  { name: "Canadian Loonie", us: false, color: "gold", old: false, fact: "Canada's dollar coin is nicknamed the 'Loonie' after the loon bird on its face." },
-  { name: "Euro Coin", us: false, color: "silver", old: false, fact: "Euro coins have a common European side and a country-specific side." },
-  { name: "British Pound Coin", us: false, color: "gold", old: false, fact: "The £1 coin has had a distinctive 12-sided shape since 2017." },
-];
 
-const QUESTIONS = [
-  {
-    text: "Is it a US coin?",
-    filter: (coin, yes) => yes ? coin.us : !coin.us
-  },
-  {
-    text: "Is it worth less than 25 cents?",
-    filter: (coin, yes) => yes
-      ? coin.valueCents != null && coin.valueCents < 25
-      : coin.valueCents == null || coin.valueCents >= 25
-  },
-  {
-    text: "Is it copper or reddish in color?",
-    filter: (coin, yes) => yes ? coin.color === "copper" : coin.color !== "copper"
-  },
-  {
-    text: "Is it an old or vintage coin (minted before 1960)?",
-    filter: (coin, yes) => yes ? coin.old === true : coin.old !== true
-  },
-  {
-    text: "Is it worth exactly 5 cents?",
-    filter: (coin, yes) => yes ? coin.valueCents === 5 : coin.valueCents !== 5
-  },
-  {
-    text: "Is it the smallest coin you have?",
-    filter: (coin, yes) => yes ? coin.small === true : !coin.small
-  },
-  {
-    text: "Is it worth exactly 25 cents?",
-    filter: (coin, yes) => yes ? coin.valueCents === 25 : coin.valueCents !== 25
-  },
-  {
-    text: "Is it worth 50 cents or more?",
-    filter: (coin, yes) => yes
-      ? coin.valueCents != null && coin.valueCents >= 50
-      : coin.valueCents == null || coin.valueCents < 50
-  },
-  {
-    text: "Is it gold or yellowish in color?",
-    filter: (coin, yes) => yes ? coin.color === "gold" : coin.color !== "gold"
-  },
-  {
-    text: "Is it from Canada?",
-    filter: (coin, yes) => yes ? coin.name.includes("Canadian") : !coin.name.includes("Canadian")
-  },
-  {
-    text: "Is it from Europe?",
-    filter: (coin, yes) => yes ? coin.name === "Euro Coin" : coin.name !== "Euro Coin"
-  },
-];
+// ─── Gold coin component ──────────────────────────────────────────────────────
 
-export default function App() {
-  const [screen, setScreen] = useState("home");
-  const [remainingCoins, setRemainingCoins] = useState(COINS);
-  const [questionIdx, setQuestionIdx] = useState(0);
-  const [history, setHistory] = useState([]);
-  const [guess, setGuess] = useState(null);
+function GoldCoin({ size = 80 }) {
+  return (
+    <View style={[styles.goldCoin, { width: size, height: size, borderRadius: size / 2 }]}>
+      <Text style={[styles.goldCoinText, { fontSize: size * 0.45 }]}>$</Text>
+    </View>
+  );
+}
 
-  function startGame() {
-    setScreen("playing");
-    setRemainingCoins(COINS);
-    setQuestionIdx(0);
-    setHistory([]);
-    setGuess(null);
-  }
+// ─── Shared header ────────────────────────────────────────────────────────────
 
-  function answer(yes) {
-    const question = QUESTIONS[questionIdx];
-    const filtered = remainingCoins.filter(coin => question.filter(coin, yes));
-    const newHistory = [...history, { q: question.text, a: yes ? "Yes" : "No" }];
-    setHistory(newHistory);
-
-    const nextIdx = questionIdx + 1;
-
-    if (filtered.length === 1 || nextIdx >= QUESTIONS.length || filtered.length === 0) {
-      setGuess(filtered.length > 0 ? filtered[0] : remainingCoins[0]);
-      setScreen("guess");
-      return;
-    }
-
-    setRemainingCoins(filtered);
-    setQuestionIdx(nextIdx);
-  }
-
-  if (screen === "home") {
-    return (
-      <SafeAreaView style={styles.safeArea}>
-        <View style={styles.center}>
-          <Text style={styles.coinIcon}>🪙</Text>
-          <Text style={styles.title}>CoinLens</Text>
-          <Text style={styles.subtitle}>Think of a coin and I'll try to guess it by asking yes or no questions!</Text>
-          <TouchableOpacity style={styles.primaryBtn} onPress={startGame}>
-            <Text style={styles.primaryBtnText}>Let's Play</Text>
+function Header({ title, onBack, onAccount, showCoin }) {
+  return (
+    <View style={styles.header}>
+      {onBack ? (
+        <TouchableOpacity onPress={onBack} style={styles.headerSide}>
+          <Text style={styles.backBtn}>‹ Back</Text>
+        </TouchableOpacity>
+      ) : (
+        <View style={styles.headerSide} />
+      )}
+      <View style={styles.headerTitleRow}>
+        {showCoin && <GoldCoin size={28} />}
+        <Text style={styles.headerTitle}>{title}</Text>
+      </View>
+      <View style={styles.headerSide}>
+        {onAccount && (
+          <TouchableOpacity onPress={onAccount} style={styles.accountBtn}>
+            <Text style={styles.accountBtnText}>👤</Text>
           </TouchableOpacity>
-        </View>
-      </SafeAreaView>
-    );
-  }
+        )}
+      </View>
+    </View>
+  );
+}
 
-  if (screen === "guess") {
-    return (
-      <SafeAreaView style={styles.safeArea}>
-        <ScrollView contentContainerStyle={styles.container}>
-          <Text style={styles.coinIcon}>🪙</Text>
-          <Text style={styles.guessLabel}>My guess is...</Text>
-          <Text style={styles.guessName}>{guess?.name}!</Text>
-          <Text style={styles.fact}>{guess?.fact}</Text>
-          <View style={styles.historyBox}>
-            {history.map((item, i) => (
-              <Text key={i} style={styles.historyItem}>
-                {item.q.replace("?", "")} → <Text style={styles.historyAnswer}>{item.a}</Text>
-              </Text>
-            ))}
-          </View>
-          <TouchableOpacity style={styles.primaryBtn} onPress={startGame}>
-            <Text style={styles.primaryBtnText}>Play Again</Text>
-          </TouchableOpacity>
-        </ScrollView>
-      </SafeAreaView>
-    );
-  }
+// ─── Screens ─────────────────────────────────────────────────────────────────
+
+function HomeScreen({ navigate }) {
+  const cards = [
+    { label: "Scan Coin", icon: "🔍", screen: "scan", desc: "Guess your coin with AI" },
+    { label: "Badges", icon: "🏅", screen: "badges", desc: "View your achievements" },
+    { label: "Leaderboard", icon: "🏆", screen: "leaderboard", desc: "See top collectors" },
+  ];
 
   return (
     <SafeAreaView style={styles.safeArea}>
-      <ScrollView contentContainerStyle={styles.container}>
-        <Text style={styles.coinIcon}>🪙</Text>
-        <Text style={styles.questionCounter}>Question {history.length + 1} of {QUESTIONS.length}</Text>
-        <View style={styles.questionCard}>
-          <Text style={styles.question}>{QUESTIONS[questionIdx].text}</Text>
-        </View>
-        <View style={styles.buttonRow}>
-          <TouchableOpacity style={styles.yesBtn} onPress={() => answer(true)}>
-            <Text style={styles.yesBtnText}>Yes</Text>
+      <Header title="CoinLens" showCoin onAccount={() => navigate("account")} />
+      <ScrollView contentContainerStyle={styles.homeContainer}>
+        <Text style={styles.homeGreeting}>What would you like to do?</Text>
+        {cards.map(card => (
+          <TouchableOpacity key={card.screen} style={styles.card} onPress={() => navigate(card.screen)}>
+            <Text style={styles.cardIcon}>{card.icon}</Text>
+            <View style={styles.cardText}>
+              <Text style={styles.cardLabel}>{card.label}</Text>
+              <Text style={styles.cardDesc}>{card.desc}</Text>
+            </View>
+            <Text style={styles.cardArrow}>›</Text>
           </TouchableOpacity>
-          <TouchableOpacity style={styles.noBtn} onPress={() => answer(false)}>
-            <Text style={styles.noBtnText}>No</Text>
-          </TouchableOpacity>
-        </View>
-        {history.length > 0 && (
-          <View style={styles.historyBox}>
-            {history.map((item, i) => (
-              <Text key={i} style={styles.historyItem}>
-                {item.q.replace("?", "")} → <Text style={styles.historyAnswer}>{item.a}</Text>
-              </Text>
-            ))}
+        ))}
+
+        <Text style={styles.sectionTitle}>Recently Scanned Coins</Text>
+        {[
+          { name: "1965 Quarter", detail: "George Washington · Silver-clad" },
+          { name: "1982 Penny", detail: "Abraham Lincoln · Zinc/Copper" },
+          { name: "2000 Sacagawea Dollar", detail: "Sacagawea · Gold-colored" },
+        ].map((coin, i) => (
+          <View key={i} style={styles.recentItem}>
+            <GoldCoin size={40} />
+            <View style={styles.recentText}>
+              <Text style={styles.recentName}>{coin.name}</Text>
+              <Text style={styles.recentDetail}>{coin.detail}</Text>
+            </View>
           </View>
-        )}
+        ))}
       </ScrollView>
     </SafeAreaView>
   );
 }
 
+
+function PlaceholderScreen({ title, icon, navigate }) {
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <Header title={title} onBack={() => navigate("home")} />
+      <View style={styles.center}>
+        <GoldCoin size={80} />
+        <Text style={styles.pageTitle}>{title}</Text>
+        <Text style={styles.pageSubtitle}>Coming soon!</Text>
+      </View>
+    </SafeAreaView>
+  );
+}
+
+function AccountScreen({ navigate }) {
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <Header title="Account" onBack={() => navigate("home")} />
+      <View style={styles.center}>
+        <View style={styles.avatarCircle}>
+          <Text style={styles.avatarText}>👤</Text>
+        </View>
+        <Text style={styles.pageTitle}>My Account</Text>
+        <Text style={styles.pageSubtitle}>Account features coming soon!</Text>
+      </View>
+    </SafeAreaView>
+  );
+}
+
+// ─── Root ─────────────────────────────────────────────────────────────────────
+
+export default function App() {
+  const [screen, setScreen] = useState("home");
+
+  function navigate(target) {
+    setScreen(target);
+  }
+
+  if (screen === "home") return <HomeScreen navigate={navigate} />;
+  if (screen === "scan") return <PlaceholderScreen title="Scan Coin" icon="🔍" navigate={navigate} />;
+  if (screen === "badges") return <PlaceholderScreen title="Badges" icon="🏅" navigate={navigate} />;
+  if (screen === "leaderboard") return <PlaceholderScreen title="Leaderboard" icon="🏆" navigate={navigate} />;
+  if (screen === "account") return <AccountScreen navigate={navigate} />;
+  return <HomeScreen navigate={navigate} />;
+}
+
+// ─── Styles ───────────────────────────────────────────────────────────────────
+
+const GOLD = "#FFD700";
+const GOLD_DIM = "rgba(255,215,0,0.15)";
+const GOLD_GLOW = {
+  shadowColor: GOLD,
+  shadowOffset: { width: 0, height: 0 },
+  shadowOpacity: 0.75,
+  shadowRadius: 12,
+  elevation: 10,
+};
+
 const styles = StyleSheet.create({
-  safeArea: {
-    flex: 1,
-    backgroundColor: "#007AFF"
+  safeArea: { flex: 1, backgroundColor: "#000" },
+  center: { flex: 1, alignItems: "center", justifyContent: "center", padding: 28 },
+  container: { padding: 24, alignItems: "center", gap: 16, paddingBottom: 40 },
+
+  // Header
+  header: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+    borderBottomWidth: 1,
+    borderBottomColor: "rgba(255,215,0,0.2)"
   },
-  center: {
-    flex: 1,
+  headerSide: { width: 72 },
+  headerTitleRow: { flexDirection: "row", alignItems: "center", gap: 8 },
+  headerTitle: { fontSize: 18, fontWeight: "700", color: GOLD, textAlign: "center" },
+  backBtn: { fontSize: 17, color: GOLD, fontWeight: "600" },
+  accountBtn: {
+    alignSelf: "flex-end",
+    backgroundColor: GOLD_DIM,
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: GOLD,
+    width: 38,
+    height: 38,
     alignItems: "center",
     justifyContent: "center",
-    padding: 28
+    ...GOLD_GLOW,
   },
-  container: {
-    padding: 24,
+  accountBtnText: { fontSize: 20 },
+
+  // Home
+  homeContainer: { padding: 24, gap: 16, paddingBottom: 40 },
+  homeGreeting: { fontSize: 22, fontWeight: "700", color: GOLD, marginBottom: 4 },
+  card: {
+    backgroundColor: "#0f0f0f",
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: "rgba(255,215,0,0.4)",
+    padding: 20,
+    flexDirection: "row",
     alignItems: "center",
     gap: 16,
-    paddingBottom: 40
+    ...GOLD_GLOW,
   },
-  coinIcon: {
-    fontSize: 80,
-    textAlign: "center"
+  cardIcon: { fontSize: 36 },
+  cardText: { flex: 1 },
+  cardLabel: { fontSize: 20, fontWeight: "700", color: GOLD },
+  cardDesc: { fontSize: 14, color: "rgba(255,215,0,0.6)", marginTop: 2 },
+  cardArrow: { fontSize: 28, color: "rgba(255,215,0,0.4)", fontWeight: "300" },
+
+  // Recently scanned
+  sectionTitle: { fontSize: 16, fontWeight: "700", color: "rgba(255,215,0,0.5)", letterSpacing: 1, marginTop: 8 },
+  recentItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 14,
+    backgroundColor: "#0f0f0f",
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "rgba(255,215,0,0.2)",
+    padding: 12,
   },
-  title: {
-    fontSize: 38,
-    fontWeight: "800",
-    color: "#fff",
-    marginTop: 8
-  },
-  subtitle: {
-    fontSize: 17,
-    color: "#cce5ff",
-    textAlign: "center",
-    marginTop: 10,
-    lineHeight: 24
-  },
+  recentText: { flex: 1 },
+  recentName: { fontSize: 16, fontWeight: "700", color: GOLD },
+  recentDetail: { fontSize: 13, color: "rgba(255,215,0,0.5)", marginTop: 2 },
+
+  // Shared
+  bigIcon: { fontSize: 80, textAlign: "center" },
+  pageTitle: { fontSize: 32, fontWeight: "800", color: GOLD, marginTop: 8 },
+  pageSubtitle: { fontSize: 17, color: "rgba(255,215,0,0.7)", textAlign: "center", marginTop: 10, lineHeight: 24 },
   primaryBtn: {
     marginTop: 28,
-    backgroundColor: "#fff",
+    backgroundColor: GOLD,
     paddingHorizontal: 48,
     paddingVertical: 16,
-    borderRadius: 32
+    borderRadius: 32,
+    ...GOLD_GLOW,
   },
-  primaryBtnText: {
-    fontSize: 18,
-    fontWeight: "700",
-    color: "#007AFF"
+  primaryBtnText: { fontSize: 18, fontWeight: "700", color: "#000" },
+
+  // Gold coin
+  goldCoin: {
+    backgroundColor: GOLD,
+    alignItems: "center",
+    justifyContent: "center",
+    shadowColor: GOLD,
+    shadowOffset: { width: 0, height: 0 },
+    shadowOpacity: 1,
+    shadowRadius: 20,
+    elevation: 16,
+    borderWidth: 3,
+    borderColor: "#FFF8DC",
   },
-  questionCounter: {
-    fontSize: 14,
-    color: "#cce5ff",
-    fontWeight: "600",
-    letterSpacing: 0.5
+  goldCoinText: {
+    fontWeight: "900",
+    color: "#7A5C00",
   },
-  questionCard: {
-    backgroundColor: "rgba(255,255,255,0.15)",
-    borderRadius: 20,
-    padding: 24,
-    width: "100%"
-  },
-  question: {
-    fontSize: 22,
-    fontWeight: "700",
-    color: "#fff",
-    textAlign: "center",
-    lineHeight: 30
-  },
-  buttonRow: {
-    flexDirection: "row",
-    gap: 14,
-    width: "100%"
-  },
-  yesBtn: {
-    flex: 1,
-    backgroundColor: "#fff",
-    paddingVertical: 18,
-    borderRadius: 18,
-    alignItems: "center"
-  },
-  yesBtnText: {
-    fontSize: 20,
-    fontWeight: "700",
-    color: "#007AFF"
-  },
-  noBtn: {
-    flex: 1,
+
+  // Account
+  avatarCircle: {
+    width: 100,
+    height: 100,
+    borderRadius: 50,
+    backgroundColor: GOLD_DIM,
     borderWidth: 2,
-    borderColor: "#fff",
-    paddingVertical: 18,
-    borderRadius: 18,
-    alignItems: "center"
+    borderColor: GOLD,
+    alignItems: "center",
+    justifyContent: "center",
+    ...GOLD_GLOW,
   },
-  noBtnText: {
-    fontSize: 20,
-    fontWeight: "700",
-    color: "#fff"
-  },
-  guessLabel: {
-    fontSize: 18,
-    color: "#cce5ff",
-    fontWeight: "600"
-  },
-  guessName: {
-    fontSize: 40,
-    fontWeight: "800",
-    color: "#fff",
-    textAlign: "center"
-  },
-  fact: {
-    fontSize: 16,
-    color: "#e0f0ff",
-    textAlign: "center",
-    fontStyle: "italic",
-    lineHeight: 24,
-    paddingHorizontal: 8
-  },
-  historyBox: {
-    width: "100%",
-    backgroundColor: "rgba(0,0,0,0.15)",
-    borderRadius: 14,
-    padding: 14,
-    gap: 6
-  },
-  historyItem: {
-    fontSize: 13,
-    color: "rgba(255,255,255,0.7)",
-    lineHeight: 20
-  },
-  historyAnswer: {
-    fontWeight: "700",
-    color: "#fff"
-  }
+  avatarText: { fontSize: 48 },
 });
