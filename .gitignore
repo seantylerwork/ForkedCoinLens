@@ -2,3 +2,5 @@ node_modules/
 .expo/
 dist/
 npm-debug.log*
+.env
+.env.local
