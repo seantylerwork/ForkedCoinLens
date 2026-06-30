@@ -84,9 +84,19 @@ function AuthScreen({ onSignIn, onSignUp }) {
   const [showAdminField, setShowAdminField] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [offerSignUp, setOfferSignUp] = useState(false);
+
+  function switchToSignUp() {
+    setTab("signup");
+    setError("");
+    setOfferSignUp(false);
+    setShowAdminField(false);
+    setAdminCode("");
+  }
 
   async function handleSubmit() {
     setError("");
+    setOfferSignUp(false);
     setLoading(true);
     try {
       if (tab === "signup") {
@@ -102,6 +112,7 @@ function AuthScreen({ onSignIn, onSignUp }) {
       }
     } catch (e) {
       setError(e.message);
+      if (e.message.includes("Email not found")) setOfferSignUp(true);
     } finally {
       setLoading(false);
     }
@@ -140,6 +151,11 @@ function AuthScreen({ onSignIn, onSignUp }) {
               )
             )}
             {error ? <Text style={styles.authError}>{error}</Text> : null}
+            {offerSignUp ? (
+              <TouchableOpacity style={styles.authRecoverBtn} onPress={switchToSignUp}>
+                <Text style={styles.authRecoverText}>No account found — create one with this email?</Text>
+              </TouchableOpacity>
+            ) : null}
             <TouchableOpacity style={styles.primaryBtn} onPress={handleSubmit} disabled={loading}>
               {loading
                 ? <ActivityIndicator color="#000" />
@@ -204,24 +220,72 @@ const SHEETDB_URL       = process.env.EXPO_PUBLIC_SHEETDB_URL       ?? "";
 const ADMIN_CODE        = process.env.EXPO_PUBLIC_ADMIN_CODE        ?? "";
 const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
 
+class ScanError extends Error {
+  constructor(code, message) {
+    super(message);
+    this.code = code;
+  }
+}
+
+const ERROR_DISPLAY = {
+  network:      { icon: "📡", title: "No Internet",           tip: "Make sure WiFi or cellular data is enabled." },
+  key_invalid:  { icon: "🔑", title: "Invalid API Key",       tip: "Update EXPO_PUBLIC_OPENAI_API_KEY in your .env file." },
+  key_missing:  { icon: "🔑", title: "API Key Missing",       tip: "Add EXPO_PUBLIC_OPENAI_API_KEY to your .env file." },
+  rate_limit:   { icon: "⏳", title: "Rate Limit Hit",         tip: "Wait 30 seconds and try again." },
+  quota:        { icon: "💳", title: "Usage Limit Reached",   tip: "Check your billing at platform.openai.com." },
+  server_error: { icon: "🔧", title: "OpenAI Service Issue",  tip: "OpenAI may be down. Try again in a few minutes." },
+  camera:       { icon: "📷", title: "Camera Not Ready",      tip: "Wait a moment, then try again." },
+  photo:        { icon: "📷", title: "Photo Capture Failed",  tip: "Make sure nothing is blocking the camera lens." },
+  ai_parse:     { icon: "🤖", title: "AI Returned Bad Data",  tip: "This is rare — try scanning again." },
+  ai_empty:     { icon: "🤖", title: "AI Gave No Response",   tip: "Servers may be busy. Try again in a moment." },
+  unknown:      { icon: "⚠️",  title: "Something Went Wrong", tip: "Try scanning again." },
+};
+
+function makeErrorDetail(e) {
+  const code = e instanceof ScanError ? e.code : "unknown";
+  const display = ERROR_DISPLAY[code] ?? ERROR_DISPLAY.unknown;
+  return { ...display, body: e.message };
+}
+
 function extractJSON(text) {
   const match = text.match(/\{[\s\S]*\}/);
-  if (!match) throw new Error(`AI response had no JSON:\n${text.slice(0, 300)}`);
+  if (!match) throw new ScanError("ai_parse", "The AI didn't return recognizable data. Try scanning again.");
   try {
     return JSON.parse(match[0]);
   } catch {
-    throw new Error(`JSON parse failed:\n${match[0].slice(0, 300)}`);
+    throw new ScanError("ai_parse", "The AI returned malformed data. Try scanning again.");
   }
 }
 
 async function openaiPost(messages, maxTokens = 400, model = "gpt-4o-mini") {
-  const res = await fetch(OPENAI_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Authorization": `Bearer ${OPENAI_API_KEY}` },
-    body: JSON.stringify({ model, messages, max_tokens: maxTokens }),
-  });
-  const data = await res.json();
-  if (data.error) throw new Error(data.error.message);
+  let res;
+  try {
+    res = await fetch(OPENAI_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${OPENAI_API_KEY}` },
+      body: JSON.stringify({ model, messages, max_tokens: maxTokens }),
+    });
+  } catch {
+    throw new ScanError("network", "No internet connection — couldn't reach OpenAI.");
+  }
+  let data;
+  try {
+    data = await res.json();
+  } catch {
+    throw new ScanError("server_error", `OpenAI sent an unreadable response (HTTP ${res.status}).`);
+  }
+  if (!res.ok) {
+    const msg = data?.error?.message ?? "";
+    if (res.status === 401) throw new ScanError("key_invalid", msg || "OpenAI rejected the API key (401 Unauthorized).");
+    if (res.status === 429) {
+      const isQuota = msg.includes("quota") || msg.includes("billing");
+      throw new ScanError(isQuota ? "quota" : "rate_limit", msg || "OpenAI rate limit exceeded (429).");
+    }
+    if (res.status === 402) throw new ScanError("quota", msg || "OpenAI billing limit reached (402).");
+    if (res.status >= 500) throw new ScanError("server_error", msg || `OpenAI server error (HTTP ${res.status}).`);
+    throw new ScanError("unknown", msg || `OpenAI error (HTTP ${res.status}).`);
+  }
+  if (!data.choices?.[0]?.message?.content) throw new ScanError("ai_empty", "OpenAI returned an empty response.");
   return data.choices[0].message.content.trim();
 }
 
@@ -268,13 +332,17 @@ ${description}`,
 }
 
 async function getNumistaSpecs(coinData) {
-  const q = `${coinData.country || ""} ${coinData.denomination || ""} ${coinData.year || ""}`.trim();
-  const res = await fetch(
-    `https://api.numista.com/api/v3/coins?q=${encodeURIComponent(q)}&count=1`,
-    { headers: { "Numista-API-Key": NUMISTA_API_KEY } }
-  );
-  const data = await res.json();
-  return data?.items?.[0] || null;
+  try {
+    const q = `${coinData.country || ""} ${coinData.denomination || ""} ${coinData.year || ""}`.trim();
+    const res = await fetch(
+      `https://api.numista.com/api/v3/coins?q=${encodeURIComponent(q)}&count=1`,
+      { headers: { "Numista-API-Key": NUMISTA_API_KEY } }
+    );
+    const data = await res.json();
+    return data?.items?.[0] || null;
+  } catch {
+    return null;
+  }
 }
 
 async function logScanToSheet(coinData, userName = "") {
@@ -289,17 +357,22 @@ async function logScanToSheet(coinData, userName = "") {
 }
 
 async function getPcgsValue(pcgsNumber) {
-  const res = await fetch(
-    `https://api.pcgs.com/publicapi/priceguide/getpricedata/${pcgsNumber}`,
-    { headers: { "Authorization": `bearer ${PCGS_BEARER_TOKEN}` } }
-  );
-  return res.json();
+  try {
+    const res = await fetch(
+      `https://api.pcgs.com/publicapi/priceguide/getpricedata/${pcgsNumber}`,
+      { headers: { "Authorization": `bearer ${PCGS_BEARER_TOKEN}` } }
+    );
+    return await res.json();
+  } catch {
+    return null;
+  }
 }
 
 async function estimateCoinValue(coinData, numistaData) {
-  const text = await openaiPost([{
-    role: "user",
-    content: `You are an expert numismatist with deep knowledge of auction results and retail prices. Estimate this coin's current market value as you would if a collector walked in and showed it to you.
+  try {
+    const text = await openaiPost([{
+      role: "user",
+      content: `You are an expert numismatist with deep knowledge of auction results and retail prices. Estimate this coin's current market value as you would if a collector walked in and showed it to you.
 
 Coin data: ${JSON.stringify(coinData)}
 Numista specs: ${JSON.stringify(numistaData)}
@@ -312,18 +385,25 @@ Return ONLY a raw JSON object (no markdown) with keys:
 - "condition_assumed": grade/condition you're basing this on (string)
 - "error_value_note": if errors/varieties affect value, explain specifically how much they add (string, or null)
 - "reasoning": 1-2 sentences citing what drives the value (string)`,
-  }], 350, "gpt-4o");
-  return extractJSON(text);
+    }], 350, "gpt-4o");
+    return extractJSON(text);
+  } catch {
+    return null;
+  }
 }
 
 async function generateSummary(coinData, numistaData, pcgsData) {
-  return openaiPost([{
-    role: "user",
-    content: `You are a friendly numismatist app. Write 3 exciting sentences about this coin for a beginner.
+  try {
+    return await openaiPost([{
+      role: "user",
+      content: `You are a friendly numismatist app. Write 3 exciting sentences about this coin for a beginner.
 AI ID: ${JSON.stringify(coinData)}
 Numista: ${JSON.stringify(numistaData)}
 PCGS: ${JSON.stringify(pcgsData)}`,
-  }], 200);
+    }], 200);
+  } catch {
+    return null;
+  }
 }
 
 // ─── Scanner ──────────────────────────────────────────────────────────────────
@@ -343,7 +423,7 @@ function ScanScreen({ navigate, user }) {
   const [phase, setPhase] = useState("scanning"); // scanning | loading | result | error
   const [loadingStep, setLoadingStep] = useState("");
   const [result, setResult] = useState(null);
-  const [errorMsg, setErrorMsg] = useState("");
+  const [errorDetail, setErrorDetail] = useState(null);
   const scanAnim = useRef(new Animated.Value(0)).current;
   const cameraRef = useRef(null);
 
@@ -359,8 +439,13 @@ function ScanScreen({ navigate, user }) {
   }, []);
 
   async function capture() {
-    if (!cameraRef.current || !OPENAI_API_KEY) {
-      setErrorMsg(!OPENAI_API_KEY ? "Add your OpenAI API key to the .env file." : "Camera not ready.");
+    if (!OPENAI_API_KEY) {
+      setErrorDetail(makeErrorDetail(new ScanError("key_missing", "No OpenAI API key is configured. Add EXPO_PUBLIC_OPENAI_API_KEY to your .env file.")));
+      setPhase("error");
+      return;
+    }
+    if (!cameraRef.current) {
+      setErrorDetail(makeErrorDetail(new ScanError("camera", "The camera hasn't finished initializing. Wait a moment and try again.")));
       setPhase("error");
       return;
     }
@@ -368,13 +453,19 @@ function ScanScreen({ navigate, user }) {
       setPhase("loading");
 
       setLoadingStep("📸  Capturing image…");
-      const photo = await cameraRef.current.takePictureAsync({ base64: true, quality: 0.92 });
+      let photo;
+      try {
+        photo = await cameraRef.current.takePictureAsync({ base64: true, quality: 0.92 });
+      } catch {
+        throw new ScanError("photo", "Failed to take the photo. Make sure nothing is blocking the camera.");
+      }
+      if (!photo?.base64) throw new ScanError("photo", "Photo was captured but contained no image data. Try again.");
 
       setLoadingStep("🤖  AI is identifying the coin…");
       const coinData = await identifyCoinFromImage(photo.base64);
 
       if (coinData.identifiable === false) {
-        setErrorMsg(coinData.unidentifiable_reason || "Could not identify this coin.");
+        setErrorDetail({ icon: "🔍", title: "Coin Not Recognized", body: coinData.unidentifiable_reason || "The AI couldn't identify this coin.", tip: null });
         setPhase("unidentifiable");
         return;
       }
@@ -392,16 +483,17 @@ function ScanScreen({ navigate, user }) {
 
       logScanToSheet(coinData, user?.name);
       const coinLabel = [coinData.year, coinData.country, coinData.denomination].filter(v => v && v !== "Unknown").join(" ");
-      AsyncStorage.getItem("@coinlens_scans").then(data => {
-        const history = data ? JSON.parse(data) : [];
+      try {
+        const stored = await AsyncStorage.getItem("@coinlens_scans");
+        const history = stored ? JSON.parse(stored) : [];
         const midValue = valueEstimate ? ((valueEstimate.low ?? 0) + (valueEstimate.high ?? 0)) / 2 : 0;
         history.unshift({ coin: coinLabel, time: new Date().toISOString(), value: midValue });
-        AsyncStorage.setItem("@coinlens_scans", JSON.stringify(history.slice(0, 50)));
-      });
+        await AsyncStorage.setItem("@coinlens_scans", JSON.stringify(history.slice(0, 50)));
+      } catch { /* storage failure shouldn't block showing results */ }
       setResult({ coinData, numistaData, pcgsData, valueEstimate, summary });
       setPhase("result");
     } catch (e) {
-      setErrorMsg(e.message || "Something went wrong.");
+      setErrorDetail(makeErrorDetail(e));
       setPhase("error");
     }
   }
@@ -437,13 +529,20 @@ function ScanScreen({ navigate, user }) {
   }
 
   if (phase === "error") {
+    const ed = errorDetail ?? { icon: "⚠️", title: "Something Went Wrong", body: "An unexpected error occurred.", tip: "Try scanning again." };
     return (
       <SafeAreaView style={styles.safeArea}>
         <Header title="Scan Coin" onBack={() => navigate("home")} />
         <View style={styles.center}>
-          <Text style={styles.errorIcon}>⚠️</Text>
-          <Text style={styles.pageTitle}>Oops</Text>
-          <Text style={styles.pageSubtitle}>{errorMsg}</Text>
+          <Text style={styles.errorIcon}>{ed.icon}</Text>
+          <Text style={styles.pageTitle}>{ed.title}</Text>
+          <Text style={styles.errorBody}>{ed.body}</Text>
+          {ed.tip ? (
+            <View style={styles.errorTipBox}>
+              <Text style={styles.errorTipLabel}>💡 What to do</Text>
+              <Text style={styles.errorTipText}>{ed.tip}</Text>
+            </View>
+          ) : null}
           <TouchableOpacity style={styles.primaryBtn} onPress={() => setPhase("scanning")}>
             <Text style={styles.primaryBtnText}>Try Again</Text>
           </TouchableOpacity>
@@ -453,13 +552,14 @@ function ScanScreen({ navigate, user }) {
   }
 
   if (phase === "unidentifiable") {
+    const ed = errorDetail ?? { icon: "🔍", title: "Coin Not Recognized", body: "The AI couldn't identify this coin.", tip: null };
     return (
       <SafeAreaView style={styles.safeArea}>
         <Header title="Scan Coin" onBack={() => navigate("home")} />
         <View style={styles.center}>
-          <Text style={styles.errorIcon}>🔍</Text>
-          <Text style={styles.pageTitle}>Coin Not Recognized</Text>
-          <Text style={styles.pageSubtitle}>{errorMsg}</Text>
+          <Text style={styles.errorIcon}>{ed.icon}</Text>
+          <Text style={styles.pageTitle}>{ed.title}</Text>
+          <Text style={styles.errorBody}>{ed.body}</Text>
           <View style={styles.unidentifiableTips}>
             <Text style={styles.tipsTitle}>Tips for a better scan</Text>
             {["Place the coin on a flat, dark surface", "Use good lighting — avoid glare", "Hold the camera steady and close", "Make sure the full coin is in frame"].map((tip, i) => (
@@ -728,9 +828,9 @@ function StatsScreen({ navigate }) {
   const [scans, setScans] = useState([]);
 
   useEffect(() => {
-    AsyncStorage.getItem("@coinlens_scans").then(data => {
-      if (data) setScans(JSON.parse(data));
-    });
+    AsyncStorage.getItem("@coinlens_scans")
+      .then(data => { if (data) setScans(JSON.parse(data)); })
+      .catch(() => {});
   }, []);
 
   const coinCounts = scans.reduce((acc, s) => {
@@ -769,6 +869,219 @@ function StatsScreen({ navigate }) {
   );
 }
 
+function _fakeBadges({ scanned, netWorth, memberDays }) {
+  const scanTiers  = [1, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
+  const worthTiers = [1, 10, 50, 100, 500, 1000, 10000, 25000, 100000, 500000, 1000000];
+  const dayTiers   = [0, 7, 30, 180, 365, 730, 1825];
+  return (
+    scanTiers.filter(t => scanned >= t).length +
+    worthTiers.filter(t => netWorth >= t).length +
+    dayTiers.filter(t => memberDays >= t).length
+  );
+}
+
+const FAKE_USERS = [
+  { name: "CoinKing99",    scanned: 312, netWorth: 4820,  memberDays: 841  },
+  { name: "SilverHunter",  scanned: 274, netWorth: 11340, memberDays: 612  },
+  { name: "MintErrorMike", scanned: 198, netWorth: 28900, memberDays: 390  },
+  { name: "PennyCollector",scanned: 165, netWorth: 390,   memberDays: 1204 },
+  { name: "AncientRome",   scanned: 143, netWorth: 7650,  memberDays: 520  },
+  { name: "QuarterQueen",  scanned: 121, netWorth: 1120,  memberDays: 278  },
+  { name: "BuffaloNickel", scanned: 97,  netWorth: 3200,  memberDays: 730  },
+  { name: "GoldEagleFan",  scanned: 84,  netWorth: 52000, memberDays: 95   },
+  { name: "WheatBackWill", scanned: 61,  netWorth: 940,   memberDays: 1560 },
+  { name: "NewCollector",  scanned: 12,  netWorth: 85,    memberDays: 8    },
+].map(u => ({ ...u, badges: _fakeBadges(u) }));
+
+const LB_CATEGORIES = [
+  { key: "scanned",    label: "Most Scanned",  field: "scanned",    format: v => `${v} coins`   },
+  { key: "netWorth",   label: "Net Worth",     field: "netWorth",   format: v => `$${v.toLocaleString()}` },
+  { key: "memberDays", label: "Longest Member",field: "memberDays", format: v => `${v} days`    },
+  { key: "badges",     label: "Most Badges",   field: "badges",     format: v => `${v} badges`  },
+];
+
+function LeaderboardScreen({ navigate, user, userScans }) {
+  const [cat, setCat] = useState("scanned");
+  const [liveUsers, setLiveUsers] = useState(FAKE_USERS.map(u => ({ ...u })));
+  const [lastUpdated, setLastUpdated] = useState(new Date());
+  const [flashedName, setFlashedName] = useState(null);
+  const category = LB_CATEGORIES.find(c => c.key === cat);
+
+  useEffect(() => {
+    function tick() {
+      setLiveUsers(prev => {
+        const next = prev.map(u => ({ ...u }));
+        const count = Math.random() < 0.4 ? 2 : 1;
+        const picked = [];
+        while (picked.length < count) {
+          const idx = Math.floor(Math.random() * next.length);
+          if (!picked.includes(idx)) picked.push(idx);
+        }
+        picked.forEach(idx => {
+          if (Math.random() < 0.7) next[idx].scanned += 1;
+          next[idx].netWorth += Math.floor(Math.random() * 120);
+        });
+        setFlashedName(next[picked[0]].name);
+        setTimeout(() => setFlashedName(null), 800);
+        return next;
+      });
+      setLastUpdated(new Date());
+    }
+
+    const id = setInterval(tick, 7000 + Math.random() * 5000);
+    return () => clearInterval(id);
+  }, []);
+
+  const myDays = user.createdAt
+    ? Math.max(1, Math.floor((Date.now() - user.createdAt) / 86400000))
+    : 1;
+
+  const myEntry = {
+    name: user.name,
+    scanned: userScans.length,
+    netWorth: userScans.reduce((s, c) => s + (c.value ?? 0), 0),
+    memberDays: myDays,
+    badges: BADGES.filter(b => b.check(userScans, user)).length,
+    isMe: true,
+  };
+
+  const all = [...liveUsers.map(u => ({ ...u, isMe: false })), myEntry]
+    .sort((a, b) => b[category.field] - a[category.field])
+    .map((u, i) => ({ ...u, rank: i + 1 }));
+
+  const medals = ["🥇", "🥈", "🥉"];
+  const updatedStr = lastUpdated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <Header title="Leaderboard" onBack={() => navigate("home")} />
+      <ScrollView contentContainerStyle={styles.accountContainer}>
+        <View style={styles.lbLiveRow}>
+          <View style={styles.lbLiveDot} />
+          <Text style={styles.lbLiveText}>LIVE</Text>
+          <Text style={styles.lbUpdatedText}>  Updated {updatedStr}</Text>
+        </View>
+
+        <View style={styles.lbCatRow}>
+          {LB_CATEGORIES.map(c => (
+            <TouchableOpacity key={c.key} style={[styles.lbCatBtn, cat === c.key && styles.lbCatBtnActive]} onPress={() => setCat(c.key)}>
+              <Text style={[styles.lbCatText, cat === c.key && styles.lbCatTextActive]}>{c.label}</Text>
+            </TouchableOpacity>
+          ))}
+        </View>
+
+        {all.map((entry) => (
+          <View key={entry.name} style={[styles.lbRow, entry.isMe && styles.lbRowMe, flashedName === entry.name && styles.lbRowFlash]}>
+            <Text style={styles.lbRank}>
+              {entry.rank <= 3 ? medals[entry.rank - 1] : `#${entry.rank}`}
+            </Text>
+            <View style={styles.lbInfo}>
+              <Text style={[styles.lbName, entry.isMe && styles.lbNameMe]}>
+                {entry.name}{entry.isMe ? "  (you)" : ""}
+              </Text>
+              <Text style={styles.lbSub}>{category.format(entry[category.field])}</Text>
+            </View>
+            <View style={[styles.lbBadge, entry.rank === 1 && styles.lbBadgeGold]}>
+              <Text style={[styles.lbBadgeText, entry.rank === 1 && styles.lbBadgeTextGold]}>
+                {category.format(entry[category.field])}
+              </Text>
+            </View>
+          </View>
+        ))}
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+// ─── Badges ───────────────────────────────────────────────────────────────────
+
+function _nw(scans) { return scans.reduce((s, c) => s + (c.value ?? 0), 0); }
+function _days(createdAt) { return Math.floor((Date.now() - createdAt) / 86400000); }
+
+const BADGES = [
+  // — Scanning milestones
+  { id: "scan_1",     icon: "🔍", name: "First Scan",           desc: "Scan your very first coin",          category: "Scanning",  check: (s) => s.length >= 1     },
+  { id: "scan_10",    icon: "🔟", name: "Getting Started",      desc: "Scan 10 coins",                      category: "Scanning",  check: (s) => s.length >= 10    },
+  { id: "scan_25",    icon: "⭐", name: "Coin Enthusiast",      desc: "Scan 25 coins",                      category: "Scanning",  check: (s) => s.length >= 25    },
+  { id: "scan_50",    icon: "🏆", name: "Half Century",         desc: "Scan 50 coins",                      category: "Scanning",  check: (s) => s.length >= 50    },
+  { id: "scan_100",   icon: "💯", name: "Century Club",         desc: "Scan 100 coins",                     category: "Scanning",  check: (s) => s.length >= 100   },
+  { id: "scan_250",   icon: "🚀", name: "Dedicated Collector",  desc: "Scan 250 coins",                     category: "Scanning",  check: (s) => s.length >= 250   },
+  { id: "scan_500",   icon: "👑", name: "Master Scanner",       desc: "Scan 500 coins",                     category: "Scanning",  check: (s) => s.length >= 500   },
+  { id: "scan_1000",  icon: "🔱", name: "Elite Collector",      desc: "Scan 1,000 coins",                   category: "Scanning",  check: (s) => s.length >= 1000  },
+  { id: "scan_2500",  icon: "🌌", name: "Numismatic Legend",    desc: "Scan 2,500 coins",                   category: "Scanning",  check: (s) => s.length >= 2500  },
+  { id: "scan_5000",  icon: "⚡", name: "Coin Overlord",        desc: "Scan 5,000 coins",                   category: "Scanning",  check: (s) => s.length >= 5000  },
+  { id: "scan_10000", icon: "🌠", name: "The Archivist",        desc: "Scan 10,000 coins",                  category: "Scanning",  check: (s) => s.length >= 10000 },
+  // — Net worth milestones
+  { id: "worth_1",      icon: "💰", name: "First Dollar",       desc: "Reach $1 in collection value",       category: "Net Worth", check: (s) => _nw(s) >= 1       },
+  { id: "worth_10",     icon: "💵", name: "Growing Stack",      desc: "Reach $10 in collection value",      category: "Net Worth", check: (s) => _nw(s) >= 10      },
+  { id: "worth_50",     icon: "💸", name: "Rising Value",       desc: "Reach $50 in collection value",      category: "Net Worth", check: (s) => _nw(s) >= 50      },
+  { id: "worth_100",    icon: "🤑", name: "Century Mark",       desc: "Reach $100 in collection value",     category: "Net Worth", check: (s) => _nw(s) >= 100     },
+  { id: "worth_500",    icon: "💎", name: "Five Hundred",       desc: "Reach $500 in collection value",     category: "Net Worth", check: (s) => _nw(s) >= 500     },
+  { id: "worth_1000",   icon: "🏦", name: "Four Figures",       desc: "Reach $1,000 in collection value",   category: "Net Worth", check: (s) => _nw(s) >= 1000    },
+  { id: "worth_10000",  icon: "🌟", name: "High Roller",        desc: "Reach $10,000 in collection value",  category: "Net Worth", check: (s) => _nw(s) >= 10000   },
+  { id: "worth_25000",  icon: "🔥", name: "Quarter Million",    desc: "Reach $25,000 in collection value",  category: "Net Worth", check: (s) => _nw(s) >= 25000   },
+  { id: "worth_100000", icon: "🏅", name: "Six Figures",        desc: "Reach $100,000 in collection value", category: "Net Worth", check: (s) => _nw(s) >= 100000  },
+  { id: "worth_500000", icon: "🦅", name: "Half Million",       desc: "Reach $500,000 in collection value", category: "Net Worth", check: (s) => _nw(s) >= 500000  },
+  { id: "worth_1m",     icon: "👁️", name: "The Million",        desc: "Reach $1,000,000 in collection value",category:"Net Worth", check: (s) => _nw(s) >= 1000000 },
+  // — Membership milestones
+  { id: "mem_join", icon: "👋", name: "Welcome",                desc: "Join CoinLens",                      category: "Member",    check: (s, u) => !!u.createdAt                             },
+  { id: "mem_7",    icon: "📅", name: "One Week",               desc: "Be a member for 7 days",             category: "Member",    check: (s, u) => u.createdAt && _days(u.createdAt) >= 7    },
+  { id: "mem_30",   icon: "📆", name: "One Month",              desc: "Be a member for 30 days",            category: "Member",    check: (s, u) => u.createdAt && _days(u.createdAt) >= 30   },
+  { id: "mem_180",  icon: "🗓️", name: "Half Year",              desc: "Be a member for 180 days",           category: "Member",    check: (s, u) => u.createdAt && _days(u.createdAt) >= 180  },
+  { id: "mem_365",  icon: "🎂", name: "Veteran",                desc: "Be a member for 1 year",             category: "Member",    check: (s, u) => u.createdAt && _days(u.createdAt) >= 365  },
+  { id: "mem_730",  icon: "🏛️", name: "Pillar of the Community",desc: "Be a member for 2 years",            category: "Member",    check: (s, u) => u.createdAt && _days(u.createdAt) >= 730  },
+  { id: "mem_1825", icon: "🌐", name: "Living Legend",          desc: "Be a member for 5 years",            category: "Member",    check: (s, u) => u.createdAt && _days(u.createdAt) >= 1825 },
+];
+
+const BADGE_CATEGORIES = ["Scanning", "Net Worth", "Member"];
+
+function BadgesScreen({ navigate, user, userScans }) {
+  const earned = new Set(BADGES.filter(b => b.check(userScans, user)).map(b => b.id));
+  const earnedCount = earned.size;
+
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <Header title="Badges" onBack={() => navigate("home")} />
+      <ScrollView contentContainerStyle={styles.badgesScroll}>
+        <View style={styles.badgesProgressRow}>
+          <Text style={styles.badgesProgressText}>{earnedCount} / {BADGES.length} earned</Text>
+          <View style={styles.badgesProgressTrack}>
+            <View style={[styles.badgesProgressFill, { width: `${(earnedCount / BADGES.length) * 100}%` }]} />
+          </View>
+        </View>
+
+        {BADGE_CATEGORIES.map(cat => {
+          const group = BADGES.filter(b => b.category === cat);
+          return (
+            <View key={cat} style={styles.badgesCatSection}>
+              <Text style={styles.badgesCatTitle}>{cat}</Text>
+              <View style={styles.badgesGrid}>
+                {group.map(badge => {
+                  const isEarned = earned.has(badge.id);
+                  return (
+                    <View key={badge.id} style={[styles.badgeCard, isEarned && styles.badgeCardEarned]}>
+                      <Text style={[styles.badgeCardIcon, !isEarned && styles.badgeCardIconLocked]}>
+                        {isEarned ? badge.icon : "🔒"}
+                      </Text>
+                      <Text style={[styles.badgeCardName, !isEarned && styles.badgeCardNameLocked]}>
+                        {badge.name}
+                      </Text>
+                      <Text style={styles.badgeCardDesc}>{badge.desc}</Text>
+                      {isEarned
+                        ? <Text style={styles.badgeEarnedTag}>✓ Earned</Text>
+                        : <Text style={styles.badgeLockedTag}>Locked</Text>}
+                    </View>
+                  );
+                })}
+              </View>
+            </View>
+          );
+        })}
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
 function PlaceholderScreen({ title, icon, navigate }) {
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -787,9 +1100,9 @@ function AccountScreen({ navigate, user, onSignOut }) {
   const [query, setQuery] = useState("");
 
   useEffect(() => {
-    AsyncStorage.getItem("@coinlens_scans").then(data => {
-      if (data) setScans(JSON.parse(data));
-    });
+    AsyncStorage.getItem("@coinlens_scans")
+      .then(data => { if (data) setScans(JSON.parse(data)); })
+      .catch(() => {});
   }, []);
 
   const initials = user.name.split(" ").map(n => n[0]).join("").toUpperCase().slice(0, 2);
@@ -903,21 +1216,36 @@ export default function App() {
   const [screen, setScreen] = useState("home");
   const [user, setUser] = useState(null);
   const [authReady, setAuthReady] = useState(false);
+  const [userScans, setUserScans] = useState([]);
 
   useEffect(() => {
-    AsyncStorage.getItem("@coinlens_session").then(data => {
-      if (data) setUser(JSON.parse(data));
+    (async () => {
+      try {
+        const session = await AsyncStorage.getItem("@coinlens_session");
+        if (session) setUser(JSON.parse(session));
+      } catch { /* corrupted session — stay logged out */ }
       setAuthReady(true);
-    });
+    })();
+    AsyncStorage.getItem("@coinlens_scans")
+      .then(data => { if (data) setUserScans(JSON.parse(data)); })
+      .catch(() => {});
   }, []);
 
   async function getAccounts() {
-    const data = await AsyncStorage.getItem("@coinlens_accounts");
-    return data ? JSON.parse(data) : [];
+    try {
+      const data = await AsyncStorage.getItem("@coinlens_accounts");
+      return data ? JSON.parse(data) : [];
+    } catch {
+      return [];
+    }
   }
 
   async function saveAccounts(accounts) {
-    await AsyncStorage.setItem("@coinlens_accounts", JSON.stringify(accounts));
+    try {
+      await AsyncStorage.setItem("@coinlens_accounts", JSON.stringify(accounts));
+    } catch {
+      throw new Error("Failed to save account. Storage may be full.");
+    }
   }
 
   async function signUp(name, email, password, role = "member") {
@@ -951,8 +1279,8 @@ export default function App() {
 
   if (screen === "home") return <HomeScreen navigate={navigate} />;
   if (screen === "scan") return <ScanScreen navigate={navigate} user={user} />;
-  if (screen === "badges") return <PlaceholderScreen title="Badges" icon="🏅" navigate={navigate} />;
-  if (screen === "leaderboard") return <PlaceholderScreen title="Leaderboard" icon="🏆" navigate={navigate} />;
+  if (screen === "badges") return <BadgesScreen navigate={navigate} user={user} userScans={userScans} />;
+  if (screen === "leaderboard") return <LeaderboardScreen navigate={navigate} user={user} userScans={userScans} />;
   if (screen === "account") return <AccountScreen navigate={navigate} user={user} onSignOut={signOut} />;
   if (screen === "admin" && user.role === "admin") return <AdminScreen navigate={navigate} />;
   if (screen === "stats") return <StatsScreen navigate={navigate} />;
@@ -1075,6 +1403,10 @@ const styles = StyleSheet.create({
   // Loading / error
   loadingStep: { marginTop: 20, fontSize: 16, color: GOLD, fontWeight: "600", textAlign: "center" },
   errorIcon: { fontSize: 60, marginBottom: 8 },
+  errorBody: { fontSize: 14, color: "rgba(255,255,255,0.6)", textAlign: "center", marginHorizontal: 24, marginTop: 6, lineHeight: 20 },
+  errorTipBox: { marginTop: 18, marginHorizontal: 24, backgroundColor: "rgba(255,215,0,0.07)", borderWidth: 1, borderColor: "rgba(255,215,0,0.2)", borderRadius: 10, padding: 14, width: "90%" },
+  errorTipLabel: { fontSize: 11, fontWeight: "800", color: GOLD, letterSpacing: 0.8, marginBottom: 4 },
+  errorTipText: { fontSize: 13, color: "rgba(255,255,255,0.75)", lineHeight: 18 },
 
   // Result
   resultContainer: { padding: 20, alignItems: "center", gap: 16, paddingBottom: 40 },
@@ -1182,6 +1514,8 @@ const styles = StyleSheet.create({
     color: GOLD,
   },
   authError: { fontSize: 14, color: "#FF4444", textAlign: "center" },
+  authRecoverBtn: { backgroundColor: "rgba(255,215,0,0.1)", borderWidth: 1, borderColor: "rgba(255,215,0,0.3)", borderRadius: 10, padding: 12, alignItems: "center" },
+  authRecoverText: { fontSize: 13, color: GOLD, fontWeight: "600", textAlign: "center" },
 
   // Account
   accountContainer: { padding: 24, gap: 16, paddingBottom: 40 },
@@ -1232,12 +1566,66 @@ const styles = StyleSheet.create({
   },
   signOutText: { fontSize: 16, fontWeight: "700", color: "rgba(255,215,0,0.6)" },
 
+  // Badges screen
+  badgesScroll: { padding: 20, paddingBottom: 40 },
+  badgesProgressRow: { marginBottom: 24 },
+  badgesProgressText: { fontSize: 13, color: GOLD, fontWeight: "700", marginBottom: 8, textAlign: "center" },
+  badgesProgressTrack: { height: 6, backgroundColor: "rgba(255,215,0,0.15)", borderRadius: 3, overflow: "hidden" },
+  badgesProgressFill: { height: 6, backgroundColor: GOLD, borderRadius: 3 },
+  badgesCatSection: { marginBottom: 28 },
+  badgesCatTitle: { fontSize: 13, fontWeight: "900", color: GOLD, letterSpacing: 1.2, marginBottom: 12, textTransform: "uppercase" },
+  badgesGrid: { flexDirection: "row", flexWrap: "wrap", gap: 10 },
+  badgeCard: {
+    width: "47%", backgroundColor: "rgba(255,215,0,0.04)", borderRadius: 14,
+    borderWidth: 1, borderColor: "rgba(255,215,0,0.12)",
+    padding: 14, alignItems: "center",
+  },
+  badgeCardEarned: {
+    backgroundColor: "rgba(255,215,0,0.09)", borderColor: GOLD,
+    shadowColor: GOLD, shadowOffset: { width: 0, height: 0 }, shadowOpacity: 0.4, shadowRadius: 8, elevation: 6,
+  },
+  badgeCardIcon: { fontSize: 34, marginBottom: 6 },
+  badgeCardIconLocked: { opacity: 0.35 },
+  badgeCardName: { fontSize: 13, fontWeight: "800", color: "#fff", textAlign: "center", marginBottom: 3 },
+  badgeCardNameLocked: { color: "rgba(255,255,255,0.35)" },
+  badgeCardDesc: { fontSize: 11, color: "rgba(255,255,255,0.45)", textAlign: "center", lineHeight: 15, marginBottom: 8 },
+  badgeEarnedTag: { fontSize: 11, fontWeight: "800", color: GOLD },
+  badgeLockedTag: { fontSize: 11, color: "rgba(255,255,255,0.25)" },
+
   // Role badges
   roleBadgeAdmin: { marginTop: 4, backgroundColor: "rgba(255,165,0,0.15)", borderRadius: 20, borderWidth: 1, borderColor: "rgba(255,165,0,0.5)", paddingHorizontal: 14, paddingVertical: 4 },
   roleBadgeMember: { marginTop: 4, backgroundColor: "rgba(255,215,0,0.08)", borderRadius: 20, borderWidth: 1, borderColor: "rgba(255,215,0,0.2)", paddingHorizontal: 14, paddingVertical: 4 },
   roleBadgeText: { fontSize: 12, fontWeight: "700", color: GOLD, letterSpacing: 0.5 },
 
   // Admin panel button on account screen
+  lbCatRow: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginBottom: 4 },
+  lbCatBtn: {
+    width: "48%", paddingVertical: 9, alignItems: "center", borderRadius: 10,
+    borderWidth: 1, borderColor: "rgba(255,215,0,0.2)", backgroundColor: "#0f0f0f",
+  },
+  lbCatBtnActive: { backgroundColor: GOLD_DIM, borderColor: GOLD, ...GOLD_GLOW },
+  lbCatText: { fontSize: 11, fontWeight: "600", color: "rgba(255,215,0,0.4)", textAlign: "center" },
+  lbCatTextActive: { color: GOLD },
+  lbRow: {
+    flexDirection: "row", alignItems: "center", gap: 12,
+    backgroundColor: "#0f0f0f", borderRadius: 14,
+    borderWidth: 1, borderColor: "rgba(255,215,0,0.15)", padding: 14,
+  },
+  lbRowMe: { borderColor: GOLD, backgroundColor: "rgba(255,215,0,0.06)", ...GOLD_GLOW },
+  lbRank: { fontSize: 18, fontWeight: "800", color: GOLD, width: 36, textAlign: "center" },
+  lbInfo: { flex: 1 },
+  lbName: { fontSize: 15, fontWeight: "700", color: "rgba(255,215,0,0.8)" },
+  lbNameMe: { color: GOLD },
+  lbSub: { fontSize: 12, color: "rgba(255,215,0,0.45)", marginTop: 2 },
+  lbBadge: { backgroundColor: "rgba(255,215,0,0.1)", borderRadius: 10, paddingHorizontal: 10, paddingVertical: 4, borderWidth: 1, borderColor: "rgba(255,215,0,0.25)" },
+  lbBadgeGold: { backgroundColor: GOLD_DIM, borderColor: GOLD },
+  lbBadgeText: { fontSize: 14, fontWeight: "800", color: "rgba(255,215,0,0.6)" },
+  lbBadgeTextGold: { color: GOLD },
+  lbRowFlash: { backgroundColor: "rgba(255,215,0,0.12)", borderColor: GOLD },
+  lbLiveRow: { flexDirection: "row", alignItems: "center", marginBottom: 12 },
+  lbLiveDot: { width: 8, height: 8, borderRadius: 4, backgroundColor: "#00e676", marginRight: 6 },
+  lbLiveText: { fontSize: 11, fontWeight: "900", color: "#00e676", letterSpacing: 1.5 },
+  lbUpdatedText: { fontSize: 11, color: "rgba(255,215,0,0.45)" },
   searchBar: {
     flexDirection: "row", alignItems: "center", gap: 10,
     backgroundColor: "#111", borderWidth: 1, borderColor: "rgba(255,215,0,0.25)",
