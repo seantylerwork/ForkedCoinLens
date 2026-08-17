@@ -14,7 +14,11 @@ import {
 } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import aiLogic from "./aiLogic";
+import { DEFAULT_ADMIN_CODE, isAdminCodeValid, isAdminUser } from "./authLogic";
+import { getCaptureStageMeta } from "./scanFlowLogic";
 
+const { extractJSON: parseJSON, getModelCandidates, isRetryableError } = aiLogic;
 
 // ─── Confidence meter ─────────────────────────────────────────────────────────
 
@@ -75,7 +79,7 @@ function Header({ title, onBack, onAccount, showCoin }) {
 
 // ─── Screens ─────────────────────────────────────────────────────────────────
 
-function AuthScreen({ onSignIn, onSignUp }) {
+function AuthScreen({ onSignIn, onSignUp, onGuest }) {
   const [tab, setTab] = useState("signin");
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
@@ -103,8 +107,8 @@ function AuthScreen({ onSignIn, onSignUp }) {
         if (!name.trim()) throw new Error("Username is required.");
         if (!email.trim()) throw new Error("Email is required.");
         if (password.length < 6) throw new Error("Password must be at least 6 characters.");
-        if (adminCode && adminCode !== ADMIN_CODE) throw new Error("Invalid admin code.");
-        const role = adminCode === ADMIN_CODE ? "admin" : "member";
+        if (adminCode && !isAdminCodeValid(adminCode, ADMIN_CODE)) throw new Error("Invalid admin code.");
+        const role = isAdminCodeValid(adminCode, ADMIN_CODE) ? "admin" : "member";
         await onSignUp(name.trim(), email.trim().toLowerCase(), password, role);
       } else {
         if (!email.trim() || !password) throw new Error("Enter your email and password.");
@@ -161,6 +165,10 @@ function AuthScreen({ onSignIn, onSignUp }) {
                 ? <ActivityIndicator color="#000" />
                 : <Text style={styles.primaryBtnText}>{tab === "signup" ? "Create Account" : "Sign In"}</Text>}
             </TouchableOpacity>
+            <TouchableOpacity style={styles.guestBtn} onPress={onGuest}>
+              <Text style={styles.guestBtnText}>Use as Guest</Text>
+              <Text style={styles.guestBtnSubtext}>Scan a coin without an account — everything else requires signing in.</Text>
+            </TouchableOpacity>
           </View>
         </ScrollView>
       </KeyboardAvoidingView>
@@ -213,11 +221,11 @@ function HomeScreen({ navigate }) {
 
 // ─── API config ───────────────────────────────────────────────────────────────
 
-const OPENAI_API_KEY    = process.env.EXPO_PUBLIC_OPENAI_API_KEY    ?? "";
+const OPENAI_API_KEY    = process.env.EXPO_PUBLIC_OPENAI_API_KEY   ?? "";
 const NUMISTA_API_KEY   = process.env.EXPO_PUBLIC_NUMISTA_API_KEY   ?? "";
 const PCGS_BEARER_TOKEN = process.env.EXPO_PUBLIC_PCGS_BEARER_TOKEN ?? "";
 const SHEETDB_URL       = process.env.EXPO_PUBLIC_SHEETDB_URL       ?? "";
-const ADMIN_CODE        = process.env.EXPO_PUBLIC_ADMIN_CODE        ?? "";
+const ADMIN_CODE        = process.env.EXPO_PUBLIC_ADMIN_CODE        || DEFAULT_ADMIN_CODE;
 const OPENAI_URL = "https://api.openai.com/v1/chat/completions";
 
 class ScanError extends Error {
@@ -248,45 +256,61 @@ function makeErrorDetail(e) {
 }
 
 function extractJSON(text) {
-  const match = text.match(/\{[\s\S]*\}/);
-  if (!match) throw new ScanError("ai_parse", "The AI didn't return recognizable data. Try scanning again.");
   try {
-    return JSON.parse(match[0]);
+    return parseJSON(text);
   } catch {
     throw new ScanError("ai_parse", "The AI returned malformed data. Try scanning again.");
   }
 }
 
 async function openaiPost(messages, maxTokens = 400, model = "gpt-4o-mini") {
-  let res;
-  try {
-    res = await fetch(OPENAI_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${OPENAI_API_KEY}` },
-      body: JSON.stringify({ model, messages, max_tokens: maxTokens }),
-    });
-  } catch {
-    throw new ScanError("network", "No internet connection — couldn't reach OpenAI.");
-  }
-  let data;
-  try {
-    data = await res.json();
-  } catch {
-    throw new ScanError("server_error", `OpenAI sent an unreadable response (HTTP ${res.status}).`);
-  }
-  if (!res.ok) {
-    const msg = data?.error?.message ?? "";
-    if (res.status === 401) throw new ScanError("key_invalid", msg || "OpenAI rejected the API key (401 Unauthorized).");
-    if (res.status === 429) {
-      const isQuota = msg.includes("quota") || msg.includes("billing");
-      throw new ScanError(isQuota ? "quota" : "rate_limit", msg || "OpenAI rate limit exceeded (429).");
+  const candidates = getModelCandidates(model);
+
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidateModel = candidates[index];
+    let res;
+    try {
+      res = await fetch(OPENAI_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${OPENAI_API_KEY}` },
+        body: JSON.stringify({ model: candidateModel, messages, max_tokens: maxTokens }),
+      });
+    } catch {
+      if (index < candidates.length - 1) continue;
+      throw new ScanError("network", "No internet connection — couldn't reach OpenAI.");
     }
-    if (res.status === 402) throw new ScanError("quota", msg || "OpenAI billing limit reached (402).");
-    if (res.status >= 500) throw new ScanError("server_error", msg || `OpenAI server error (HTTP ${res.status}).`);
-    throw new ScanError("unknown", msg || `OpenAI error (HTTP ${res.status}).`);
+
+    let data;
+    try {
+      data = await res.json();
+    } catch {
+      if (index < candidates.length - 1) continue;
+      throw new ScanError("server_error", `OpenAI sent an unreadable response (HTTP ${res.status}).`);
+    }
+
+    if (!res.ok) {
+      const msg = data?.error?.message ?? "";
+      const retryable = isRetryableError({ status: res.status, message: msg });
+      if (retryable && index < candidates.length - 1) continue;
+      if (res.status === 401) throw new ScanError("key_invalid", msg || "OpenAI rejected the API key (401 Unauthorized).");
+      if (res.status === 429) {
+        const isQuota = msg.includes("quota") || msg.includes("billing");
+        throw new ScanError(isQuota ? "quota" : "rate_limit", msg || "OpenAI rate limit exceeded (429).");
+      }
+      if (res.status === 402) throw new ScanError("quota", msg || "OpenAI billing limit reached (402).");
+      if (res.status >= 500) throw new ScanError("server_error", msg || `OpenAI server error (HTTP ${res.status}).`);
+      throw new ScanError("unknown", msg || `OpenAI error (HTTP ${res.status}).`);
+    }
+
+    if (!data.choices?.[0]?.message?.content) {
+      if (index < candidates.length - 1) continue;
+      throw new ScanError("ai_empty", "OpenAI returned an empty response.");
+    }
+
+    return data.choices[0].message.content.trim();
   }
-  if (!data.choices?.[0]?.message?.content) throw new ScanError("ai_empty", "OpenAI returned an empty response.");
-  return data.choices[0].message.content.trim();
+
+  throw new ScanError("server_error", "OpenAI did not return a usable response.");
 }
 
 async function identifyCoinFromImage(base64Image) {
@@ -311,6 +335,47 @@ Be specific and literal — describe exactly what you observe, not what you assu
   const text = await openaiPost([{
     role: "user",
     content: `Based on this numismatist's description of a coin, return ONLY a raw JSON object (no markdown) with these exact keys:
+- "country": string
+- "denomination": string
+- "year": string
+- "mint_mark": string or null
+- "estimated_grade": string (Sheldon scale, e.g. "MS-63", "VF-30", "PR-65 DCAM")
+- "mint_errors": array of strings describing each error or anomaly observed (empty array if none)
+- "varieties": string describing any known die variety, or null
+- "error_premium": boolean (true if errors/varieties meaningfully increase value)
+- "special_notes": string with anything a collector should know
+- "identifiable": boolean — false if the image is too blurry, too dark, not a coin, or genuinely unidentifiable; true otherwise
+- "unidentifiable_reason": string explaining why — only if identifiable is false (e.g. "Image is too blurry to read the date or country", "Object does not appear to be a coin")
+- "confidence": integer 0-100 (how certain the identification is)
+- "alternatives": array of up to 3 objects {"coin": string, "confidence": integer} — only include alternatives that are a genuinely different coin type, country, or denomination (e.g. "1921 Morgan Dollar" vs "1921 Peace Dollar", or "Canadian cent" vs "US cent"). Do NOT suggest adjacent years of the same coin as alternatives — that is not a meaningful alternative. Leave as empty array [] if the only uncertainty is the exact year.
+
+Description:
+${description}`,
+  }], 600);
+  return extractJSON(text);
+}
+
+async function identifyCoinFromImages(frontBase64, backBase64) {
+  const description = await openaiPost([{
+    role: "user",
+    content: [
+      { type: "text", text: `You are an expert numismatist examining a coin. Compare both sides of the coin carefully and describe everything you can see in exhaustive detail:
+- Front and back designs, portraits, inscriptions, mottos
+- Date and mint mark (exact characters visible)
+- Country and denomination text
+- Metal color and composition clues
+- Surface condition: luster, wear, contact marks, scratches, toning
+- Any doubling, off-center strike, planchet irregularities, die cracks, or other anomalies
+- Overall grade estimate using the Sheldon scale
+Be specific and literal — describe exactly what you observe, not what you assume.` },
+      { type: "image_url", image_url: { url: `data:image/jpeg;base64,${frontBase64}`, detail: "high" } },
+      { type: "image_url", image_url: { url: `data:image/jpeg;base64,${backBase64}`, detail: "high" } },
+    ],
+  }], 800, "gpt-4o");
+
+  const text = await openaiPost([{
+    role: "user",
+    content: `Based on this numismatist's description of both sides of a coin, return ONLY a raw JSON object (no markdown) with these exact keys:
 - "country": string
 - "denomination": string
 - "year": string
@@ -406,6 +471,32 @@ PCGS: ${JSON.stringify(pcgsData)}`,
   }
 }
 
+async function generateEbayListing(coinData, numistaData, valueEstimate, summary) {
+  try {
+    const text = await openaiPost([{
+      role: "user",
+      content: `You are an expert eBay copywriter for collectible coins. Create a polished listing draft that would help this coin sell confidently and quickly.
+
+Coin data: ${JSON.stringify(coinData)}
+Numista specs: ${JSON.stringify(numistaData)}
+Value estimate: ${JSON.stringify(valueEstimate)}
+Summary: ${summary || "No summary available"}
+
+Return ONLY a raw JSON object with these exact keys:
+- "title": string
+- "subtitle": string
+- "description": string
+- "item_specifics": array of objects with "label" and "value"
+- "shipping_notes": string
+
+Make the title concise, buyer-friendly, and search-friendly. The description should be professional, informative, and ideal for eBay. Include key identifying details and any notable condition or mint error information.`
+    }], 800, "gpt-4o");
+    return extractJSON(text);
+  } catch {
+    return null;
+  }
+}
+
 // ─── Scanner ──────────────────────────────────────────────────────────────────
 
 const BOX_SIZE = 260;
@@ -421,11 +512,22 @@ const BLUR_LAYERS = [
 function ScanScreen({ navigate, user }) {
   const [permission, requestPermission] = useCameraPermissions();
   const [phase, setPhase] = useState("scanning"); // scanning | loading | result | error
+  const [captureStage, setCaptureStage] = useState("front");
+  const [frontImage, setFrontImage] = useState(null);
+  const [backImage, setBackImage] = useState(null);
   const [loadingStep, setLoadingStep] = useState("");
   const [result, setResult] = useState(null);
   const [errorDetail, setErrorDetail] = useState(null);
+  const [ebayListing, setEbayListing] = useState(null);
+  const [listingLoading, setListingLoading] = useState(false);
+  const [listingError, setListingError] = useState("");
+  const [cameraReady, setCameraReady] = useState(false);
+  const [flashActive, setFlashActive] = useState(false);
   const scanAnim = useRef(new Animated.Value(0)).current;
+  const flashAnim = useRef(new Animated.Value(0)).current;
   const cameraRef = useRef(null);
+  const autoCaptureTimerRef = useRef(null);
+  const captureMeta = getCaptureStageMeta(captureStage);
 
   useEffect(() => {
     const anim = Animated.loop(
@@ -438,7 +540,38 @@ function ScanScreen({ navigate, user }) {
     return () => anim.stop();
   }, []);
 
+  function startNewScan() {
+    if (autoCaptureTimerRef.current) {
+      clearTimeout(autoCaptureTimerRef.current);
+      autoCaptureTimerRef.current = null;
+    }
+    setPhase("scanning");
+    setCaptureStage("front");
+    setFrontImage(null);
+    setBackImage(null);
+    setLoadingStep("");
+    setErrorDetail(null);
+    setCameraReady(false);
+    setEbayListing(null);
+    setListingError("");
+    setListingLoading(false);
+  }
+
+  async function capturePhoto() {
+    try {
+      const photo = await cameraRef.current.takePictureAsync({ base64: true, quality: 0.92 });
+      if (!photo?.base64) throw new ScanError("photo", "Photo was captured but contained no image data. Try again.");
+      return photo;
+    } catch {
+      throw new ScanError("photo", "Failed to take the photo. Make sure nothing is blocking the camera.");
+    }
+  }
+
   async function capture() {
+    if (autoCaptureTimerRef.current) {
+      clearTimeout(autoCaptureTimerRef.current);
+      autoCaptureTimerRef.current = null;
+    }
     if (!OPENAI_API_KEY) {
       setErrorDetail(makeErrorDetail(new ScanError("key_missing", "No OpenAI API key is configured. Add EXPO_PUBLIC_OPENAI_API_KEY to your .env file.")));
       setPhase("error");
@@ -450,19 +583,27 @@ function ScanScreen({ navigate, user }) {
       return;
     }
     try {
-      setPhase("loading");
-
-      setLoadingStep("📸  Capturing image…");
-      let photo;
-      try {
-        photo = await cameraRef.current.takePictureAsync({ base64: true, quality: 0.92 });
-      } catch {
-        throw new ScanError("photo", "Failed to take the photo. Make sure nothing is blocking the camera.");
+      setFlashActive(true);
+      if (captureStage === "front") {
+        setLoadingStep("📸  Capturing the front of the coin…");
+        const photo = await capturePhoto();
+        setFrontImage(photo.base64);
+        setCaptureStage("back");
+        setLoadingStep("");
+        return;
       }
-      if (!photo?.base64) throw new ScanError("photo", "Photo was captured but contained no image data. Try again.");
 
-      setLoadingStep("🤖  AI is identifying the coin…");
-      const coinData = await identifyCoinFromImage(photo.base64);
+      if (!frontImage) {
+        throw new ScanError("photo", "The front photo is missing. Please capture the front side again.");
+      }
+
+      setPhase("loading");
+      setLoadingStep("📸  Capturing the back of the coin…");
+      const photo = await capturePhoto();
+      setBackImage(photo.base64);
+
+      setLoadingStep("🤖  AI is identifying the coin from both sides…");
+      const coinData = await identifyCoinFromImages(frontImage, photo.base64);
 
       if (coinData.identifiable === false) {
         setErrorDetail({ icon: "🔍", title: "Coin Not Recognized", body: coinData.unidentifiable_reason || "The AI couldn't identify this coin.", tip: null });
@@ -490,6 +631,8 @@ function ScanScreen({ navigate, user }) {
         history.unshift({ coin: coinLabel, time: new Date().toISOString(), value: midValue });
         await AsyncStorage.setItem("@coinlens_scans", JSON.stringify(history.slice(0, 50)));
       } catch { /* storage failure shouldn't block showing results */ }
+      setEbayListing(null);
+      setListingError("");
       setResult({ coinData, numistaData, pcgsData, valueEstimate, summary });
       setPhase("result");
     } catch (e) {
@@ -497,6 +640,38 @@ function ScanScreen({ navigate, user }) {
       setPhase("error");
     }
   }
+
+  useEffect(() => {
+    if (!flashActive) return undefined;
+    flashAnim.setValue(0);
+    const animation = Animated.sequence([
+      Animated.timing(flashAnim, { toValue: 1, duration: 180, useNativeDriver: true }),
+      Animated.timing(flashAnim, { toValue: 0, duration: 180, useNativeDriver: true }),
+    ]);
+    animation.start(() => setFlashActive(false));
+    return () => animation.stop();
+  }, [flashActive, flashAnim]);
+
+  useEffect(() => {
+    if (phase !== "scanning" || !permission?.granted || !cameraReady) return undefined;
+
+    if (autoCaptureTimerRef.current) {
+      clearTimeout(autoCaptureTimerRef.current);
+    }
+
+    autoCaptureTimerRef.current = setTimeout(() => {
+      if (cameraRef.current) {
+        void capture();
+      }
+    }, captureMeta.autoCaptureDelayMs);
+
+    return () => {
+      if (autoCaptureTimerRef.current) {
+        clearTimeout(autoCaptureTimerRef.current);
+        autoCaptureTimerRef.current = null;
+      }
+    };
+  }, [cameraReady, captureMeta.autoCaptureDelayMs, captureStage, permission?.granted, phase]);
 
   if (!permission) return <View style={styles.safeArea} />;
 
@@ -543,7 +718,7 @@ function ScanScreen({ navigate, user }) {
               <Text style={styles.errorTipText}>{ed.tip}</Text>
             </View>
           ) : null}
-          <TouchableOpacity style={styles.primaryBtn} onPress={() => setPhase("scanning")}>
+          <TouchableOpacity style={styles.primaryBtn} onPress={startNewScan}>
             <Text style={styles.primaryBtnText}>Try Again</Text>
           </TouchableOpacity>
         </View>
@@ -566,7 +741,7 @@ function ScanScreen({ navigate, user }) {
               <Text key={i} style={styles.tipItem}>• {tip}</Text>
             ))}
           </View>
-          <TouchableOpacity style={styles.primaryBtn} onPress={() => setPhase("scanning")}>
+          <TouchableOpacity style={styles.primaryBtn} onPress={startNewScan}>
             <Text style={styles.primaryBtnText}>Try Again</Text>
           </TouchableOpacity>
         </View>
@@ -574,11 +749,32 @@ function ScanScreen({ navigate, user }) {
     );
   }
 
+  async function handleCreateEbayListing() {
+    if (!result) return;
+    if (!OPENAI_API_KEY) {
+      setListingError("OpenAI API key is not configured.");
+      return;
+    }
+
+    setListingLoading(true);
+    setListingError("");
+    try {
+      const { coinData, numistaData, valueEstimate, summary } = result;
+      const listing = await generateEbayListing(coinData, numistaData, valueEstimate, summary);
+      if (!listing) throw new Error("Unable to generate the listing draft right now.");
+      setEbayListing(listing);
+    } catch (err) {
+      setListingError(err.message || "Unable to create the listing draft.");
+    } finally {
+      setListingLoading(false);
+    }
+  }
+
   if (phase === "result" && result) {
     const { coinData, numistaData, pcgsData, valueEstimate, summary } = result;
     return (
       <SafeAreaView style={styles.safeArea}>
-        <Header title="Coin Identified" onBack={() => setPhase("scanning")} />
+        <Header title="Coin Identified" onBack={startNewScan} />
         <ScrollView contentContainerStyle={styles.resultContainer}>
           <GoldCoin size={72} />
           <Text style={styles.resultCoinName}>
@@ -699,7 +895,35 @@ function ScanScreen({ navigate, user }) {
             <Text style={styles.resultSummary}>{summary}</Text>
           </View>
 
-          <TouchableOpacity style={styles.primaryBtn} onPress={() => setPhase("scanning")}>
+          <View style={styles.resultCard}>
+            <Text style={styles.resultCardTitle}>eBay Listing Draft</Text>
+            {ebayListing ? (
+              <>
+                <Text style={styles.resultSummary}><Text style={styles.resultLabel}>Title: </Text>{ebayListing.title}</Text>
+                {ebayListing.subtitle ? <Text style={styles.resultSummary}><Text style={styles.resultLabel}>Subtitle: </Text>{ebayListing.subtitle}</Text> : null}
+                {ebayListing.description ? <Text style={styles.resultSummary}>{ebayListing.description}</Text> : null}
+                {Array.isArray(ebayListing.item_specifics) && ebayListing.item_specifics.length > 0 ? (
+                  <View style={styles.listingSpecList}>
+                    {ebayListing.item_specifics.map((spec, i) => (
+                      <View key={`${spec.label}-${i}`} style={styles.listingSpecRow}>
+                        <Text style={styles.resultLabel}>{spec.label}</Text>
+                        <Text style={styles.resultValue}>{spec.value}</Text>
+                      </View>
+                    ))}
+                  </View>
+                ) : null}
+                {ebayListing.shipping_notes ? <Text style={styles.resultSummary}>Shipping notes: {ebayListing.shipping_notes}</Text> : null}
+              </>
+            ) : (
+              <Text style={styles.resultSummary}>Create a polished eBay title, description, item specifics, and shipping notes for this coin.</Text>
+            )}
+            {listingError ? <Text style={styles.authError}>{listingError}</Text> : null}
+            <TouchableOpacity style={[styles.secondaryBtn, listingLoading && styles.secondaryBtnDisabled]} onPress={handleCreateEbayListing} disabled={listingLoading}>
+              {listingLoading ? <ActivityIndicator color="#000" /> : <Text style={styles.secondaryBtnText}>{ebayListing ? "Refresh eBay Listing" : "Create Ideal eBay Listing"}</Text>}
+            </TouchableOpacity>
+          </View>
+
+          <TouchableOpacity style={styles.primaryBtn} onPress={startNewScan}>
             <Text style={styles.primaryBtnText}>Scan Another</Text>
           </TouchableOpacity>
         </ScrollView>
@@ -714,7 +938,7 @@ function ScanScreen({ navigate, user }) {
       <View style={styles.scannerOuter}>
         <View style={styles.scannerBoxWrapper}>
           <View style={styles.scannerBox}>
-            <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" />
+            <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" onCameraReady={() => setCameraReady(true)} />
             <View style={[styles.corner, styles.cornerTL]} />
             <View style={[styles.corner, styles.cornerTR]} />
             <View style={[styles.corner, styles.cornerBL]} />
@@ -736,10 +960,16 @@ function ScanScreen({ navigate, user }) {
             }]} />
           </View>
         </View>
-        <Text style={styles.scanHint}>Scan the front and back of the coin</Text>
-        <TouchableOpacity style={styles.captureBtn} onPress={capture}>
-          <View style={styles.captureBtnInner} />
-        </TouchableOpacity>
+        <Text style={styles.scanHint}>{captureMeta.title}</Text>
+        <Text style={styles.scanSubHint}>{captureMeta.body}</Text>
+        <Animated.View style={[
+          styles.captureIndicator,
+          flashActive && {
+            transform: [{ scale: flashAnim.interpolate({ inputRange: [0, 1], outputRange: [1, 1.18] }) }],
+            backgroundColor: flashAnim.interpolate({ inputRange: [0, 1], outputRange: ["rgba(255,215,0,0.08)", GOLD] }),
+            borderColor: flashAnim.interpolate({ inputRange: [0, 1], outputRange: ["rgba(255,215,0,0.25)", "#fff6b0"] }),
+          },
+        ]} />
       </View>
     </SafeAreaView>
   );
@@ -751,18 +981,40 @@ function AdminScreen({ navigate }) {
   const [error, setError] = useState("");
 
   useEffect(() => {
-    fetch(SHEETDB_URL)
-      .then(r => r.json())
-      .then(data => {
-        const rows = Array.isArray(data) ? data.filter(r => r.Coin) : [];
-        setScans(rows);
-      })
-      .catch(() => setError("Failed to load data."))
-      .finally(() => setLoading(false));
+    async function loadData() {
+      try {
+        let rows = [];
+        try {
+          const response = await fetch(SHEETDB_URL);
+          const data = await response.json();
+          rows = Array.isArray(data) ? data.filter(r => r.Coin) : [];
+        } catch {
+          rows = [];
+        }
+
+        const stored = await AsyncStorage.getItem("@coinlens_scans");
+        const localScans = stored ? JSON.parse(stored) : [];
+        const normalizedLocal = localScans.map((scan, index) => ({
+          Coin: scan.coin || `Scan ${index + 1}`,
+          Time: scan.time,
+          User: scan.user || "Local User",
+          Value: scan.value,
+        }));
+
+        const mergedRows = [...rows, ...normalizedLocal];
+        setScans(mergedRows);
+      } catch {
+        setError("Failed to load data.");
+      } finally {
+        setLoading(false);
+      }
+    }
+
+    loadData();
   }, []);
 
   const byUser = scans.reduce((acc, scan) => {
-    const u = scan.User?.trim() || "Anonymous";
+    const u = scan.User?.trim() || scan.user?.trim() || "Anonymous";
     if (!acc[u]) acc[u] = [];
     acc[u].push(scan);
     return acc;
@@ -1120,8 +1372,8 @@ function AccountScreen({ navigate, user, onSignOut }) {
           </View>
           <Text style={styles.profileName}>{user.name}</Text>
           <Text style={styles.profileEmail}>{user.email}</Text>
-          <View style={user.role === "admin" ? styles.roleBadgeAdmin : styles.roleBadgeMember}>
-            <Text style={styles.roleBadgeText}>{user.role === "admin" ? "🛡 Admin" : "Member"}</Text>
+          <View style={isAdminUser(user, ADMIN_CODE) ? styles.roleBadgeAdmin : styles.roleBadgeMember}>
+            <Text style={styles.roleBadgeText}>{isAdminUser(user, ADMIN_CODE) ? "🛡 Admin" : "Member"}</Text>
           </View>
         </View>
 
@@ -1194,7 +1446,7 @@ function AccountScreen({ navigate, user, onSignOut }) {
           </View>
         ))}
 
-        {user.role === "admin" && (
+        {isAdminUser(user, ADMIN_CODE) && (
           <View style={styles.adminPanelGlow}>
             <TouchableOpacity style={styles.adminPanelBtn} onPress={() => navigate("admin")}>
               <Text style={styles.adminPanelBtnText}>🛡 Admin Panel</Text>
@@ -1217,12 +1469,16 @@ export default function App() {
   const [user, setUser] = useState(null);
   const [authReady, setAuthReady] = useState(false);
   const [userScans, setUserScans] = useState([]);
+  const [isGuest, setIsGuest] = useState(false);
 
   useEffect(() => {
     (async () => {
       try {
         const session = await AsyncStorage.getItem("@coinlens_session");
-        if (session) setUser(JSON.parse(session));
+        if (session) {
+          const persistedUser = JSON.parse(session);
+          setUser({ ...persistedUser, role: isAdminUser(persistedUser, ADMIN_CODE) ? "admin" : (persistedUser.role || "member") });
+        }
       } catch { /* corrupted session — stay logged out */ }
       setAuthReady(true);
     })();
@@ -1262,8 +1518,12 @@ export default function App() {
     const match = accounts.find(a => a.email === email);
     if (!match) throw new Error("Email not found. Please sign up first.");
     if (match.password !== password) throw new Error("Wrong password.");
-    await AsyncStorage.setItem("@coinlens_session", JSON.stringify(match));
-    setUser(match);
+    const normalizedUser = {
+      ...match,
+      role: isAdminUser(match, ADMIN_CODE) ? "admin" : (match.role || "member"),
+    };
+    await AsyncStorage.setItem("@coinlens_session", JSON.stringify(normalizedUser));
+    setUser(normalizedUser);
   }
 
   async function signOut() {
@@ -1272,17 +1532,32 @@ export default function App() {
     setScreen("home");
   }
 
+  function continueAsGuest() {
+    setIsGuest(true);
+    setScreen("scan");
+  }
+
+  function exitGuest() {
+    setIsGuest(false);
+    setScreen("home");
+  }
+
   function navigate(target) { setScreen(target); }
 
   if (!authReady) return <View style={styles.safeArea} />;
-  if (!user) return <AuthScreen onSignIn={signIn} onSignUp={signUp} />;
+
+  if (isGuest) {
+    return <ScanScreen navigate={(target) => (target === "home" ? exitGuest() : navigate(target))} user={{ name: "Guest" }} />;
+  }
+
+  if (!user) return <AuthScreen onSignIn={signIn} onSignUp={signUp} onGuest={continueAsGuest} />;
 
   if (screen === "home") return <HomeScreen navigate={navigate} />;
   if (screen === "scan") return <ScanScreen navigate={navigate} user={user} />;
   if (screen === "badges") return <BadgesScreen navigate={navigate} user={user} userScans={userScans} />;
   if (screen === "leaderboard") return <LeaderboardScreen navigate={navigate} user={user} userScans={userScans} />;
   if (screen === "account") return <AccountScreen navigate={navigate} user={user} onSignOut={signOut} />;
-  if (screen === "admin" && user.role === "admin") return <AdminScreen navigate={navigate} />;
+  if (screen === "admin" && isAdminUser(user, ADMIN_CODE)) return <AdminScreen navigate={navigate} />;
   if (screen === "stats") return <StatsScreen navigate={navigate} />;
   return <HomeScreen navigate={navigate} />;
 }
@@ -1389,15 +1664,17 @@ const styles = StyleSheet.create({
     elevation: 8,
   },
   scanHint: { fontSize: 15, color: "rgba(255,215,0,0.8)", fontWeight: "600", textAlign: "center" },
-  captureBtn: {
-    width: 72, height: 72, borderRadius: 36,
-    borderWidth: 3, borderColor: GOLD,
-    alignItems: "center", justifyContent: "center",
+  scanSubHint: { fontSize: 13, color: "rgba(255,255,255,0.7)", textAlign: "center", lineHeight: 20, maxWidth: 300, marginTop: -8 },
+  captureIndicator: {
+    width: 84,
+    height: 84,
+    borderRadius: 42,
+    borderWidth: 3,
+    borderColor: "rgba(255,215,0,0.25)",
+    backgroundColor: "rgba(255,215,0,0.08)",
+    alignItems: "center",
+    justifyContent: "center",
     ...GOLD_GLOW,
-  },
-  captureBtnInner: {
-    width: 54, height: 54, borderRadius: 27,
-    backgroundColor: GOLD,
   },
 
   // Loading / error
@@ -1474,6 +1751,19 @@ const styles = StyleSheet.create({
     ...GOLD_GLOW,
   },
   primaryBtnText: { fontSize: 18, fontWeight: "700", color: "#000" },
+  secondaryBtn: {
+    marginTop: 12,
+    backgroundColor: "rgba(255,215,0,0.12)",
+    paddingHorizontal: 24,
+    paddingVertical: 12,
+    borderRadius: 24,
+    borderWidth: 1,
+    borderColor: "rgba(255,215,0,0.35)",
+  },
+  secondaryBtnDisabled: { opacity: 0.7 },
+  secondaryBtnText: { fontSize: 15, fontWeight: "700", color: GOLD, textAlign: "center" },
+  listingSpecList: { gap: 6, marginTop: 4 },
+  listingSpecRow: { flexDirection: "row", justifyContent: "space-between", alignItems: "center", gap: 10 },
 
   // Gold coin
   goldCoin: {
@@ -1516,6 +1806,9 @@ const styles = StyleSheet.create({
   authError: { fontSize: 14, color: "#FF4444", textAlign: "center" },
   authRecoverBtn: { backgroundColor: "rgba(255,215,0,0.1)", borderWidth: 1, borderColor: "rgba(255,215,0,0.3)", borderRadius: 10, padding: 12, alignItems: "center" },
   authRecoverText: { fontSize: 13, color: GOLD, fontWeight: "600", textAlign: "center" },
+  guestBtn: { marginTop: 16, alignItems: "center", padding: 8 },
+  guestBtnText: { fontSize: 14, color: "rgba(255,215,0,0.7)", fontWeight: "600", textDecorationLine: "underline" },
+  guestBtnSubtext: { fontSize: 11, color: "rgba(255,215,0,0.35)", textAlign: "center", marginTop: 4, paddingHorizontal: 16 },
 
   // Account
   accountContainer: { padding: 24, gap: 16, paddingBottom: 40 },
