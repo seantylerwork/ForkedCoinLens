@@ -2,6 +2,7 @@ import { useState, useRef, useEffect } from "react";
 import {
   ActivityIndicator,
   Animated,
+  Image,
   KeyboardAvoidingView,
   Platform,
   SafeAreaView,
@@ -504,6 +505,7 @@ function ScanScreen({ navigate, user }) {
   const [loadingStep, setLoadingStep] = useState("");
   const [result, setResult] = useState(null);
   const [errorDetail, setErrorDetail] = useState(null);
+  const [selectedUpload, setSelectedUpload] = useState(null);
   const scanAnim = useRef(new Animated.Value(0)).current;
   const cameraRef = useRef(null);
 
@@ -606,6 +608,16 @@ function ScanScreen({ navigate, user }) {
       return;
     }
 
+    setSelectedUpload(photo.assets[0]);
+  }
+
+  async function startUploadedPhotoScan() {
+    if (!selectedUpload?.base64) {
+      setErrorDetail(makeErrorDetail(new ScanError("photo", "Choose a photo before starting the scan.")));
+      setPhase("error");
+      return;
+    }
+
     if (!OPENAI_API_KEY) {
       setPhase("loading");
       setLoadingStep("No API key found. Loading a mock scan result...");
@@ -621,7 +633,7 @@ function ScanScreen({ navigate, user }) {
 
       setLoadingStep("Preparing uploaded photo...");
       setLoadingStep("AI is identifying the coin...");
-      const coinData = await identifyCoinFromImage(photo.assets[0].base64);
+      const coinData = await identifyCoinFromImage(selectedUpload.base64);
 
       if (coinData.identifiable === false) {
         setErrorDetail(makeErrorDetail(new ScanError("unidentifiable", coinData.unidentifiable_reason || "Could not identify this coin.")));
@@ -674,6 +686,23 @@ function ScanScreen({ navigate, user }) {
               </View>
               <Text style={styles.cardArrow}>›</Text>
             </TouchableOpacity>
+
+            {selectedUpload ? (
+              <View style={styles.uploadPreviewCard}>
+                <Text style={styles.resultCardTitle}>Selected Photo</Text>
+                <View style={styles.uploadPreviewFrame}>
+                  <Image source={{ uri: selectedUpload.uri }} style={styles.uploadPreviewImage} />
+                </View>
+                <View style={styles.uploadPreviewActions}>
+                  <TouchableOpacity style={styles.secondaryBtn} onPress={uploadPhoto}>
+                    <Text style={styles.secondaryBtnText}>Choose Different</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={styles.previewScanBtn} onPress={startUploadedPhotoScan}>
+                    <Text style={styles.previewScanBtnText}>Start Scan</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            ) : null}
 
             <TouchableOpacity style={styles.scanChoiceCard} onPress={() => setPhase("scanning")}>
               <Text style={styles.scanChoiceIcon}>[]</Text>
@@ -1572,6 +1601,63 @@ const styles = StyleSheet.create({
     width: 42,
     fontSize: 32,
     color: GOLD,
+    fontWeight: "800",
+    textAlign: "center",
+  },
+  uploadPreviewCard: {
+    backgroundColor: "#0f0f0f",
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: "rgba(255,215,0,0.3)",
+    padding: 16,
+    gap: 12,
+  },
+  uploadPreviewFrame: {
+    height: 220,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "rgba(255,215,0,0.25)",
+    backgroundColor: "#050505",
+    overflow: "hidden",
+  },
+  uploadPreviewImage: {
+    width: "100%",
+    height: "100%",
+    resizeMode: "contain",
+  },
+  uploadPreviewActions: {
+    flexDirection: "row",
+    gap: 12,
+  },
+  secondaryBtn: {
+    flex: 1,
+    minHeight: 46,
+    borderRadius: 23,
+    borderWidth: 1,
+    borderColor: "rgba(255,215,0,0.45)",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 12,
+  },
+  secondaryBtnText: {
+    color: "rgba(255,215,0,0.8)",
+    fontSize: 14,
+    fontWeight: "700",
+    textAlign: "center",
+  },
+  previewScanBtn: {
+    flex: 1,
+    minHeight: 46,
+    borderRadius: 23,
+    backgroundColor: GOLD,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 12,
+    ...GOLD_GLOW,
+  },
+  previewScanBtnText: {
+    color: "#000",
+    fontSize: 14,
     fontWeight: "800",
     textAlign: "center",
   },
