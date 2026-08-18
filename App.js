@@ -13,6 +13,7 @@ import {
   View
 } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
+import * as ImagePicker from "expo-image-picker";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 
 
@@ -408,6 +409,85 @@ PCGS: ${JSON.stringify(pcgsData)}`,
 
 // ─── Scanner ──────────────────────────────────────────────────────────────────
 
+function getMockScanResult() {
+  const mockResults = [
+    {
+      coinData: {
+        country: "United States",
+        denomination: "Quarter Dollar",
+        year: "1965",
+        mint_mark: null,
+        estimated_grade: "VF-30",
+        mint_errors: [],
+        varieties: null,
+        error_premium: false,
+        special_notes: "Mock result for UI testing. This is not based on the uploaded image.",
+        identifiable: true,
+        confidence: 84,
+        alternatives: [
+          { coin: "Washington Quarter", confidence: 72 },
+          { coin: "Roosevelt Dime", confidence: 41 },
+          { coin: "Kennedy Half Dollar", confidence: 32 },
+        ],
+      },
+      numistaData: {
+        title: "Washington Quarter",
+        composition: { text: "Copper-nickel clad copper" },
+        weight: 5.67,
+        size: 24.3,
+      },
+      pcgsData: null,
+      valueEstimate: {
+        low: 0.25,
+        high: 1.5,
+        condition_assumed: "VF-30",
+        error_value_note: null,
+        reasoning: "This mock estimate treats the coin as a common circulated clad quarter.",
+      },
+      summary:
+        "This looks like a common U.S. Washington quarter in circulated condition. The portrait and denomination make it a familiar everyday coin, with most value coming from condition rather than rarity. This is a temporary mock result for checking the scan result UI.",
+    },
+    {
+      coinData: {
+        country: "United States",
+        denomination: "One Cent",
+        year: "1982",
+        mint_mark: null,
+        estimated_grade: "XF-40",
+        mint_errors: [],
+        varieties: "Large Date / Small Date variety possible",
+        error_premium: false,
+        special_notes: "Mock result for UI testing. 1982 cents can vary by date style and composition.",
+        identifiable: true,
+        confidence: 78,
+        alternatives: [
+          { coin: "Lincoln Memorial Cent", confidence: 69 },
+          { coin: "Wheat Cent", confidence: 28 },
+          { coin: "Jefferson Nickel", confidence: 18 },
+        ],
+      },
+      numistaData: {
+        title: "Lincoln Cent",
+        composition: { text: "Copper-plated zinc or bronze, depending on variety" },
+        weight: 2.5,
+        size: 19,
+      },
+      pcgsData: null,
+      valueEstimate: {
+        low: 0.01,
+        high: 3,
+        condition_assumed: "XF-40",
+        error_value_note: null,
+        reasoning: "This mock estimate assumes a common 1982 Lincoln cent without a rare variety.",
+      },
+      summary:
+        "This mock match is a 1982 Lincoln cent, a transition-year penny collectors often check more closely. Some 1982 cents differ by composition and date style, which can matter for identification. This placeholder result lets you preview the UI before the API key is ready.",
+    },
+  ];
+
+  return mockResults[Math.floor(Math.random() * mockResults.length)];
+}
+
 const BOX_SIZE = 260;
 const BLUR_LAYERS = [
   { offset: -20, opacity: 0.05, height: 3 },
@@ -420,7 +500,7 @@ const BLUR_LAYERS = [
 
 function ScanScreen({ navigate, user }) {
   const [permission, requestPermission] = useCameraPermissions();
-  const [phase, setPhase] = useState("scanning"); // scanning | loading | result | error
+  const [phase, setPhase] = useState("choose"); // choose | scanning | loading | result | error | unidentifiable
   const [loadingStep, setLoadingStep] = useState("");
   const [result, setResult] = useState(null);
   const [errorDetail, setErrorDetail] = useState(null);
@@ -439,14 +519,18 @@ function ScanScreen({ navigate, user }) {
   }, []);
 
   async function capture() {
-    if (!OPENAI_API_KEY) {
-      setErrorDetail(makeErrorDetail(new ScanError("key_missing", "No OpenAI API key is configured. Add EXPO_PUBLIC_OPENAI_API_KEY to your .env file.")));
-      setPhase("error");
-      return;
-    }
     if (!cameraRef.current) {
       setErrorDetail(makeErrorDetail(new ScanError("camera", "The camera hasn't finished initializing. Wait a moment and try again.")));
       setPhase("error");
+      return;
+    }
+    if (!OPENAI_API_KEY) {
+      setPhase("loading");
+      setLoadingStep("No API key found. Loading a mock scan result...");
+      setTimeout(() => {
+        setResult(getMockScanResult());
+        setPhase("result");
+      }, 1200);
       return;
     }
     try {
@@ -498,12 +582,119 @@ function ScanScreen({ navigate, user }) {
     }
   }
 
-  if (!permission) return <View style={styles.safeArea} />;
+  async function uploadPhoto() {
+    const permissionResult = await ImagePicker.requestMediaLibraryPermissionsAsync(false);
+    if (!permissionResult.granted) {
+      setErrorDetail(makeErrorDetail(new ScanError(
+        "permission",
+        permissionResult.canAskAgain
+          ? "Photo access is needed to upload a coin image. Tap Upload Photo again to retry."
+          : "Photo access is blocked. Enable Photos access for CoinLens in your device settings."
+      )));
+      setPhase("error");
+      return;
+    }
 
-  if (!permission.granted) {
+    const photo = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ["images"],
+      allowsMultipleSelection: false,
+      base64: true,
+      quality: 0.92,
+    });
+
+    if (photo.canceled || !photo.assets?.[0]?.base64) {
+      return;
+    }
+
+    if (!OPENAI_API_KEY) {
+      setPhase("loading");
+      setLoadingStep("No API key found. Loading a mock scan result...");
+      setTimeout(() => {
+        setResult(getMockScanResult());
+        setPhase("result");
+      }, 1200);
+      return;
+    }
+
+    try {
+      setPhase("loading");
+
+      setLoadingStep("Preparing uploaded photo...");
+      setLoadingStep("AI is identifying the coin...");
+      const coinData = await identifyCoinFromImage(photo.assets[0].base64);
+
+      if (coinData.identifiable === false) {
+        setErrorDetail(makeErrorDetail(new ScanError("unidentifiable", coinData.unidentifiable_reason || "Could not identify this coin.")));
+        setPhase("unidentifiable");
+        return;
+      }
+
+      setLoadingStep("Looking up specifications...");
+      const numistaData = await getNumistaSpecs(coinData);
+
+      setLoadingStep("Estimating value...");
+      const pcgsNo = numistaData?.references?.find?.(r => r.type === "PCGS")?.number;
+      const pcgsData = pcgsNo ? await getPcgsValue(pcgsNo) : null;
+      const valueEstimate = await estimateCoinValue(coinData, numistaData);
+
+      setLoadingStep("Generating summary...");
+      const summary = await generateSummary(coinData, numistaData, pcgsData);
+
+      logScanToSheet(coinData, user?.name);
+      const coinLabel = [coinData.year, coinData.country, coinData.denomination].filter(v => v && v !== "Unknown").join(" ");
+      AsyncStorage.getItem("@coinlens_scans").then(data => {
+        const history = data ? JSON.parse(data) : [];
+        const midValue = valueEstimate ? ((valueEstimate.low ?? 0) + (valueEstimate.high ?? 0)) / 2 : 0;
+        history.unshift({ coin: coinLabel, time: new Date().toISOString(), value: midValue });
+        AsyncStorage.setItem("@coinlens_scans", JSON.stringify(history.slice(0, 50)));
+      });
+      setResult({ coinData, numistaData, pcgsData, valueEstimate, summary });
+      setPhase("result");
+    } catch (e) {
+      setErrorDetail(makeErrorDetail(e));
+      setPhase("error");
+    }
+  }
+
+  if (phase === "choose") {
     return (
       <SafeAreaView style={styles.safeArea}>
         <Header title="Scan Coin" onBack={() => navigate("home")} />
+        <ScrollView contentContainerStyle={styles.scanChoiceContainer}>
+          <GoldCoin size={88} />
+          <Text style={styles.pageTitle}>Scan Coin</Text>
+          <Text style={styles.pageSubtitle}>Choose how you want to add a coin photo.</Text>
+
+          <View style={styles.scanChoiceOptions}>
+            <TouchableOpacity style={styles.scanChoiceCard} onPress={uploadPhoto}>
+              <Text style={styles.scanChoiceIcon}>+</Text>
+              <View style={styles.cardText}>
+                <Text style={styles.cardLabel}>Upload Photo</Text>
+                <Text style={styles.cardDesc}>Pick an existing coin photo</Text>
+              </View>
+              <Text style={styles.cardArrow}>›</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity style={styles.scanChoiceCard} onPress={() => setPhase("scanning")}>
+              <Text style={styles.scanChoiceIcon}>[]</Text>
+              <View style={styles.cardText}>
+                <Text style={styles.cardLabel}>Take Photo</Text>
+                <Text style={styles.cardDesc}>Use your camera for a new scan</Text>
+              </View>
+              <Text style={styles.cardArrow}>›</Text>
+            </TouchableOpacity>
+          </View>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  if (phase === "scanning" && !permission) return <View style={styles.safeArea} />;
+
+  if (phase === "scanning" && !permission.granted) {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <Header title="Scan Coin" onBack={() => setPhase("choose")} />
         <View style={styles.center}>
           <GoldCoin size={80} />
           <Text style={styles.pageTitle}>Camera Access</Text>
@@ -519,7 +710,7 @@ function ScanScreen({ navigate, user }) {
   if (phase === "loading") {
     return (
       <SafeAreaView style={styles.safeArea}>
-        <Header title="Scan Coin" onBack={() => navigate("home")} />
+        <Header title="Scan Coin" onBack={() => setPhase("choose")} />
         <View style={styles.center}>
           <ActivityIndicator size="large" color={GOLD} />
           <Text style={styles.loadingStep}>{loadingStep}</Text>
@@ -543,7 +734,7 @@ function ScanScreen({ navigate, user }) {
               <Text style={styles.errorTipText}>{ed.tip}</Text>
             </View>
           ) : null}
-          <TouchableOpacity style={styles.primaryBtn} onPress={() => setPhase("scanning")}>
+          <TouchableOpacity style={styles.primaryBtn} onPress={() => setPhase("choose")}>
             <Text style={styles.primaryBtnText}>Try Again</Text>
           </TouchableOpacity>
         </View>
@@ -578,7 +769,7 @@ function ScanScreen({ navigate, user }) {
     const { coinData, numistaData, pcgsData, valueEstimate, summary } = result;
     return (
       <SafeAreaView style={styles.safeArea}>
-        <Header title="Coin Identified" onBack={() => setPhase("scanning")} />
+        <Header title="Coin Identified" onBack={() => setPhase("choose")} />
         <ScrollView contentContainerStyle={styles.resultContainer}>
           <GoldCoin size={72} />
           <Text style={styles.resultCoinName}>
@@ -699,7 +890,7 @@ function ScanScreen({ navigate, user }) {
             <Text style={styles.resultSummary}>{summary}</Text>
           </View>
 
-          <TouchableOpacity style={styles.primaryBtn} onPress={() => setPhase("scanning")}>
+          <TouchableOpacity style={styles.primaryBtn} onPress={() => setPhase("choose")}>
             <Text style={styles.primaryBtnText}>Scan Another</Text>
           </TouchableOpacity>
         </ScrollView>
@@ -1351,6 +1542,39 @@ const styles = StyleSheet.create({
   cardLabel: { fontSize: 20, fontWeight: "700", color: GOLD },
   cardDesc: { fontSize: 14, color: "rgba(255,215,0,0.6)", marginTop: 2 },
   cardArrow: { fontSize: 28, color: "rgba(255,215,0,0.4)", fontWeight: "300" },
+
+  // Scan choice
+  scanChoiceContainer: {
+    flexGrow: 1,
+    alignItems: "center",
+    padding: 24,
+    paddingTop: 44,
+    paddingBottom: 40,
+  },
+  scanChoiceOptions: {
+    width: "100%",
+    maxWidth: 440,
+    gap: 16,
+    marginTop: 32,
+  },
+  scanChoiceCard: {
+    backgroundColor: "#0f0f0f",
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: "rgba(255,215,0,0.4)",
+    padding: 20,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 16,
+    ...GOLD_GLOW,
+  },
+  scanChoiceIcon: {
+    width: 42,
+    fontSize: 32,
+    color: GOLD,
+    fontWeight: "800",
+    textAlign: "center",
+  },
 
   // Scanner
   scannerOuter: { flex: 1, alignItems: "center", justifyContent: "center", gap: 28 },
