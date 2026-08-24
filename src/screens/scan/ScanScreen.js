@@ -1,0 +1,724 @@
+import { useEffect, useRef, useState } from "react";
+import {
+  ActivityIndicator,
+  Animated,
+  Image,
+  SafeAreaView,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
+} from "react-native";
+import { CameraView, useCameraPermissions } from "expo-camera";
+import * as ImagePicker from "expo-image-picker";
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import ConfidenceMeter from "../../components/ConfidenceMeter";
+import GoldCoin from "../../components/GoldCoin";
+import Header from "../../components/Header";
+import { GOLD, BOX_SIZE } from "../../theme/colors";
+import styles from "../../theme/styles";
+import { getCaptureStageMeta } from "../../../scanFlowLogic";
+import {
+  MOCK_MODE,
+  ScanError,
+  makeErrorDetail,
+  identifyCoinFromImage,
+  identifyCoinFromImages,
+  getNumistaSpecs,
+  getPcgsValue,
+  estimateCoinValue,
+  generateSummary,
+  generateEbayListing,
+  logScanToSheet,
+} from "../../api/client";
+
+function getMockScanResult() {
+  const mockResults = [
+    {
+      coinData: {
+        country: "United States",
+        denomination: "Quarter Dollar",
+        year: "1965",
+        mint_mark: null,
+        estimated_grade: "VF-30",
+        mint_errors: [],
+        varieties: null,
+        error_premium: false,
+        special_notes: "Mock result for UI testing. This is not based on the uploaded image.",
+        identifiable: true,
+        confidence: 84,
+        alternatives: [
+          { coin: "Washington Quarter", confidence: 72 },
+          { coin: "Roosevelt Dime", confidence: 41 },
+          { coin: "Kennedy Half Dollar", confidence: 32 },
+        ],
+      },
+      numistaData: {
+        title: "Washington Quarter",
+        composition: { text: "Copper-nickel clad copper" },
+        weight: 5.67,
+        size: 24.3,
+      },
+      pcgsData: null,
+      valueEstimate: {
+        low: 0.25,
+        high: 1.5,
+        condition_assumed: "VF-30",
+        error_value_note: null,
+        reasoning: "This mock estimate treats the coin as a common circulated clad quarter.",
+      },
+      summary:
+        "This looks like a common U.S. Washington quarter in circulated condition. The portrait and denomination make it a familiar everyday coin, with most value coming from condition rather than rarity. This is a temporary mock result for checking the scan result UI.",
+    },
+    {
+      coinData: {
+        country: "United States",
+        denomination: "One Cent",
+        year: "1982",
+        mint_mark: null,
+        estimated_grade: "XF-40",
+        mint_errors: [],
+        varieties: "Large Date / Small Date variety possible",
+        error_premium: false,
+        special_notes: "Mock result for UI testing. 1982 cents can vary by date style and composition.",
+        identifiable: true,
+        confidence: 78,
+        alternatives: [
+          { coin: "Lincoln Memorial Cent", confidence: 69 },
+          { coin: "Wheat Cent", confidence: 28 },
+          { coin: "Jefferson Nickel", confidence: 18 },
+        ],
+      },
+      numistaData: {
+        title: "Lincoln Cent",
+        composition: { text: "Copper-plated zinc or bronze, depending on variety" },
+        weight: 2.5,
+        size: 19,
+      },
+      pcgsData: null,
+      valueEstimate: {
+        low: 0.01,
+        high: 3,
+        condition_assumed: "XF-40",
+        error_value_note: null,
+        reasoning: "This mock estimate assumes a common 1982 Lincoln cent without a rare variety.",
+      },
+      summary:
+        "This mock match is a 1982 Lincoln cent, a transition-year penny collectors often check more closely. Some 1982 cents differ by composition and date style, which can matter for identification. This placeholder result lets you preview the UI before the API key is ready.",
+    },
+  ];
+
+  return mockResults[Math.floor(Math.random() * mockResults.length)];
+}
+
+const BLUR_LAYERS = [
+  { offset: -20, opacity: 0.05, height: 3 },
+  { offset: -11, opacity: 0.18, height: 2 },
+  { offset: -5,  opacity: 0.35, height: 2 },
+  { offset: 5,   opacity: 0.35, height: 2 },
+  { offset: 11,  opacity: 0.18, height: 2 },
+  { offset: 20,  opacity: 0.05, height: 3 },
+];
+
+export default function ScanScreen({ navigate, user }) {
+  const [permission, requestPermission] = useCameraPermissions();
+  const [phase, setPhase] = useState("choose"); // choose | scanning | loading | result | error | unidentifiable
+  const [captureStage, setCaptureStage] = useState("front");
+  const [frontImage, setFrontImage] = useState(null);
+  const [backImage, setBackImage] = useState(null);
+  const [loadingStep, setLoadingStep] = useState("");
+  const [result, setResult] = useState(null);
+  const [errorDetail, setErrorDetail] = useState(null);
+  const [ebayListing, setEbayListing] = useState(null);
+  const [listingLoading, setListingLoading] = useState(false);
+  const [listingError, setListingError] = useState("");
+  const [cameraReady, setCameraReady] = useState(false);
+  const [flashActive, setFlashActive] = useState(false);
+  const [selectedUpload, setSelectedUpload] = useState(null);
+  const scanAnim = useRef(new Animated.Value(0)).current;
+  const flashAnim = useRef(new Animated.Value(0)).current;
+  const cameraRef = useRef(null);
+  const autoCaptureTimerRef = useRef(null);
+  const captureMeta = getCaptureStageMeta(captureStage);
+
+  useEffect(() => {
+    const anim = Animated.loop(
+      Animated.sequence([
+        Animated.timing(scanAnim, { toValue: 1, duration: 1800, useNativeDriver: true }),
+        Animated.timing(scanAnim, { toValue: 0, duration: 1800, useNativeDriver: true }),
+      ])
+    );
+    anim.start();
+    return () => anim.stop();
+  }, []);
+
+  function startNewScan() {
+    if (autoCaptureTimerRef.current) {
+      clearTimeout(autoCaptureTimerRef.current);
+      autoCaptureTimerRef.current = null;
+    }
+    setPhase("choose");
+    setCaptureStage("front");
+    setFrontImage(null);
+    setBackImage(null);
+    setLoadingStep("");
+    setErrorDetail(null);
+    setCameraReady(false);
+    setEbayListing(null);
+    setListingError("");
+    setListingLoading(false);
+    setSelectedUpload(null);
+  }
+
+  async function capturePhoto() {
+    try {
+      const photo = await cameraRef.current.takePictureAsync({ base64: true, quality: 0.92 });
+      if (!photo?.base64) throw new ScanError("photo", "Photo was captured but contained no image data. Try again.");
+      return photo;
+    } catch {
+      throw new ScanError("photo", "Failed to take the photo. Make sure nothing is blocking the camera.");
+    }
+  }
+
+  async function capture() {
+    if (autoCaptureTimerRef.current) {
+      clearTimeout(autoCaptureTimerRef.current);
+      autoCaptureTimerRef.current = null;
+    }
+    if (!cameraRef.current) {
+      setErrorDetail(makeErrorDetail(new ScanError("camera", "The camera hasn't finished initializing. Wait a moment and try again.")));
+      setPhase("error");
+      return;
+    }
+    if (MOCK_MODE) {
+      setPhase("loading");
+      setLoadingStep("Mock mode enabled. Loading a mock scan result...");
+      setTimeout(() => {
+        setResult(getMockScanResult());
+        setPhase("result");
+      }, 1200);
+      return;
+    }
+    try {
+      setFlashActive(true);
+      if (captureStage === "front") {
+        setLoadingStep("📸  Capturing the front of the coin…");
+        const photo = await capturePhoto();
+        setFrontImage(photo.base64);
+        setCaptureStage("back");
+        setLoadingStep("");
+        return;
+      }
+
+      if (!frontImage) {
+        throw new ScanError("photo", "The front photo is missing. Please capture the front side again.");
+      }
+
+      setPhase("loading");
+      setLoadingStep("📸  Capturing the back of the coin…");
+      const photo = await capturePhoto();
+      setBackImage(photo.base64);
+
+      setLoadingStep("🤖  AI is identifying the coin from both sides…");
+      const coinData = await identifyCoinFromImages(frontImage, photo.base64);
+
+      if (coinData.identifiable === false) {
+        setErrorDetail({ icon: "🔍", title: "Coin Not Recognized", body: coinData.unidentifiable_reason || "The AI couldn't identify this coin.", tip: null });
+        setPhase("unidentifiable");
+        return;
+      }
+
+      setLoadingStep("📚  Looking up specifications…");
+      const numistaData = await getNumistaSpecs(coinData);
+
+      setLoadingStep("💰  Estimating value…");
+      const pcgsNo = numistaData?.references?.find?.(r => r.type === "PCGS")?.number;
+      const pcgsData = pcgsNo ? await getPcgsValue(pcgsNo) : null;
+      const valueEstimate = await estimateCoinValue(coinData, numistaData);
+
+      setLoadingStep("✍️  Generating summary…");
+      const summary = await generateSummary(coinData, numistaData, pcgsData);
+
+      logScanToSheet(coinData, user?.name);
+      const coinLabel = [coinData.year, coinData.country, coinData.denomination].filter(v => v && v !== "Unknown").join(" ");
+      try {
+        const stored = await AsyncStorage.getItem("@coinlens_scans");
+        const history = stored ? JSON.parse(stored) : [];
+        const midValue = valueEstimate ? ((valueEstimate.low ?? 0) + (valueEstimate.high ?? 0)) / 2 : 0;
+        history.unshift({ coin: coinLabel, time: new Date().toISOString(), value: midValue });
+        await AsyncStorage.setItem("@coinlens_scans", JSON.stringify(history.slice(0, 50)));
+      } catch { /* storage failure shouldn't block showing results */ }
+      setEbayListing(null);
+      setListingError("");
+      setResult({ coinData, numistaData, pcgsData, valueEstimate, summary });
+      setPhase("result");
+    } catch (e) {
+      setErrorDetail(makeErrorDetail(e));
+      setPhase("error");
+    }
+  }
+
+  useEffect(() => {
+    if (!flashActive) return undefined;
+    flashAnim.setValue(0);
+    const animation = Animated.sequence([
+      Animated.timing(flashAnim, { toValue: 1, duration: 180, useNativeDriver: true }),
+      Animated.timing(flashAnim, { toValue: 0, duration: 180, useNativeDriver: true }),
+    ]);
+    animation.start(() => setFlashActive(false));
+    return () => animation.stop();
+  }, [flashActive, flashAnim]);
+
+  useEffect(() => {
+    if (phase !== "scanning" || !permission?.granted || !cameraReady) return undefined;
+
+    if (autoCaptureTimerRef.current) {
+      clearTimeout(autoCaptureTimerRef.current);
+    }
+
+    autoCaptureTimerRef.current = setTimeout(() => {
+      if (cameraRef.current) {
+        void capture();
+      }
+    }, captureMeta.autoCaptureDelayMs);
+
+    return () => {
+      if (autoCaptureTimerRef.current) {
+        clearTimeout(autoCaptureTimerRef.current);
+        autoCaptureTimerRef.current = null;
+      }
+    };
+  }, [cameraReady, captureMeta.autoCaptureDelayMs, captureStage, permission?.granted, phase]);
+
+  async function uploadPhoto() {
+    const permissionResult = await ImagePicker.requestMediaLibraryPermissionsAsync(false);
+    if (!permissionResult.granted) {
+      setErrorDetail(makeErrorDetail(new ScanError(
+        "permission",
+        permissionResult.canAskAgain
+          ? "Photo access is needed to upload a coin image. Tap Upload Photo again to retry."
+          : "Photo access is blocked. Enable Photos access for CoinLens in your device settings."
+      )));
+      setPhase("error");
+      return;
+    }
+
+    const photo = await ImagePicker.launchImageLibraryAsync({
+      mediaTypes: ["images"],
+      allowsMultipleSelection: false,
+      base64: true,
+      quality: 0.92,
+    });
+
+    if (photo.canceled || !photo.assets?.[0]?.base64) {
+      return;
+    }
+
+    setSelectedUpload(photo.assets[0]);
+  }
+
+  async function startUploadedPhotoScan() {
+    if (!selectedUpload?.base64) {
+      setErrorDetail(makeErrorDetail(new ScanError("photo", "Choose a photo before starting the scan.")));
+      setPhase("error");
+      return;
+    }
+
+    if (MOCK_MODE) {
+      setPhase("loading");
+      setLoadingStep("Mock mode enabled. Loading a mock scan result...");
+      setTimeout(() => {
+        setResult(getMockScanResult());
+        setPhase("result");
+      }, 1200);
+      return;
+    }
+
+    try {
+      setPhase("loading");
+
+      setLoadingStep("Preparing uploaded photo...");
+      setLoadingStep("AI is identifying the coin...");
+      const coinData = await identifyCoinFromImage(selectedUpload.base64);
+
+      if (coinData.identifiable === false) {
+        setErrorDetail(makeErrorDetail(new ScanError("unidentifiable", coinData.unidentifiable_reason || "Could not identify this coin.")));
+        setPhase("unidentifiable");
+        return;
+      }
+
+      setLoadingStep("Looking up specifications...");
+      const numistaData = await getNumistaSpecs(coinData);
+
+      setLoadingStep("Estimating value...");
+      const pcgsNo = numistaData?.references?.find?.(r => r.type === "PCGS")?.number;
+      const pcgsData = pcgsNo ? await getPcgsValue(pcgsNo) : null;
+      const valueEstimate = await estimateCoinValue(coinData, numistaData);
+
+      setLoadingStep("Generating summary...");
+      const summary = await generateSummary(coinData, numistaData, pcgsData);
+
+      logScanToSheet(coinData, user?.name);
+      const coinLabel = [coinData.year, coinData.country, coinData.denomination].filter(v => v && v !== "Unknown").join(" ");
+      AsyncStorage.getItem("@coinlens_scans").then(data => {
+        const history = data ? JSON.parse(data) : [];
+        const midValue = valueEstimate ? ((valueEstimate.low ?? 0) + (valueEstimate.high ?? 0)) / 2 : 0;
+        history.unshift({ coin: coinLabel, time: new Date().toISOString(), value: midValue });
+        AsyncStorage.setItem("@coinlens_scans", JSON.stringify(history.slice(0, 50)));
+      });
+      setResult({ coinData, numistaData, pcgsData, valueEstimate, summary });
+      setPhase("result");
+    } catch (e) {
+      setErrorDetail(makeErrorDetail(e));
+      setPhase("error");
+    }
+  }
+
+  if (phase === "choose") {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <Header title="Scan Coin" onBack={() => navigate("home")} />
+        <ScrollView contentContainerStyle={styles.scanChoiceContainer}>
+          <GoldCoin size={88} />
+          <Text style={styles.pageTitle}>Scan Coin</Text>
+          <Text style={styles.pageSubtitle}>Choose how you want to add a coin photo.</Text>
+
+          <View style={styles.scanChoiceOptions}>
+            <TouchableOpacity style={styles.scanChoiceCard} onPress={uploadPhoto}>
+              <Text style={styles.scanChoiceIcon}>+</Text>
+              <View style={styles.cardText}>
+                <Text style={styles.cardLabel}>Upload Photo</Text>
+                <Text style={styles.cardDesc}>Pick an existing coin photo</Text>
+              </View>
+              <Text style={styles.cardArrow}>›</Text>
+            </TouchableOpacity>
+
+            {selectedUpload ? (
+              <View style={styles.uploadPreviewCard}>
+                <Text style={styles.resultCardTitle}>Selected Photo</Text>
+                <View style={styles.uploadPreviewFrame}>
+                  <Image source={{ uri: selectedUpload.uri }} style={styles.uploadPreviewImage} />
+                </View>
+                <View style={styles.uploadPreviewActions}>
+                  <TouchableOpacity style={styles.secondaryBtn} onPress={uploadPhoto}>
+                    <Text style={styles.secondaryBtnText}>Choose Different</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={styles.previewScanBtn} onPress={startUploadedPhotoScan}>
+                    <Text style={styles.previewScanBtnText}>Start Scan</Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            ) : null}
+
+            <TouchableOpacity style={styles.scanChoiceCard} onPress={() => { setCaptureStage("front"); setFrontImage(null); setBackImage(null); setPhase("scanning"); }}>
+              <Text style={styles.scanChoiceIcon}>[]</Text>
+              <View style={styles.cardText}>
+                <Text style={styles.cardLabel}>Take Photo</Text>
+                <Text style={styles.cardDesc}>Use your camera for a new scan</Text>
+              </View>
+              <Text style={styles.cardArrow}>›</Text>
+            </TouchableOpacity>
+          </View>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  if (phase === "scanning" && !permission) return <View style={styles.safeArea} />;
+
+  if (phase === "scanning" && !permission.granted) {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <Header title="Scan Coin" onBack={() => setPhase("choose")} />
+        <View style={styles.center}>
+          <GoldCoin size={80} />
+          <Text style={styles.pageTitle}>Camera Access</Text>
+          <Text style={styles.pageSubtitle}>Camera access is needed to scan your coins.</Text>
+          <TouchableOpacity style={styles.primaryBtn} onPress={requestPermission}>
+            <Text style={styles.primaryBtnText}>Allow Camera</Text>
+          </TouchableOpacity>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  if (phase === "loading") {
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <Header title="Scan Coin" onBack={() => setPhase("choose")} />
+        <View style={styles.center}>
+          <ActivityIndicator size="large" color={GOLD} />
+          <Text style={styles.loadingStep}>{loadingStep}</Text>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  if (phase === "error") {
+    const ed = errorDetail ?? { icon: "⚠️", title: "Something Went Wrong", body: "An unexpected error occurred.", tip: "Try scanning again." };
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <Header title="Scan Coin" onBack={() => navigate("home")} />
+        <View style={styles.center}>
+          <Text style={styles.errorIcon}>{ed.icon}</Text>
+          <Text style={styles.pageTitle}>{ed.title}</Text>
+          <Text style={styles.errorBody}>{ed.body}</Text>
+          {ed.tip ? (
+            <View style={styles.errorTipBox}>
+              <Text style={styles.errorTipLabel}>💡 What to do</Text>
+              <Text style={styles.errorTipText}>{ed.tip}</Text>
+            </View>
+          ) : null}
+          <TouchableOpacity style={styles.primaryBtn} onPress={startNewScan}>
+            <Text style={styles.primaryBtnText}>Try Again</Text>
+          </TouchableOpacity>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  if (phase === "unidentifiable") {
+    const ed = errorDetail ?? { icon: "🔍", title: "Coin Not Recognized", body: "The AI couldn't identify this coin.", tip: null };
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <Header title="Scan Coin" onBack={() => navigate("home")} />
+        <View style={styles.center}>
+          <Text style={styles.errorIcon}>{ed.icon}</Text>
+          <Text style={styles.pageTitle}>{ed.title}</Text>
+          <Text style={styles.errorBody}>{ed.body}</Text>
+          <View style={styles.unidentifiableTips}>
+            <Text style={styles.tipsTitle}>Tips for a better scan</Text>
+            {["Place the coin on a flat, dark surface", "Use good lighting — avoid glare", "Hold the camera steady and close", "Make sure the full coin is in frame"].map((tip, i) => (
+              <Text key={i} style={styles.tipItem}>• {tip}</Text>
+            ))}
+          </View>
+          <TouchableOpacity style={styles.primaryBtn} onPress={startNewScan}>
+            <Text style={styles.primaryBtnText}>Try Again</Text>
+          </TouchableOpacity>
+        </View>
+      </SafeAreaView>
+    );
+  }
+
+  async function handleCreateEbayListing() {
+    if (!result) return;
+
+    setListingLoading(true);
+    setListingError("");
+    try {
+      const { coinData, numistaData, valueEstimate, summary } = result;
+      const listing = await generateEbayListing(coinData, numistaData, valueEstimate, summary);
+      if (!listing) throw new Error("Unable to generate the listing draft right now.");
+      setEbayListing(listing);
+    } catch (err) {
+      setListingError(err.message || "Unable to create the listing draft.");
+    } finally {
+      setListingLoading(false);
+    }
+  }
+
+  if (phase === "result" && result) {
+    const { coinData, numistaData, pcgsData, valueEstimate, summary } = result;
+    return (
+      <SafeAreaView style={styles.safeArea}>
+        <Header title="Coin Identified" onBack={startNewScan} />
+        <ScrollView contentContainerStyle={styles.resultContainer}>
+          <GoldCoin size={72} />
+          <Text style={styles.resultCoinName}>
+            {coinData.year !== "Unknown" ? `${coinData.year} ` : ""}{coinData.country} {coinData.denomination}
+          </Text>
+
+          <ConfidenceMeter value={coinData.confidence} />
+
+          {Array.isArray(coinData.alternatives) && coinData.alternatives.length > 0 && (
+            <View style={styles.resultCard}>
+              <Text style={styles.resultCardTitle}>Could Also Be</Text>
+              {coinData.alternatives.map((alt, i) => (
+                <View key={i} style={styles.altRow}>
+                  <View style={styles.altInfo}>
+                    <Text style={styles.altCoin}>{alt.coin}</Text>
+                    <View style={styles.altBarTrack}>
+                      <View style={[styles.altBarFill, { width: `${alt.confidence}%` }]} />
+                    </View>
+                  </View>
+                  <Text style={styles.altPct}>{alt.confidence}%</Text>
+                </View>
+              ))}
+            </View>
+          )}
+
+          <View style={styles.resultCard}>
+            <Text style={styles.resultCardTitle}>AI Identification</Text>
+            {[["Country", coinData.country], ["Denomination", coinData.denomination],
+              ["Year", coinData.year], ["Mint Mark", coinData.mint_mark],
+              ["Grade", coinData.estimated_grade],
+              ["Varieties", coinData.varieties]].map(([label, val]) =>
+              val && val !== "Unknown" ? (
+                <View key={label} style={styles.resultRow}>
+                  <Text style={styles.resultLabel}>{label}</Text>
+                  <Text style={styles.resultValue}>{val}</Text>
+                </View>
+              ) : null
+            )}
+            {coinData.special_notes ? (
+              <Text style={[styles.resultSummary, { marginTop: 4 }]}>{coinData.special_notes}</Text>
+            ) : null}
+          </View>
+
+          {coinData.mint_errors?.length > 0 && (
+            <View style={[styles.resultCard, styles.errorCard]}>
+              <Text style={[styles.resultCardTitle, { color: "#FF6B35" }]}>⚠ Mint Errors Detected</Text>
+              {coinData.mint_errors.map((err, i) => (
+                <View key={i} style={styles.errorRow}>
+                  <Text style={styles.errorBullet}>•</Text>
+                  <Text style={styles.errorText}>{err}</Text>
+                </View>
+              ))}
+            </View>
+          )}
+
+          {numistaData && !numistaData.error && (
+            <View style={styles.resultCard}>
+              <Text style={styles.resultCardTitle}>Numista Specs</Text>
+              {[["Title", numistaData.title], ["Composition", numistaData.composition?.text],
+                ["Weight", numistaData.weight ? `${numistaData.weight}g` : null],
+                ["Diameter", numistaData.size ? `${numistaData.size}mm` : null]].map(([label, val]) =>
+                val ? (
+                  <View key={label} style={styles.resultRow}>
+                    <Text style={styles.resultLabel}>{label}</Text>
+                    <Text style={styles.resultValue}>{val}</Text>
+                  </View>
+                ) : null
+              )}
+            </View>
+          )}
+
+          {valueEstimate && (
+            <View style={styles.resultCard}>
+              <Text style={styles.resultCardTitle}>AI Value Estimate</Text>
+              <View style={styles.valueRangeRow}>
+                <View style={styles.valueBox}>
+                  <Text style={styles.valueBoxLabel}>Low</Text>
+                  <Text style={styles.valueBoxAmount}>${valueEstimate.low?.toLocaleString() ?? "—"}</Text>
+                </View>
+                <Text style={styles.valueDash}>—</Text>
+                <View style={styles.valueBox}>
+                  <Text style={styles.valueBoxLabel}>High</Text>
+                  <Text style={styles.valueBoxAmount}>${valueEstimate.high?.toLocaleString() ?? "—"}</Text>
+                </View>
+              </View>
+              {valueEstimate.condition_assumed ? (
+                <View style={styles.resultRow}>
+                  <Text style={styles.resultLabel}>Condition assumed</Text>
+                  <Text style={styles.resultValue}>{valueEstimate.condition_assumed}</Text>
+                </View>
+              ) : null}
+              {valueEstimate.error_value_note ? (
+                <Text style={[styles.resultSummary, { color: "#FF6B35", fontWeight: "700" }]}>⚠ {valueEstimate.error_value_note}</Text>
+              ) : null}
+              {valueEstimate.reasoning ? (
+                <Text style={styles.resultSummary}>{valueEstimate.reasoning}</Text>
+              ) : null}
+            </View>
+          )}
+
+          {pcgsData && !pcgsData.error && (
+            <View style={styles.resultCard}>
+              <Text style={styles.resultCardTitle}>PCGS Value</Text>
+              {[["Grade", pcgsData.grade], ["Price", pcgsData.price ? `$${pcgsData.price}` : null],
+                ["Designation", pcgsData.designation]].map(([label, val]) =>
+                val ? (
+                  <View key={label} style={styles.resultRow}>
+                    <Text style={styles.resultLabel}>{label}</Text>
+                    <Text style={styles.resultValue}>{val}</Text>
+                  </View>
+                ) : null
+              )}
+            </View>
+          )}
+
+          <View style={styles.resultCard}>
+            <Text style={styles.resultCardTitle}>Summary</Text>
+            <Text style={styles.resultSummary}>{summary}</Text>
+          </View>
+
+          <View style={styles.resultCard}>
+            <Text style={styles.resultCardTitle}>eBay Listing Draft</Text>
+            {ebayListing ? (
+              <>
+                <Text style={styles.resultSummary}><Text style={styles.resultLabel}>Title: </Text>{ebayListing.title}</Text>
+                {ebayListing.subtitle ? <Text style={styles.resultSummary}><Text style={styles.resultLabel}>Subtitle: </Text>{ebayListing.subtitle}</Text> : null}
+                {ebayListing.description ? <Text style={styles.resultSummary}>{ebayListing.description}</Text> : null}
+                {Array.isArray(ebayListing.item_specifics) && ebayListing.item_specifics.length > 0 ? (
+                  <View style={styles.listingSpecList}>
+                    {ebayListing.item_specifics.map((spec, i) => (
+                      <View key={`${spec.label}-${i}`} style={styles.listingSpecRow}>
+                        <Text style={styles.resultLabel}>{spec.label}</Text>
+                        <Text style={styles.resultValue}>{spec.value}</Text>
+                      </View>
+                    ))}
+                  </View>
+                ) : null}
+                {ebayListing.shipping_notes ? <Text style={styles.resultSummary}>Shipping notes: {ebayListing.shipping_notes}</Text> : null}
+              </>
+            ) : (
+              <Text style={styles.resultSummary}>Create a polished eBay title, description, item specifics, and shipping notes for this coin.</Text>
+            )}
+            {listingError ? <Text style={styles.authError}>{listingError}</Text> : null}
+            <TouchableOpacity style={[styles.secondaryBtn, listingLoading && styles.secondaryBtnDisabled]} onPress={handleCreateEbayListing} disabled={listingLoading}>
+              {listingLoading ? <ActivityIndicator color="#000" /> : <Text style={styles.secondaryBtnText}>{ebayListing ? "Refresh eBay Listing" : "Create Ideal eBay Listing"}</Text>}
+            </TouchableOpacity>
+          </View>
+
+          <TouchableOpacity style={styles.primaryBtn} onPress={startNewScan}>
+            <Text style={styles.primaryBtnText}>Scan Another</Text>
+          </TouchableOpacity>
+        </ScrollView>
+      </SafeAreaView>
+    );
+  }
+
+  // ── Scanning view ──
+  return (
+    <SafeAreaView style={styles.safeArea}>
+      <Header title="Scan Coin" onBack={() => navigate("home")} />
+      <View style={styles.scannerOuter}>
+        <View style={styles.scannerBoxWrapper}>
+          <View style={styles.scannerBox}>
+            <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" onCameraReady={() => setCameraReady(true)} />
+            <View style={[styles.corner, styles.cornerTL]} />
+            <View style={[styles.corner, styles.cornerTR]} />
+            <View style={[styles.corner, styles.cornerBL]} />
+            <View style={[styles.corner, styles.cornerBR]} />
+            {BLUR_LAYERS.map(({ offset, opacity, height }, i) => (
+              <Animated.View key={i} style={{
+                position: "absolute", left: 0, right: 0, height,
+                backgroundColor: GOLD, opacity,
+                transform: [{ translateY: scanAnim.interpolate({
+                  inputRange: [0, 1], outputRange: [offset, BOX_SIZE - 3 + offset],
+                })}],
+              }} />
+            ))}
+            <Animated.View style={[styles.scanLineSolid, {
+              position: "absolute", left: 0, right: 0,
+              transform: [{ translateY: scanAnim.interpolate({
+                inputRange: [0, 1], outputRange: [0, BOX_SIZE - 3],
+              })}],
+            }]} />
+          </View>
+        </View>
+        <Text style={styles.scanHint}>{captureMeta.title}</Text>
+        <Text style={styles.scanSubHint}>{captureMeta.body}</Text>
+        <Animated.View style={[
+          styles.captureIndicator,
+          flashActive && {
+            transform: [{ scale: flashAnim.interpolate({ inputRange: [0, 1], outputRange: [1, 1.18] }) }],
+            backgroundColor: flashAnim.interpolate({ inputRange: [0, 1], outputRange: ["rgba(255,215,0,0.08)", GOLD] }),
+            borderColor: flashAnim.interpolate({ inputRange: [0, 1], outputRange: ["rgba(255,215,0,0.25)", "#fff6b0"] }),
+          },
+        ]} />
+      </View>
+    </SafeAreaView>
+  );
+}

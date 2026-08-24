@@ -4,3 +4,6 @@ dist/
 npm-debug.log*
 .env
 .env.local
+server/.env
+server/__pycache__/
+server/venv/
