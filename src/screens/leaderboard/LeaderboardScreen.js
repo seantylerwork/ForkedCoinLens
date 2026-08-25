@@ -29,11 +29,15 @@ const FAKE_USERS = [
 ].map(u => ({ ...u, badges: _fakeBadges(u) }));
 
 const LB_CATEGORIES = [
-  { key: "scanned",    label: "Most Scanned",  field: "scanned",    format: v => `${v} coins`   },
-  { key: "netWorth",   label: "Net Worth",     field: "netWorth",   format: v => `$${v.toLocaleString()}` },
-  { key: "memberDays", label: "Longest Member",field: "memberDays", format: v => `${v} days`    },
-  { key: "badges",     label: "Most Badges",   field: "badges",     format: v => `${v} badges`  },
+  { key: "scanned",  label: "Most Scanned", field: "scanned",  format: v => `${v} coins`   },
+  { key: "netWorth", label: "Net Worth",    field: "netWorth", format: v => `$${v.toLocaleString()}` },
+  { key: "avgValue", label: "Avg Coin Value",field: "avgValue", format: v => `$${v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}/coin` },
+  { key: "badges",   label: "Most Badges",  field: "badges",   format: v => `${v} badges`  },
 ];
+
+function withAvgValue(u) {
+  return { ...u, avgValue: u.scanned > 0 ? u.netWorth / u.scanned : 0 };
+}
 
 export default function LeaderboardScreen({ navigate, user, userScans }) {
   const [cat, setCat] = useState("scanned");
@@ -80,7 +84,7 @@ export default function LeaderboardScreen({ navigate, user, userScans }) {
     isMe: true,
   };
 
-  const all = [...liveUsers.map(u => ({ ...u, isMe: false })), myEntry]
+  const all = [...liveUsers.map(u => withAvgValue({ ...u, isMe: false })), withAvgValue(myEntry)]
     .sort((a, b) => b[category.field] - a[category.field])
     .map((u, i) => ({ ...u, rank: i + 1 }));
 

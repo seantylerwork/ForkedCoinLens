@@ -5,6 +5,8 @@ from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 
+from mock_openai import build_mock_reply
+
 load_dotenv()
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
@@ -12,6 +14,7 @@ NUMISTA_API_KEY = os.environ.get("NUMISTA_API_KEY", "")
 PCGS_BEARER_TOKEN = os.environ.get("PCGS_BEARER_TOKEN", "")
 SHEETDB_URL = os.environ.get("SHEETDB_URL", "")
 ADMIN_CODE = os.environ.get("ADMIN_CODE", "")
+MOCK_MODE = os.environ.get("MOCK_MODE", "false").lower() == "true"
 
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 NUMISTA_COINS_URL = "https://api.numista.com/api/v3/coins"
@@ -33,10 +36,15 @@ def proxy_response(upstream_response):
 
 @app.route("/api/openai/chat", methods=["POST"])
 def openai_chat():
+    payload = request.get_json(force=True, silent=True) or {}
+
+    if MOCK_MODE:
+        content = build_mock_reply(payload)
+        return jsonify({"choices": [{"message": {"content": content}}]})
+
     if not OPENAI_API_KEY:
         return jsonify({"error": {"message": "Server is missing OPENAI_API_KEY."}}), 500
 
-    payload = request.get_json(force=True, silent=True) or {}
     upstream = requests.post(
         OPENAI_CHAT_URL,
         headers={

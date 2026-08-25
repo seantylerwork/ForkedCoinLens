@@ -1,14 +1,15 @@
 import { useEffect, useState } from "react";
-import { SafeAreaView, ScrollView, Text, TextInput, TouchableOpacity, View } from "react-native";
+import { SafeAreaView, ScrollView, Text, TouchableOpacity, View } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import GoldCoin from "../../components/GoldCoin";
 import Header from "../../components/Header";
 import styles from "../../theme/styles";
 import { isAdminUser } from "../../../authLogic";
 
+const RECENT_SCANS_LIMIT = 5;
+
 export default function AccountScreen({ navigate, user, onSignOut }) {
   const [scans, setScans] = useState([]);
-  const [query, setQuery] = useState("");
 
   useEffect(() => {
     AsyncStorage.getItem("@coinlens_scans")
@@ -17,9 +18,7 @@ export default function AccountScreen({ navigate, user, onSignOut }) {
   }, []);
 
   const initials = user.name.split(" ").map(n => n[0]).join("").toUpperCase().slice(0, 2);
-  const filtered = query.trim()
-    ? scans.filter(s => s.coin?.toLowerCase().includes(query.toLowerCase()))
-    : scans;
+  const recentScans = scans.slice(0, RECENT_SCANS_LIMIT);
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -68,31 +67,11 @@ export default function AccountScreen({ navigate, user, onSignOut }) {
           <Text style={styles.detailedStatsBtnText}>Detailed Stats →</Text>
         </TouchableOpacity>
 
-        <Text style={styles.sectionTitle}>Scanned Coins</Text>
+        <Text style={styles.sectionTitle}>Recent Scans</Text>
 
-        <View style={styles.searchBar}>
-          <Text style={styles.searchIcon}>🔍</Text>
-          <TextInput
-            style={styles.searchInput}
-            placeholder="Search your coins…"
-            placeholderTextColor="rgba(255,215,0,0.3)"
-            value={query}
-            onChangeText={setQuery}
-            autoCapitalize="none"
-            autoCorrect={false}
-          />
-          {query.length > 0 && (
-            <TouchableOpacity onPress={() => setQuery("")}>
-              <Text style={styles.searchClear}>✕</Text>
-            </TouchableOpacity>
-          )}
-        </View>
-
-        {filtered.length === 0 ? (
-          <Text style={styles.searchEmpty}>
-            {scans.length === 0 ? "No coins scanned yet." : "No coins match your search."}
-          </Text>
-        ) : filtered.slice(0, 50).map((scan, i) => (
+        {recentScans.length === 0 ? (
+          <Text style={styles.searchEmpty}>No coins scanned yet.</Text>
+        ) : recentScans.map((scan, i) => (
           <View key={i} style={styles.recentItem}>
             <GoldCoin size={38} />
             <View style={styles.recentText}>
