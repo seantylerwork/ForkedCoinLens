@@ -20,97 +20,13 @@ import { GOLD, BOX_SIZE } from "../../theme/colors";
 import styles from "../../theme/styles";
 import { getCaptureStageMeta } from "../../../scanFlowLogic";
 import {
-  MOCK_MODE,
   ScanError,
   makeErrorDetail,
-  identifyCoinFromImage,
-  identifyCoinFromImages,
-  getNumistaSpecs,
-  getPcgsValue,
-  estimateCoinValue,
-  generateSummary,
+  identifyCoin,
+  toLegacyScanResult,
   generateEbayListing,
   logScanToSheet,
 } from "../../api/client";
-
-function getMockScanResult() {
-  const mockResults = [
-    {
-      coinData: {
-        country: "United States",
-        denomination: "Quarter Dollar",
-        year: "1965",
-        mint_mark: null,
-        estimated_grade: "VF-30",
-        mint_errors: [],
-        varieties: null,
-        error_premium: false,
-        special_notes: "Mock result for UI testing. This is not based on the uploaded image.",
-        identifiable: true,
-        confidence: 84,
-        alternatives: [
-          { coin: "Washington Quarter", confidence: 72 },
-          { coin: "Roosevelt Dime", confidence: 41 },
-          { coin: "Kennedy Half Dollar", confidence: 32 },
-        ],
-      },
-      numistaData: {
-        title: "Washington Quarter",
-        composition: { text: "Copper-nickel clad copper" },
-        weight: 5.67,
-        size: 24.3,
-      },
-      pcgsData: null,
-      valueEstimate: {
-        low: 0.25,
-        high: 1.5,
-        condition_assumed: "VF-30",
-        error_value_note: null,
-        reasoning: "This mock estimate treats the coin as a common circulated clad quarter.",
-      },
-      summary:
-        "This looks like a common U.S. Washington quarter in circulated condition. The portrait and denomination make it a familiar everyday coin, with most value coming from condition rather than rarity. This is a temporary mock result for checking the scan result UI.",
-    },
-    {
-      coinData: {
-        country: "United States",
-        denomination: "One Cent",
-        year: "1982",
-        mint_mark: null,
-        estimated_grade: "XF-40",
-        mint_errors: [],
-        varieties: "Large Date / Small Date variety possible",
-        error_premium: false,
-        special_notes: "Mock result for UI testing. 1982 cents can vary by date style and composition.",
-        identifiable: true,
-        confidence: 78,
-        alternatives: [
-          { coin: "Lincoln Memorial Cent", confidence: 69 },
-          { coin: "Wheat Cent", confidence: 28 },
-          { coin: "Jefferson Nickel", confidence: 18 },
-        ],
-      },
-      numistaData: {
-        title: "Lincoln Cent",
-        composition: { text: "Copper-plated zinc or bronze, depending on variety" },
-        weight: 2.5,
-        size: 19,
-      },
-      pcgsData: null,
-      valueEstimate: {
-        low: 0.01,
-        high: 3,
-        condition_assumed: "XF-40",
-        error_value_note: null,
-        reasoning: "This mock estimate assumes a common 1982 Lincoln cent without a rare variety.",
-      },
-      summary:
-        "This mock match is a 1982 Lincoln cent, a transition-year penny collectors often check more closely. Some 1982 cents differ by composition and date style, which can matter for identification. This placeholder result lets you preview the UI before the API key is ready.",
-    },
-  ];
-
-  return mockResults[Math.floor(Math.random() * mockResults.length)];
-}
 
 const BLUR_LAYERS = [
   { offset: -20, opacity: 0.05, height: 3 },
@@ -191,19 +107,10 @@ export default function ScanScreen({ navigate, user }) {
       setPhase("error");
       return;
     }
-    if (MOCK_MODE) {
-      setPhase("loading");
-      setLoadingStep("Mock mode enabled. Loading a mock scan result...");
-      setTimeout(() => {
-        setResult(getMockScanResult());
-        setPhase("result");
-      }, 1200);
-      return;
-    }
     try {
       setFlashActive(true);
       if (captureStage === "front") {
-        setLoadingStep("📸  Capturing the front of the coin…");
+        setLoadingStep("Capturing the front of the coin...");
         const photo = await capturePhoto();
         setFrontImage(photo.base64);
         setCaptureStage("back");
@@ -216,29 +123,20 @@ export default function ScanScreen({ navigate, user }) {
       }
 
       setPhase("loading");
-      setLoadingStep("📸  Capturing the back of the coin…");
+      setLoadingStep("Capturing the back of the coin...");
       const photo = await capturePhoto();
       setBackImage(photo.base64);
 
-      setLoadingStep("🤖  AI is identifying the coin from both sides…");
-      const coinData = await identifyCoinFromImages(frontImage, photo.base64);
+      setLoadingStep("Identifying the coin from both sides...");
+      const coinLensResult = await identifyCoin(frontImage, photo.base64);
+      const legacyResult = toLegacyScanResult(coinLensResult);
+      const { coinData, valueEstimate } = legacyResult;
 
       if (coinData.identifiable === false) {
-        setErrorDetail({ icon: "🔍", title: "Coin Not Recognized", body: coinData.unidentifiable_reason || "The AI couldn't identify this coin.", tip: null });
+        setErrorDetail({ icon: "!", title: "Coin Not Recognized", body: coinData.unidentifiable_reason || "CoinLens could not identify this coin.", tip: null });
         setPhase("unidentifiable");
         return;
       }
-
-      setLoadingStep("📚  Looking up specifications…");
-      const numistaData = await getNumistaSpecs(coinData);
-
-      setLoadingStep("💰  Estimating value…");
-      const pcgsNo = numistaData?.references?.find?.(r => r.type === "PCGS")?.number;
-      const pcgsData = pcgsNo ? await getPcgsValue(pcgsNo) : null;
-      const valueEstimate = await estimateCoinValue(coinData, numistaData);
-
-      setLoadingStep("✍️  Generating summary…");
-      const summary = await generateSummary(coinData, numistaData, pcgsData);
 
       logScanToSheet(coinData, user?.name);
       const coinLabel = [coinData.year, coinData.country, coinData.denomination].filter(v => v && v !== "Unknown").join(" ");
@@ -251,7 +149,7 @@ export default function ScanScreen({ navigate, user }) {
       } catch { /* storage failure shouldn't block showing results */ }
       setEbayListing(null);
       setListingError("");
-      setResult({ coinData, numistaData, pcgsData, valueEstimate, summary });
+      setResult(legacyResult);
       setPhase("result");
     } catch (e) {
       setErrorDetail(makeErrorDetail(e));
@@ -325,39 +223,18 @@ export default function ScanScreen({ navigate, user }) {
       return;
     }
 
-    if (MOCK_MODE) {
-      setPhase("loading");
-      setLoadingStep("Mock mode enabled. Loading a mock scan result...");
-      setTimeout(() => {
-        setResult(getMockScanResult());
-        setPhase("result");
-      }, 1200);
-      return;
-    }
-
     try {
       setPhase("loading");
-
-      setLoadingStep("Preparing uploaded photo...");
-      setLoadingStep("AI is identifying the coin...");
-      const coinData = await identifyCoinFromImage(selectedUpload.base64);
+      setLoadingStep("Identifying the coin...");
+      const coinLensResult = await identifyCoin(selectedUpload.base64);
+      const legacyResult = toLegacyScanResult(coinLensResult);
+      const { coinData, valueEstimate } = legacyResult;
 
       if (coinData.identifiable === false) {
         setErrorDetail(makeErrorDetail(new ScanError("unidentifiable", coinData.unidentifiable_reason || "Could not identify this coin.")));
         setPhase("unidentifiable");
         return;
       }
-
-      setLoadingStep("Looking up specifications...");
-      const numistaData = await getNumistaSpecs(coinData);
-
-      setLoadingStep("Estimating value...");
-      const pcgsNo = numistaData?.references?.find?.(r => r.type === "PCGS")?.number;
-      const pcgsData = pcgsNo ? await getPcgsValue(pcgsNo) : null;
-      const valueEstimate = await estimateCoinValue(coinData, numistaData);
-
-      setLoadingStep("Generating summary...");
-      const summary = await generateSummary(coinData, numistaData, pcgsData);
 
       logScanToSheet(coinData, user?.name);
       const coinLabel = [coinData.year, coinData.country, coinData.denomination].filter(v => v && v !== "Unknown").join(" ");
@@ -367,7 +244,7 @@ export default function ScanScreen({ navigate, user }) {
         history.unshift({ coin: coinLabel, time: new Date().toISOString(), value: midValue });
         AsyncStorage.setItem("@coinlens_scans", JSON.stringify(history.slice(0, 50)));
       });
-      setResult({ coinData, numistaData, pcgsData, valueEstimate, summary });
+      setResult(legacyResult);
       setPhase("result");
     } catch (e) {
       setErrorDetail(makeErrorDetail(e));
@@ -391,7 +268,7 @@ export default function ScanScreen({ navigate, user }) {
                 <Text style={styles.cardLabel}>Upload Photo</Text>
                 <Text style={styles.cardDesc}>Pick an existing coin photo</Text>
               </View>
-              <Text style={styles.cardArrow}>›</Text>
+              <Text style={styles.cardArrow}>&gt;</Text>
             </TouchableOpacity>
 
             {selectedUpload ? (
@@ -417,7 +294,7 @@ export default function ScanScreen({ navigate, user }) {
                 <Text style={styles.cardLabel}>Take Photo</Text>
                 <Text style={styles.cardDesc}>Use your camera for a new scan</Text>
               </View>
-              <Text style={styles.cardArrow}>›</Text>
+              <Text style={styles.cardArrow}>&gt;</Text>
             </TouchableOpacity>
           </View>
         </ScrollView>
@@ -456,7 +333,7 @@ export default function ScanScreen({ navigate, user }) {
   }
 
   if (phase === "error") {
-    const ed = errorDetail ?? { icon: "⚠️", title: "Something Went Wrong", body: "An unexpected error occurred.", tip: "Try scanning again." };
+    const ed = errorDetail ?? { icon: "!", title: "Something Went Wrong", body: "An unexpected error occurred.", tip: "Try scanning again." };
     return (
       <SafeAreaView style={styles.safeArea}>
         <Header title="Scan Coin" onBack={() => navigate("home")} />
@@ -466,7 +343,7 @@ export default function ScanScreen({ navigate, user }) {
           <Text style={styles.errorBody}>{ed.body}</Text>
           {ed.tip ? (
             <View style={styles.errorTipBox}>
-              <Text style={styles.errorTipLabel}>💡 What to do</Text>
+              <Text style={styles.errorTipLabel}>What to do</Text>
               <Text style={styles.errorTipText}>{ed.tip}</Text>
             </View>
           ) : null}
@@ -479,7 +356,7 @@ export default function ScanScreen({ navigate, user }) {
   }
 
   if (phase === "unidentifiable") {
-    const ed = errorDetail ?? { icon: "🔍", title: "Coin Not Recognized", body: "The AI couldn't identify this coin.", tip: null };
+    const ed = errorDetail ?? { icon: "!", title: "Coin Not Recognized", body: "CoinLens could not identify this coin.", tip: null };
     return (
       <SafeAreaView style={styles.safeArea}>
         <Header title="Scan Coin" onBack={() => navigate("home")} />
@@ -489,8 +366,8 @@ export default function ScanScreen({ navigate, user }) {
           <Text style={styles.errorBody}>{ed.body}</Text>
           <View style={styles.unidentifiableTips}>
             <Text style={styles.tipsTitle}>Tips for a better scan</Text>
-            {["Place the coin on a flat, dark surface", "Use good lighting — avoid glare", "Hold the camera steady and close", "Make sure the full coin is in frame"].map((tip, i) => (
-              <Text key={i} style={styles.tipItem}>• {tip}</Text>
+            {["Place the coin on a flat, dark surface", "Use good lighting - avoid glare", "Hold the camera steady and close", "Make sure the full coin is in frame"].map((tip, i) => (
+              <Text key={i} style={styles.tipItem}>- {tip}</Text>
             ))}
           </View>
           <TouchableOpacity style={styles.primaryBtn} onPress={startNewScan}>
@@ -568,10 +445,10 @@ export default function ScanScreen({ navigate, user }) {
 
           {coinData.mint_errors?.length > 0 && (
             <View style={[styles.resultCard, styles.errorCard]}>
-              <Text style={[styles.resultCardTitle, { color: "#FF6B35" }]}>⚠ Mint Errors Detected</Text>
+              <Text style={[styles.resultCardTitle, { color: "#FF6B35" }]}>Mint Errors Detected</Text>
               {coinData.mint_errors.map((err, i) => (
                 <View key={i} style={styles.errorRow}>
-                  <Text style={styles.errorBullet}>•</Text>
+                  <Text style={styles.errorBullet}>-</Text>
                   <Text style={styles.errorText}>{err}</Text>
                 </View>
               ))}
@@ -600,12 +477,12 @@ export default function ScanScreen({ navigate, user }) {
               <View style={styles.valueRangeRow}>
                 <View style={styles.valueBox}>
                   <Text style={styles.valueBoxLabel}>Low</Text>
-                  <Text style={styles.valueBoxAmount}>${valueEstimate.low?.toLocaleString() ?? "—"}</Text>
+                  <Text style={styles.valueBoxAmount}>${valueEstimate.low?.toLocaleString() ?? "-"}</Text>
                 </View>
-                <Text style={styles.valueDash}>—</Text>
+                <Text style={styles.valueDash}>-</Text>
                 <View style={styles.valueBox}>
                   <Text style={styles.valueBoxLabel}>High</Text>
-                  <Text style={styles.valueBoxAmount}>${valueEstimate.high?.toLocaleString() ?? "—"}</Text>
+                  <Text style={styles.valueBoxAmount}>${valueEstimate.high?.toLocaleString() ?? "-"}</Text>
                 </View>
               </View>
               {valueEstimate.condition_assumed ? (
@@ -615,7 +492,7 @@ export default function ScanScreen({ navigate, user }) {
                 </View>
               ) : null}
               {valueEstimate.error_value_note ? (
-                <Text style={[styles.resultSummary, { color: "#FF6B35", fontWeight: "700" }]}>⚠ {valueEstimate.error_value_note}</Text>
+                <Text style={[styles.resultSummary, { color: "#FF6B35", fontWeight: "700" }]}>{valueEstimate.error_value_note}</Text>
               ) : null}
               {valueEstimate.reasoning ? (
                 <Text style={styles.resultSummary}>{valueEstimate.reasoning}</Text>
@@ -679,7 +556,7 @@ export default function ScanScreen({ navigate, user }) {
     );
   }
 
-  // ── Scanning view ──
+  // Scanning view
   return (
     <SafeAreaView style={styles.safeArea}>
       <Header title="Scan Coin" onBack={() => navigate("home")} />
