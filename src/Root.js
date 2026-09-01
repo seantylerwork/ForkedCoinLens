@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { View } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { isAdminUser } from "../authLogic";
+import { isAdminUser, mapSupabaseUser, friendlyAuthError } from "../authLogic";
+import { supabase } from "./api/supabase";
 import styles from "./theme/styles";
 import AuthScreen from "./screens/auth/AuthScreen";
 import HomeScreen from "./screens/home/HomeScreen";
@@ -20,63 +21,48 @@ export default function App() {
   const [isGuest, setIsGuest] = useState(false);
 
   useEffect(() => {
-    (async () => {
-      try {
-        const session = await AsyncStorage.getItem("@coinlens_session");
-        if (session) {
-          const persistedUser = JSON.parse(session);
-          setUser({ ...persistedUser, role: isAdminUser(persistedUser) ? "admin" : (persistedUser.role || "member") });
-        }
-      } catch { /* corrupted session — stay logged out */ }
+    let mounted = true;
+
+    supabase.auth.getSession().then(({ data }) => {
+      if (!mounted) return;
+      setUser(mapSupabaseUser(data.session?.user));
       setAuthReady(true);
-    })();
+    });
+
+    const { data: subscription } = supabase.auth.onAuthStateChange((_event, session) => {
+      if (!mounted) return;
+      setUser(mapSupabaseUser(session?.user));
+    });
+
     AsyncStorage.getItem("@coinlens_scans")
       .then(data => { if (data) setUserScans(JSON.parse(data)); })
       .catch(() => {});
+
+    return () => {
+      mounted = false;
+      subscription.subscription.unsubscribe();
+    };
   }, []);
 
-  async function getAccounts() {
-    try {
-      const data = await AsyncStorage.getItem("@coinlens_accounts");
-      return data ? JSON.parse(data) : [];
-    } catch {
-      return [];
-    }
-  }
-
-  async function saveAccounts(accounts) {
-    try {
-      await AsyncStorage.setItem("@coinlens_accounts", JSON.stringify(accounts));
-    } catch {
-      throw new Error("Failed to save account. Storage may be full.");
-    }
-  }
-
   async function signUp(name, email, password, role = "member") {
-    const accounts = await getAccounts();
-    if (accounts.find(a => a.email === email)) throw new Error("An account with this email already exists.");
-    const userData = { name, email, password, role, createdAt: Date.now() };
-    await saveAccounts([...accounts, userData]);
-    await AsyncStorage.setItem("@coinlens_session", JSON.stringify(userData));
-    setUser(userData);
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
+      options: { data: { name, role } },
+    });
+    if (error) throw new Error(friendlyAuthError(error));
+    if (!data.session) {
+      throw new Error("Account created. Check your email to confirm it, then sign in.");
+    }
   }
 
   async function signIn(email, password) {
-    const accounts = await getAccounts();
-    const match = accounts.find(a => a.email === email);
-    if (!match) throw new Error("Email not found. Please sign up first.");
-    if (match.password !== password) throw new Error("Wrong password.");
-    const normalizedUser = {
-      ...match,
-      role: isAdminUser(match) ? "admin" : (match.role || "member"),
-    };
-    await AsyncStorage.setItem("@coinlens_session", JSON.stringify(normalizedUser));
-    setUser(normalizedUser);
+    const { error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) throw new Error(friendlyAuthError(error));
   }
 
   async function signOut() {
-    await AsyncStorage.removeItem("@coinlens_session");
-    setUser(null);
+    await supabase.auth.signOut();
     setScreen("home");
   }
 

@@ -1,4 +1,6 @@
-﻿export const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || "http://localhost:5000";
+﻿import { getAccessToken } from "./supabase";
+
+export const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || "http://localhost:5000";
 export class ScanError extends Error {
   constructor(code, message) {
     super(message);
@@ -22,6 +24,9 @@ const ERROR_DISPLAY = {
   photo: { icon: "!", title: "Photo Capture Failed", tip: "Make sure nothing is blocking the camera lens." },
   permission: { icon: "!", title: "Permission Needed", tip: "Enable photo or camera access and try again." },
   unidentifiable: { icon: "!", title: "Coin Not Recognized", tip: null },
+  auth_required: { icon: "!", title: "Sign In Required", tip: "Sign in or create an account to identify and value coins." },
+  auth_missing: { icon: "!", title: "Sign In Required", tip: "Sign in or create an account to identify and value coins." },
+  auth_invalid: { icon: "!", title: "Session Expired", tip: "Sign out and sign back in, then try again." },
   unknown: { icon: "!", title: "Something Went Wrong", tip: "Try scanning again." },
 };
 
@@ -60,11 +65,16 @@ export function toLegacyScanResult(result) {
 }
 
 export async function identifyCoin(frontImage, backImage = null) {
+  const token = await getAccessToken();
+  if (!token) {
+    throw new ScanError("auth_required", "Sign in to identify and value coins.");
+  }
+
   let res;
   try {
     res = await fetch(`${API_BASE_URL}/api/identify-coin`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
       body: JSON.stringify({ front_image: frontImage, back_image: backImage || undefined }),
     });
   } catch {
@@ -114,11 +124,15 @@ export async function generateEbayListing(coinLensResultOrCoinData, numistaData,
         summary,
       };
 
+  const token = await getAccessToken();
   let res;
   try {
     res = await fetch(`${API_BASE_URL}/api/generate-ebay-listing`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
       body: JSON.stringify(payload),
     });
   } catch {

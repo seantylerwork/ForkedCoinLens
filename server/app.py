@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 
+from auth import require_auth
 from mock_openai import build_mock_reply
 
 load_dotenv()
@@ -66,6 +67,7 @@ def health():
 
 
 @app.route("/api/openai/chat", methods=["POST"])
+@require_auth
 def openai_chat():
     payload = request.get_json(force=True, silent=True) or {}
 
@@ -501,6 +503,7 @@ def build_coinlens_result(front_image, back_image=None):
 
 
 @app.route("/api/identify-coin", methods=["POST"])
+@require_auth
 def identify_coin():
     front_image, back_image = read_identification_images()
     result = build_coinlens_result(front_image, back_image)
@@ -510,6 +513,7 @@ def identify_coin():
 
 
 @app.route("/api/generate-ebay-listing", methods=["POST"])
+@require_auth
 def generate_ebay_listing():
     payload = request.get_json(force=True, silent=True) or {}
     if USE_MOCK_COIN_RESPONSE:
