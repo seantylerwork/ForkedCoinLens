@@ -2,6 +2,7 @@ import os
 import base64
 import binascii
 import json
+import logging
 
 import requests
 from dotenv import load_dotenv
@@ -9,7 +10,15 @@ from flask import Flask, Response, jsonify, request
 from flask_cors import CORS
 
 from auth import require_auth
-from mock_openai import build_mock_reply
+from mock_openai import (
+    MOCK_EBAY_LISTING,
+    MOCK_MARKER,
+    MOCK_NUMISTA,
+    MOCK_PCGS,
+    MOCK_SCAN_ROW,
+    build_mock_coin_result as deterministic_mock_coin_result,
+    build_mock_reply,
+)
 
 load_dotenv()
 
@@ -19,7 +28,7 @@ PCGS_BEARER_TOKEN = os.environ.get("PCGS_BEARER_TOKEN", "")
 SHEETDB_URL = os.environ.get("SHEETDB_URL", "")
 ADMIN_CODE = os.environ.get("ADMIN_CODE", "")
 MOCK_MODE = os.environ.get("MOCK_MODE", "false").lower() == "true"
-USE_MOCK_COIN_RESPONSE = os.environ.get("USE_MOCK_COIN_RESPONSE", "false").lower() == "true"
+USE_MOCK_COIN_RESPONSE = os.environ.get("USE_MOCK_COIN_RESPONSE", "false").lower() == "true" or MOCK_MODE
 
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 NUMISTA_COINS_URL = "https://api.numista.com/api/v3/coins"
@@ -29,6 +38,10 @@ REQUEST_TIMEOUT = 60
 
 app = Flask(__name__)
 CORS(app)
+
+logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
+app.logger.handlers = logging.getLogger("gunicorn.error").handlers or app.logger.handlers
+app.logger.setLevel(logging.getLogger("gunicorn.error").level or logging.INFO)
 
 
 class CoinLensError(Exception):
@@ -47,6 +60,18 @@ def proxy_response(upstream_response):
     )
 
 
+def mock_coin_enabled():
+    return MOCK_MODE or USE_MOCK_COIN_RESPONSE
+
+
+def should_use_mock_coin_response():
+    return mock_coin_enabled() or not OPENAI_API_KEY
+
+
+def log_mock_response(route):
+    app.logger.info("MOCK response: %s", route)
+
+
 def error_response(error):
     return jsonify({"error": {"code": error.code, "message": error.message}}), error.status
 
@@ -63,7 +88,18 @@ def handle_unexpected_error(_error):
 
 @app.route("/api/health", methods=["GET"])
 def health():
-    return jsonify({"ok": True})
+    body = {
+        "ok": True,
+        "status": "ok",
+        "mock_mode": should_use_mock_coin_response(),
+        "has_openai_key": bool(OPENAI_API_KEY),
+        "has_numista_key": bool(NUMISTA_API_KEY),
+        "has_pcgs_token": bool(PCGS_BEARER_TOKEN),
+        "has_sheetdb": bool(SHEETDB_URL),
+    }
+    if should_use_mock_coin_response():
+        log_mock_response("/api/health")
+    return jsonify(body)
 
 
 @app.route("/api/openai/chat", methods=["POST"])
@@ -71,7 +107,8 @@ def health():
 def openai_chat():
     payload = request.get_json(force=True, silent=True) or {}
 
-    if MOCK_MODE:
+    if should_use_mock_coin_response():
+        log_mock_response("/api/openai/chat")
         content = build_mock_reply(payload)
         return jsonify({"choices": [{"message": {"content": content}}]})
 
@@ -359,6 +396,9 @@ Description:
 
 
 def lookup_numista(identification):
+    if should_use_mock_coin_response():
+        log_mock_response("lookup_numista")
+        return dict(MOCK_NUMISTA)
     if not NUMISTA_API_KEY or identification.get("identifiable") is False:
         return None
     query = " ".join(filter(None, [identification.get("country"), identification.get("denomination"), identification.get("year")])).strip()
@@ -378,6 +418,9 @@ def lookup_numista(identification):
 
 
 def lookup_pcgs(numista_data):
+    if should_use_mock_coin_response():
+        log_mock_response("lookup_pcgs")
+        return dict(MOCK_PCGS)
     if not PCGS_BEARER_TOKEN or not isinstance(numista_data, dict):
         return None
     references = numista_data.get("references") or []
@@ -400,6 +443,9 @@ def lookup_pcgs(numista_data):
 
 
 def estimate_value(identification, numista_data):
+    if should_use_mock_coin_response():
+        log_mock_response("estimate_value")
+        return dict(deterministic_mock_coin_result()["valuation"])
     if identification.get("identifiable") is False:
         return {"status": "unavailable", "currency": "USD", "source": "CoinLens", "reason": "Coin was not identifiable."}
     try:
@@ -427,6 +473,9 @@ Return ONLY a raw JSON object with keys:
 
 
 def generate_coin_summary(identification, numista_data, pcgs_data):
+    if should_use_mock_coin_response():
+        log_mock_response("generate_coin_summary")
+        return deterministic_mock_coin_result()["summary"]
     try:
         prompt = f"""You are a friendly numismatist app. Write 3 exciting sentences about this coin for a beginner.
 AI ID: {json.dumps(identification)}
@@ -438,49 +487,12 @@ PCGS: {json.dumps(pcgs_data)}"""
 
 
 def build_mock_coin_result(front_image_present=True, back_image_present=False):
-    identification = {
-        "coin_name": "1965 United States Quarter Dollar",
-        "country": "United States",
-        "denomination": "Quarter Dollar",
-        "year": "1965",
-        "mint_mark": None,
-        "estimated_grade": "VF-30",
-        "description": "Mock backend result for end-to-end integration testing.",
-        "mint_errors": [],
-        "varieties": None,
-        "error_premium": False,
-        "special_notes": "Mock server response. Configure real credentials for live identification.",
-        "identifiable": True,
-        "confidence": 84,
-        "alternatives": [{"coin": "Washington Quarter", "confidence": 72}],
-    }
-    return {
-        "identification": identification,
-        "valuation": {
-            "status": "available",
-            "estimated_value": 0.88,
-            "currency": "USD",
-            "source": "CoinLens mock",
-            "low": 0.25,
-            "high": 1.5,
-            "condition_assumed": "VF-30",
-            "error_value_note": None,
-            "reasoning": "Mock estimate for a common circulated clad quarter.",
-        },
-        "numista": {
-            "title": "Washington Quarter",
-            "composition": {"text": "Copper-nickel clad copper"},
-            "weight": 5.67,
-            "size": 24.3,
-        },
-        "pcgs": None,
-        "summary": "This mock response proves the Expo request reached Flask. It follows the same CoinLens contract as the real identification path. The request included a front image%s." % (" and a back image" if back_image_present else ""),
-        "meta": {"mock": True, "front_image_received": front_image_present, "back_image_received": back_image_present},
-    }
+    return deterministic_mock_coin_result(front_image_present, back_image_present)
 
 
 def build_coinlens_result(front_image, back_image=None):
-    if USE_MOCK_COIN_RESPONSE:
+    if should_use_mock_coin_response():
+        log_mock_response("/api/identify-coin")
         return build_mock_coin_result(True, back_image is not None)
     identification = identify_with_ai(front_image, back_image)
     if identification.get("identifiable") is False:
@@ -516,14 +528,9 @@ def identify_coin():
 @require_auth
 def generate_ebay_listing():
     payload = request.get_json(force=True, silent=True) or {}
-    if USE_MOCK_COIN_RESPONSE:
-        return jsonify({
-            "title": "Mock Listing - 1965 Washington Quarter",
-            "subtitle": "Backend mock draft for CoinLens integration testing",
-            "description": "This is placeholder eBay listing copy generated by Flask mock mode.",
-            "item_specifics": [{"label": "Certification", "value": "Uncertified"}],
-            "shipping_notes": "Package securely and ship with tracking.",
-        })
+    if should_use_mock_coin_response():
+        log_mock_response("/api/generate-ebay-listing")
+        return jsonify(dict(MOCK_EBAY_LISTING))
 
     try:
         prompt = f"""You are an expert eBay copywriter for collectible coins. Create a polished listing draft.
@@ -546,6 +553,10 @@ Return ONLY a raw JSON object with these exact keys:
 
 @app.route("/api/numista-specs", methods=["GET"])
 def numista_specs():
+    if should_use_mock_coin_response():
+        log_mock_response("/api/numista-specs")
+        return jsonify({"items": [dict(MOCK_NUMISTA)], "marker": MOCK_MARKER})
+
     if not NUMISTA_API_KEY:
         return jsonify({"items": []})
 
@@ -560,6 +571,12 @@ def numista_specs():
 
 @app.route("/api/pcgs-value/<pcgs_number>", methods=["GET"])
 def pcgs_value(pcgs_number):
+    if should_use_mock_coin_response():
+        log_mock_response("/api/pcgs-value")
+        payload = dict(MOCK_PCGS)
+        payload["pcgs_number"] = pcgs_number
+        return jsonify(payload)
+
     if not PCGS_BEARER_TOKEN:
         return jsonify(None)
 
@@ -573,6 +590,10 @@ def pcgs_value(pcgs_number):
 
 @app.route("/api/log-scan", methods=["POST"])
 def log_scan():
+    if should_use_mock_coin_response():
+        log_mock_response("/api/log-scan")
+        return jsonify({"success": True, "marker": MOCK_MARKER})
+
     if not SHEETDB_URL:
         return jsonify({"skipped": True})
 
@@ -583,6 +604,10 @@ def log_scan():
 
 @app.route("/api/scans", methods=["GET"])
 def get_scans():
+    if should_use_mock_coin_response():
+        log_mock_response("/api/scans")
+        return jsonify([dict(MOCK_SCAN_ROW)])
+
     if not SHEETDB_URL:
         return jsonify([])
 
