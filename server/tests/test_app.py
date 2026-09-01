@@ -47,6 +47,14 @@ class CoinLensApiTests(unittest.TestCase):
         self.assertEqual(body["identification"]["country"], "United States")
         self.assertEqual(body["valuation"]["status"], "available")
 
+    def test_identify_coin_missing_openai_key_uses_mock_response(self):
+        response = self.client.post("/api/identify-coin", json={"front_image": JPEG_BASE64})
+        body = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(body["meta"]["mock"])
+        self.assertNotIn("error", body)
+
     def test_identify_coin_single_image_request(self):
         coinlens_app.USE_MOCK_COIN_RESPONSE = True
 

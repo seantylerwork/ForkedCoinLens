@@ -18,7 +18,7 @@ PCGS_BEARER_TOKEN = os.environ.get("PCGS_BEARER_TOKEN", "")
 SHEETDB_URL = os.environ.get("SHEETDB_URL", "")
 ADMIN_CODE = os.environ.get("ADMIN_CODE", "")
 MOCK_MODE = os.environ.get("MOCK_MODE", "false").lower() == "true"
-USE_MOCK_COIN_RESPONSE = os.environ.get("USE_MOCK_COIN_RESPONSE", "false").lower() == "true"
+USE_MOCK_COIN_RESPONSE = os.environ.get("USE_MOCK_COIN_RESPONSE", "false").lower() == "true" or MOCK_MODE
 
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 NUMISTA_COINS_URL = "https://api.numista.com/api/v3/coins"
@@ -44,6 +44,10 @@ def proxy_response(upstream_response):
         status=upstream_response.status_code,
         content_type=upstream_response.headers.get("Content-Type", "application/json"),
     )
+
+
+def should_use_mock_coin_response():
+    return USE_MOCK_COIN_RESPONSE or not OPENAI_API_KEY
 
 
 def error_response(error):
@@ -478,7 +482,7 @@ def build_mock_coin_result(front_image_present=True, back_image_present=False):
 
 
 def build_coinlens_result(front_image, back_image=None):
-    if USE_MOCK_COIN_RESPONSE:
+    if should_use_mock_coin_response():
         return build_mock_coin_result(True, back_image is not None)
     identification = identify_with_ai(front_image, back_image)
     if identification.get("identifiable") is False:
@@ -512,7 +516,7 @@ def identify_coin():
 @app.route("/api/generate-ebay-listing", methods=["POST"])
 def generate_ebay_listing():
     payload = request.get_json(force=True, silent=True) or {}
-    if USE_MOCK_COIN_RESPONSE:
+    if should_use_mock_coin_response():
         return jsonify({
             "title": "Mock Listing - 1965 Washington Quarter",
             "subtitle": "Backend mock draft for CoinLens integration testing",

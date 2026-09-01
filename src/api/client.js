@@ -1,4 +1,4 @@
-﻿export const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || "http://localhost:5000";
+﻿export const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || "https://coinlens-jmp4.onrender.com";
 export class ScanError extends Error {
   constructor(code, message) {
     super(message);
@@ -129,4 +129,5 @@ export async function generateEbayListing(coinLensResultOrCoinData, numistaData,
   throwForErrorResponse(res, data);
   return data;
 }
+
 
