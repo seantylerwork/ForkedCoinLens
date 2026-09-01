@@ -1,4 +1,19 @@
-﻿export const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || "https://coinlens-jmp4.onrender.com";
+﻿import Constants from "expo-constants";
+
+function resolveApiBaseUrl() {
+  const envUrl = process.env.EXPO_PUBLIC_API_BASE_URL?.trim();
+  const configUrl = Constants.expoConfig?.extra?.apiBaseUrl?.trim();
+  const url = envUrl || configUrl;
+
+  if (url) return url.replace(/\/$/, "");
+
+  console.warn("EXPO_PUBLIC_API_BASE_URL is not set - set it to your Render URL in .env.local");
+  return "http://localhost:5000";
+}
+
+export const API_BASE_URL = resolveApiBaseUrl();
+console.log("CoinLens API base URL:", API_BASE_URL);
+
 export class ScanError extends Error {
   constructor(code, message) {
     super(message);
@@ -129,5 +144,6 @@ export async function generateEbayListing(coinLensResultOrCoinData, numistaData,
   throwForErrorResponse(res, data);
   return data;
 }
+
 
 

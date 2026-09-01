@@ -1,127 +1,114 @@
-import json
-import random
+﻿import json
 
-MOCK_COINS = [
-    {
-        "country": "United States",
-        "denomination": "Quarter Dollar",
-        "year": "1965",
-        "mint_mark": None,
-        "estimated_grade": "VF-30",
-        "mint_errors": [],
-        "varieties": None,
-        "error_premium": False,
-        "special_notes": "Mock server response — OpenAI key is not configured.",
-        "identifiable": True,
-        "confidence": 84,
-        "alternatives": [
-            {"coin": "Washington Quarter", "confidence": 72},
-            {"coin": "Roosevelt Dime", "confidence": 41},
-            {"coin": "Kennedy Half Dollar", "confidence": 32},
-        ],
-    },
-    {
-        "country": "United States",
-        "denomination": "One Cent",
-        "year": "1982",
-        "mint_mark": None,
-        "estimated_grade": "XF-40",
-        "mint_errors": [],
-        "varieties": "Large Date / Small Date variety possible",
-        "error_premium": False,
-        "special_notes": "Mock server response — OpenAI key is not configured.",
-        "identifiable": True,
-        "confidence": 78,
-        "alternatives": [
-            {"coin": "Lincoln Memorial Cent", "confidence": 69},
-            {"coin": "Wheat Cent", "confidence": 28},
-            {"coin": "Jefferson Nickel", "confidence": 18},
-        ],
-    },
-    {
-        "country": "Canada",
-        "denomination": "Silver Dollar",
-        "year": "1948",
-        "mint_mark": None,
-        "estimated_grade": "AU-55",
-        "mint_errors": [],
-        "varieties": None,
-        "error_premium": False,
-        "special_notes": "Mock server response — OpenAI key is not configured.",
-        "identifiable": True,
-        "confidence": 71,
-        "alternatives": [
-            {"coin": "1947 Canadian Silver Dollar", "confidence": 44},
-        ],
-    },
-]
+MOCK_MARKER = "MOCK RESPONSE FROM RENDER FLASK SERVER"
+
+MOCK_IDENTIFICATION = {
+    "coin_name": "1946 United States Lincoln Wheat Cent",
+    "country": "United States",
+    "denomination": "One Cent",
+    "year": "1946",
+    "mint_mark": None,
+    "estimated_grade": "VF-30",
+    "description": f"{MOCK_MARKER}: deterministic mock identification for backend round-trip testing.",
+    "mint_errors": [],
+    "varieties": "Lincoln Wheat Cent",
+    "error_premium": False,
+    "special_notes": f"{MOCK_MARKER}: canned 1946 Lincoln Wheat Cent result.",
+    "identifiable": True,
+    "confidence": 94,
+    "alternatives": [
+        {"coin": "1946-D Lincoln Wheat Cent", "confidence": 42},
+        {"coin": "1946-S Lincoln Wheat Cent", "confidence": 31},
+    ],
+}
+
+MOCK_NUMISTA = {
+    "id": 784,
+    "title": "Lincoln Cent - Wheat reverse",
+    "url": "https://en.numista.com/catalogue/pieces908.html",
+    "composition": {"text": "Bronze"},
+    "weight": 3.11,
+    "size": 19.0,
+    "references": [{"type": "PCGS", "number": "2731"}],
+    "note": MOCK_MARKER,
+}
+
+MOCK_PCGS = {
+    "grade": "VF-30",
+    "price": 12.34,
+    "designation": "Brown",
+    "source_note": f"{MOCK_MARKER}: canned PCGS priceguide-shaped response; this is not automated grading.",
+}
+
+MOCK_VALUATION = {
+    "status": "available",
+    "estimated_value": 12.34,
+    "currency": "USD",
+    "source": "CoinLens deterministic mock",
+    "low": 10.0,
+    "high": 15.0,
+    "condition_assumed": "VF-30",
+    "error_value_note": None,
+    "reasoning": f"{MOCK_MARKER}: canned valuation for a 1946 Lincoln Wheat Cent in VF condition.",
+}
+
+MOCK_SUMMARY = (
+    f"{MOCK_MARKER}: This is a 1946 Lincoln Wheat Cent in VF condition. "
+    "Its wheat reverse makes it a classic beginner-friendly collectible. "
+    "The mock valuation is $12.34 so the full capture-upload-result flow is easy to verify."
+)
+
+MOCK_EBAY_LISTING = {
+    "title": "1946 Lincoln Wheat Cent VF Brown - CoinLens Mock",
+    "subtitle": MOCK_MARKER,
+    "description": f"{MOCK_MARKER}: Deterministic listing draft for a 1946 United States Lincoln Wheat Cent graded about VF-30.",
+    "item_specifics": [
+        {"label": "Year", "value": "1946"},
+        {"label": "Denomination", "value": "Small Cent"},
+        {"label": "Country/Region of Manufacture", "value": "United States"},
+        {"label": "Grade", "value": "VF"},
+        {"label": "Certification", "value": "Uncertified"},
+    ],
+    "shipping_notes": f"{MOCK_MARKER}: Ship protected in a 2x2 holder with tracking.",
+}
+
+MOCK_SCAN_ROW = {
+    "Coin": "1946 United States Lincoln Wheat Cent",
+    "Time": "2026-01-01T00:00:00.000Z",
+    "User": "Mock User",
+    "Value": 12.34,
+    "Marker": MOCK_MARKER,
+}
 
 
-def _flatten_text(messages):
-    parts = []
-    for message in messages or []:
-        content = message.get("content")
-        if isinstance(content, str):
-            parts.append(content)
-        elif isinstance(content, list):
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "text":
-                    parts.append(item.get("text", ""))
-    return "\n".join(parts)
-
-
-def _has_image(messages):
-    for message in messages or []:
-        content = message.get("content")
-        if isinstance(content, list):
-            for item in content:
-                if isinstance(item, dict) and item.get("type") == "image_url":
-                    return True
-    return False
+def build_mock_coin_result(front_image_present=True, back_image_present=False):
+    return {
+        "identification": dict(MOCK_IDENTIFICATION),
+        "valuation": dict(MOCK_VALUATION),
+        "numista": dict(MOCK_NUMISTA),
+        "pcgs": dict(MOCK_PCGS),
+        "summary": MOCK_SUMMARY,
+        "marker": MOCK_MARKER,
+        "meta": {
+            "mock": True,
+            "front_image_received": bool(front_image_present),
+            "back_image_received": bool(back_image_present),
+            "marker": MOCK_MARKER,
+        },
+    }
 
 
 def build_mock_reply(payload):
-    """Return plausible fake OpenAI reply text based on which of the app's known
-    prompts this call matches, so a scan can complete end-to-end without a
-    working OpenAI key."""
-    messages = payload.get("messages", [])
-    text = _flatten_text(messages)
-
-    if _has_image(messages):
-        coin = random.choice(MOCK_COINS)
-        return (
-            f"Obverse shows a portrait consistent with a {coin['year']} {coin['country']} "
-            f"{coin['denomination']}. Reverse design and inscriptions match the expected type. "
-            f"Metal color and wear are consistent with an estimated grade of {coin['estimated_grade']}. "
-            "No doubling, off-center strike, or die cracks observed. "
-            "(Mock description — server MOCK_MODE is on because no working OpenAI key is configured.)"
-        )
-
-    if "unidentifiable_reason" in text and "alternatives" in text:
-        return json.dumps(random.choice(MOCK_COINS))
-
-    if "condition_assumed" in text and "error_value_note" in text:
-        return json.dumps({
-            "low": round(random.uniform(0.25, 5), 2),
-            "high": round(random.uniform(5, 50), 2),
-            "condition_assumed": "VF-30",
-            "error_value_note": None,
-            "reasoning": "Mock value estimate — server MOCK_MODE is on because no working OpenAI key is configured.",
-        })
-
-    if "3 exciting sentences" in text:
-        return (
-            "This coin has a story worth telling! Its design and wear tell us a lot about its "
-            "circulation history. (Mock summary — server MOCK_MODE is on because no working OpenAI key is configured.)"
-        )
+    messages = payload.get("messages", []) if isinstance(payload, dict) else []
+    text = json.dumps(messages)
 
     if "item_specifics" in text:
-        return json.dumps({
-            "title": "Mock Listing — configure a real OpenAI key to generate this for real",
-            "subtitle": "Server is running in MOCK_MODE",
-            "description": "This is placeholder eBay listing copy generated by the Flask mock responder because no working OpenAI key is configured.",
-            "item_specifics": [{"label": "Mode", "value": "Mock"}],
-            "shipping_notes": "N/A — mock data",
-        })
+        return json.dumps(MOCK_EBAY_LISTING)
+    if "condition_assumed" in text and "error_value_note" in text:
+        return json.dumps(MOCK_VALUATION)
+    if "3 exciting sentences" in text:
+        return MOCK_SUMMARY
+    if "unidentifiable_reason" in text and "alternatives" in text:
+        return json.dumps(MOCK_IDENTIFICATION)
 
-    return "Mock response — server MOCK_MODE is on because no working OpenAI key is configured."
+    return f"{MOCK_MARKER}: Mock visual description for a 1946 United States Lincoln Wheat Cent in VF condition."
