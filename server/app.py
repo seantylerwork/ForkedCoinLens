@@ -6,10 +6,11 @@ import logging
 
 import requests
 from dotenv import load_dotenv
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, g, jsonify, request
 from flask_cors import CORS
 
 from auth import require_auth
+from require_user import require_user
 from mock_openai import (
     MOCK_EBAY_LISTING,
     MOCK_MARKER,
@@ -100,6 +101,12 @@ def health():
     if should_use_mock_coin_response():
         log_mock_response("/api/health")
     return jsonify(body)
+
+
+@app.route("/api/me", methods=["GET"])
+@require_user
+def me():
+    return jsonify({"id": g.user_id, "email": g.user_email})
 
 
 @app.route("/api/openai/chat", methods=["POST"])
