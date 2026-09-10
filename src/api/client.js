@@ -51,6 +51,18 @@ export function makeErrorDetail(e) {
   return { ...display, body: e.message };
 }
 
+// Central fetch wrapper: every call to our Flask backend goes through here so
+// the Supabase JWT is attached in one place instead of per-screen. Reads the
+// current Supabase session and sends `Authorization: Bearer <access_token>`.
+// Never sends user_id as proof of identity.
+export async function apiFetch(path, options = {}) {
+  const token = await getAccessToken();
+  const headers = { ...(options.headers || {}) };
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const url = /^https?:\/\//.test(path) ? path : `${API_BASE_URL}${path}`;
+  return fetch(url, { ...options, headers });
+}
+
 async function readJsonResponse(res) {
   try {
     return await res.json();
@@ -87,9 +99,9 @@ export async function identifyCoin(frontImage, backImage = null) {
 
   let res;
   try {
-    res = await fetch(`${API_BASE_URL}/api/identify-coin`, {
+    res = await apiFetch(`/api/identify-coin`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${token}` },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ front_image: frontImage, back_image: backImage || undefined }),
     });
   } catch {
@@ -108,7 +120,7 @@ export async function logScanToSheet(coinData, userName = "") {
   const coin = [coinData.year, coinData.country, coinData.denomination]
     .filter(v => v && v !== "Unknown")
     .join(" ");
-  await fetch(`${API_BASE_URL}/api/log-scan`, {
+  await apiFetch(`/api/log-scan`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ data: [{ Coin: coin, Time: new Date().toISOString(), User: userName }] }),
@@ -117,7 +129,7 @@ export async function logScanToSheet(coinData, userName = "") {
 
 export async function verifyAdminCode(code) {
   try {
-    const res = await fetch(`${API_BASE_URL}/api/verify-admin-code`, {
+    const res = await apiFetch(`/api/verify-admin-code`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ code }),
@@ -139,21 +151,31 @@ export async function generateEbayListing(coinLensResultOrCoinData, numistaData,
         summary,
       };
 
-  const token = await getAccessToken();
   let res;
   try {
-    res = await fetch(`${API_BASE_URL}/api/generate-ebay-listing`, {
+    res = await apiFetch(`/api/generate-ebay-listing`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(token ? { Authorization: `Bearer ${token}` } : {}),
-      },
+      headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
   } catch {
     throw new ScanError("network", "No internet connection. Could not reach CoinLens.");
   }
 
+  const data = await readJsonResponse(res);
+  throwForErrorResponse(res, data);
+  return data;
+}
+
+// TEMP: verifies the full Expo -> Render -> Supabase auth flow. Calls the
+// backend's Supabase-protected /api/me and returns { id, email }.
+export async function getMe() {
+  let res;
+  try {
+    res = await apiFetch(`/api/me`);
+  } catch {
+    throw new ScanError("network", "No internet connection. Could not reach CoinLens.");
+  }
   const data = await readJsonResponse(res);
   throwForErrorResponse(res, data);
   return data;

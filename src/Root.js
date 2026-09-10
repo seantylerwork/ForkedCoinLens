@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
-import { View } from "react-native";
+import { ActivityIndicator, View } from "react-native";
+import { GOLD } from "./theme/colors";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { isAdminUser, mapSupabaseUser, friendlyAuthError } from "../authLogic";
 import { supabase } from "./api/supabase";
@@ -48,7 +49,7 @@ export default function App() {
     const { data, error } = await supabase.auth.signUp({
       email,
       password,
-      options: { data: { name, role } },
+      options: { data: { display_name: name, name, role } },
     });
     if (error) throw new Error(friendlyAuthError(error));
     if (!data.session) {
@@ -78,7 +79,15 @@ export default function App() {
 
   function navigate(target) { setScreen(target); }
 
-  if (!authReady) return <View style={styles.safeArea} />;
+  // Hold on a loading indicator while the saved Supabase session is restored so
+  // the Login screen never flashes for an already-authenticated user.
+  if (!authReady) {
+    return (
+      <View style={[styles.safeArea, { alignItems: "center", justifyContent: "center" }]}>
+        <ActivityIndicator size="large" color={GOLD} />
+      </View>
+    );
+  }
 
   if (isGuest) {
     return <ScanScreen navigate={(target) => (target === "home" ? exitGuest() : navigate(target))} user={{ name: "Guest" }} />;
