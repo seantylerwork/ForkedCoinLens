@@ -11,6 +11,7 @@ from flask_cors import CORS
 
 from auth import require_auth
 from require_user import require_user
+from supabase_admin import insert_scan, SupabaseAdminError
 from mock_openai import (
     MOCK_EBAY_LISTING,
     MOCK_MARKER,
@@ -620,6 +621,26 @@ def get_scans():
 
     upstream = requests.get(SHEETDB_URL, timeout=REQUEST_TIMEOUT)
     return proxy_response(upstream)
+
+
+@app.route("/api/test-scan", methods=["POST"])
+@require_user
+def test_scan():
+    payload = {
+        "user_id": g.user_id,
+        "coin_name": "Lincoln Wheat Cent",
+        "year": 1946,
+        "estimated_value": 0.20,
+        "source": "camera",
+    }
+    try:
+        row = insert_scan(payload)
+    except SupabaseAdminError as error:
+        app.logger.error("test_scan insert failed for user_id=%s: %s", g.user_id, error)
+        return jsonify({"error": {"code": "scan_insert_failed", "message": "Could not save scan."}}), 500
+
+    app.logger.info("test_scan created scan id=%s for user_id=%s", row.get("id"), g.user_id)
+    return jsonify(row), 201
 
 
 @app.route("/api/verify-admin-code", methods=["POST"])

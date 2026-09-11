@@ -7,3 +7,5 @@ npm-debug.log*
 server/.env
 server/__pycache__/
 server/venv/
+server/.venv/
+.devenv
