@@ -181,5 +181,25 @@ export async function getMe() {
   return data;
 }
 
+// TEMP: debug-only call to the backend's Supabase-protected /api/test-scan.
+// Sends no request body; the server derives user_id from the JWT and inserts
+// a fixed test row. Returns the inserted row ({ id, user_id, ... }).
+export async function postTestScan() {
+  let res;
+  try {
+    res = await apiFetch(`/api/test-scan`, { method: "POST" });
+  } catch {
+    throw new ScanError("network", "No internet connection. Could not reach CoinLens.");
+  }
+  const data = await readJsonResponse(res);
+  try {
+    throwForErrorResponse(res, data);
+  } catch (e) {
+    e.status = res.status;
+    throw e;
+  }
+  return data;
+}
+
 
 

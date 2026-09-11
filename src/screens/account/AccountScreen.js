@@ -5,7 +5,7 @@ import GoldCoin from "../../components/GoldCoin";
 import Header from "../../components/Header";
 import styles from "../../theme/styles";
 import { isAdminUser } from "../../../authLogic";
-import { getMe } from "../../api/client";
+import { getMe, postTestScan } from "../../api/client";
 
 const RECENT_SCANS_LIMIT = 5;
 
@@ -13,6 +13,9 @@ export default function AccountScreen({ navigate, user, onSignOut }) {
   const [scans, setScans] = useState([]);
   // TEMP: debug check for the Expo -> Render -> Supabase auth flow.
   const [debugResult, setDebugResult] = useState("");
+  // TEMP: debug check for /api/test-scan (no request body sent).
+  const [testScanResult, setTestScanResult] = useState("");
+  const [testScanLoading, setTestScanLoading] = useState(false);
 
   async function handleDebugMe() {
     setDebugResult("Calling /api/me...");
@@ -21,6 +24,20 @@ export default function AccountScreen({ navigate, user, onSignOut }) {
       setDebugResult(`/api/me OK\nid: ${me.id}\nemail: ${me.email}`);
     } catch (e) {
       setDebugResult(`/api/me failed: ${e.message}`);
+    }
+  }
+
+  async function handleDebugTestScan() {
+    setTestScanLoading(true);
+    setTestScanResult("Calling /api/test-scan...");
+    try {
+      const scan = await postTestScan();
+      setTestScanResult(`/api/test-scan OK\nid: ${scan.id}\nuser_id: ${scan.user_id}`);
+    } catch (e) {
+      const status = e.status ? `HTTP ${e.status}: ` : "";
+      setTestScanResult(`/api/test-scan failed\n${status}${e.message}`);
+    } finally {
+      setTestScanLoading(false);
     }
   }
 
@@ -110,6 +127,12 @@ export default function AccountScreen({ navigate, user, onSignOut }) {
           <Text style={styles.detailedStatsBtnText}>Debug: GET /api/me</Text>
         </TouchableOpacity>
         {debugResult ? <Text style={styles.profileEmail}>{debugResult}</Text> : null}
+
+        {/* TEMP debug: verify a JWT-authenticated write via the backend. No request body is sent. */}
+        <TouchableOpacity style={styles.detailedStatsBtn} onPress={handleDebugTestScan} disabled={testScanLoading}>
+          <Text style={styles.detailedStatsBtnText}>{testScanLoading ? "Saving..." : "Save Test Scan"}</Text>
+        </TouchableOpacity>
+        {testScanResult ? <Text style={styles.profileEmail}>{testScanResult}</Text> : null}
 
         <TouchableOpacity style={styles.signOutBtn} onPress={onSignOut}>
           <Text style={styles.signOutText}>Sign Out</Text>
