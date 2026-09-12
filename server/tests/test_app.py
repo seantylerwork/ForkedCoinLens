@@ -310,17 +310,62 @@ class CoinLensApiTests(unittest.TestCase):
         self.assertEqual(scans[0]["Coin"], "1946 United States Lincoln Wheat Cent")
 
     def test_openai_chat_route_removed(self):
-        # This app's blanket @app.errorhandler(Exception) turns Flask's normal
-        # 404 for an unmatched route into a generic 500 (a pre-existing,
-        # unrelated behavior) - so the route being gone shows up as a 500
-        # "server_error", not a 404. Either way, the old success shape
-        # (a "choices" key) must never come back.
         self._authenticate()
         response = self.client.post("/api/openai/chat", json={"messages": []}, headers=self.auth_headers)
         body = response.get_json()
 
-        self.assertEqual(response.status_code, 500)
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(body["error"]["code"], "not_found")
         self.assertNotIn("choices", body)
+
+    def test_unknown_route_returns_structured_404_not_500(self):
+        # A stray/mistyped URL hitting the server (e.g. someone navigating to
+        # /identify-coin instead of the real /api/identify-coin) must read as
+        # a clean 404 in logs and to any caller, not a scary 500 that looks
+        # like a server crash.
+        response = self.client.get("/identify-coin")
+        body = response.get_json()
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(body["error"]["code"], "not_found")
+
+    def test_wrong_method_returns_structured_405(self):
+        # /api/identify-coin only accepts POST.
+        response = self.client.get("/api/identify-coin")
+        body = response.get_json()
+
+        self.assertEqual(response.status_code, 405)
+        self.assertEqual(body["error"]["code"], "method_not_allowed")
+
+    def test_oversized_upload_still_returns_413_not_generic_http_exception(self):
+        # The more specific @app.errorhandler(413) must still win over the
+        # new blanket HTTPException handler for this exact case.
+        self._authenticate()
+        coinlens_app.MAX_IMAGE_BYTES = 10
+        response = self.client.post(
+            "/api/identify-coin",
+            json={"front_image": JPEG_BASE64, "source": "camera"},
+            headers=self.auth_headers,
+        )
+        body = response.get_json()
+
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(body["error"]["code"], "image_too_large")
+
+    def test_unexpected_server_error_still_returns_500(self):
+        # Real bugs must still surface as 500, not get miscategorized by the
+        # new HTTPException handler (which only catches routing-level cases).
+        self.enable_mock()
+        with mock.patch.object(coinlens_app, "build_coinlens_result", side_effect=RuntimeError("boom")):
+            response = self.client.post(
+                "/api/identify-coin",
+                json={"front_image": JPEG_BASE64, "source": "camera"},
+                headers=self.auth_headers,
+            )
+        body = response.get_json()
+
+        self.assertEqual(response.status_code, 500)
+        self.assertEqual(body["error"]["code"], "server_error")
 
     def test_successful_response_contract(self):
         self.enable_mock()

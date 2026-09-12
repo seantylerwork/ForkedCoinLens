@@ -10,6 +10,7 @@ import requests
 from dotenv import load_dotenv
 from flask import Flask, Response, g, jsonify, request
 from flask_cors import CORS
+from werkzeug.exceptions import HTTPException
 
 from auth import require_auth
 from require_user import require_user
@@ -122,6 +123,19 @@ def handle_coinlens_error(error):
 @app.errorhandler(413)
 def handle_payload_too_large(_error):
     return error_response(CoinLensError("payload_too_large", "Upload is too large.", 413))
+
+
+@app.errorhandler(HTTPException)
+def handle_http_exception(error):
+    # Flask/Werkzeug raise these for routing-level cases (unknown route -> 404,
+    # wrong HTTP method -> 405, malformed request -> 400, etc). Without this
+    # handler, the blanket Exception handler below catches them too and turns
+    # every one - including a plain "wrong URL" - into a generic 500, which
+    # reads as a server crash in logs when it's really just a 404/405. This
+    # runs before the Exception handler because HTTPException is more specific
+    # in the MRO (a still-more-specific code, like 413 above, wins over this).
+    code = (error.name or "http_error").lower().replace(" ", "_")
+    return error_response(CoinLensError(code, error.description or error.name or "Request failed.", error.code or 500))
 
 
 @app.errorhandler(Exception)
