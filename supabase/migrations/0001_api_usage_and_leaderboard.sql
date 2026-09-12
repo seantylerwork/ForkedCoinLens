@@ -29,6 +29,14 @@ create index if not exists api_usage_user_created_idx
 -- leaked anon/authenticated key can never read or write usage rows directly.
 alter table public.api_usage enable row level security;
 
+-- RLS bypass and base table privileges are two separate permission layers:
+-- service_role bypasses RLS policies, but still needs an explicit GRANT to
+-- touch the table at all. Supabase's Studio table editor applies this
+-- automatically for tables created through it; a table created via raw SQL
+-- (like this one) does not get it for free, which is exactly what caused
+-- "permission denied for table api_usage" (42501) in production.
+grant select, insert, update on public.api_usage to service_role;
+
 -- Safe aggregate-only leaderboard: exposes counts/sums per user, never raw
 -- scan rows, so it can be granted to any signed-in user without leaking
 -- other users' scan history.
