@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `2f45558` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `a89a258` (origin/seperate).
 
 ---
 
@@ -522,7 +522,77 @@ case) still needs a live test scan to confirm.
 
 ---
 
-## 9. Pending external actions
+## 9. Follow-up change: unmatched routes now return 404/405, not 500
+
+**Trigger**: the user woke the Render server up in the morning by visiting
+`/api/health` in a browser, then got confused seeing this in the logs:
+```
+GET /favicon.ico HTTP/1.1" 500 ...
+GET /identify-coin HTTP/1.1" 500 ... "Mozilla/5.0 (iPhone; ...) Safari/604.1"
+```
+and worried the app might be crashing or someone was hitting the real scan
+endpoint. Diagnosed as harmless: the `/identify-coin` hit was a plain
+mobile-Safari `GET` to the wrong path (missing the `/api` prefix, wrong
+HTTP method, no referer, User-Agent is Safari not the Expo app's
+`Expo/... CFNetwork/... Darwin/...` signature) - confirmed by grepping the
+entire client codebase and finding only one call site
+(`src/api/client.js:108`), which correctly POSTs to `/api/identify-coin`.
+Most likely just someone (possibly the user) typing/tapping that URL
+directly into Safari, not a real scan attempt, a bot, or a security issue -
+it never reached `require_auth`, so no auth, quota, OpenAI, Numista, or
+Supabase code ran at all.
+
+**Real (pre-existing) bug this surfaced**, independently flagged by another
+AI reviewer as worth fixing before release testing: `server/app.py` had a
+blanket `@app.errorhandler(Exception)` that catches *every* exception,
+including Flask/Werkzeug's own routing-level `HTTPException`s (404 Not
+Found, 405 Method Not Allowed, etc). With no more specific handler
+registered for those, every wrong-URL or wrong-method request - completely
+harmless - got logged and returned as a generic `500 server_error`, making
+routine noise indistinguishable from a real crash. This is exactly what
+made the log line above look alarming.
+
+**Fix** (`server/app.py`): added `from werkzeug.exceptions import
+HTTPException` and a new `@app.errorhandler(HTTPException)` handler that
+returns the exception's real status code (404, 405, 400, etc.) in the
+app's normal `{"error": {"code": ..., "message": ...}}` shape, with `code`
+derived from the exception's name (e.g. `not_found`, `method_not_allowed`).
+Registration order doesn't matter to Flask - it picks the most specific
+match in the exception's MRO - so:
+- the existing more-specific `@app.errorhandler(413)` still wins for
+  oversized uploads (verified by a new test),
+- the new `HTTPException` handler catches 404/405/400/etc. that have no
+  more specific handler,
+- the blanket `@app.errorhandler(Exception)` now only catches genuine,
+  non-HTTP application bugs (verified by a new test that forces a
+  `RuntimeError` and confirms it still comes back as 500).
+
+No other behavior changed - identification, valuation, quota, persistence,
+and the 422/429/413 contracts are untouched.
+
+**Tests added** (`server/tests/test_app.py`):
+- `test_unknown_route_returns_structured_404_not_500` - reproduces the
+  exact `/identify-coin` scenario from the log.
+- `test_wrong_method_returns_structured_405` - `GET /api/identify-coin`
+  (POST-only) now 405s cleanly.
+- `test_oversized_upload_still_returns_413_not_generic_http_exception` -
+  confirms the new handler doesn't shadow the existing 413 handler.
+- `test_unexpected_server_error_still_returns_500` - confirms a real bug
+  still surfaces as 500.
+- `test_openai_chat_route_removed` (existing, from an earlier session)
+  updated to assert 404 instead of documenting the old 500-on-404 quirk,
+  since that quirk is now fixed.
+
+**Verified live**: booted the server locally in mock mode and reproduced
+the user's exact log lines - `GET /favicon.ico` and `GET /identify-coin`
+both now return 404 (previously 500); `GET /api/identify-coin` (wrong
+method) returns 405; `GET /api/health` still works normally.
+
+**Tests**: 32/32 Python passing (28 → 32), 22/22 JS passing (unaffected).
+
+---
+
+## 10. Pending external actions
 
 1. Run this in the Supabase SQL editor (unchanged from §3/§5 in the earlier
    version of this doc — code is committed, but nothing has executed it
@@ -545,5 +615,5 @@ case) still needs a live test scan to confirm.
    rather than a high number next to "uncertain" - the prompt fix is
    unverified against a live model.
 
-Everything from today (code, tests, seven commits so far, push) is already
-done and live on `origin/seperate` at `2f45558`.
+Everything from today (code, tests, eight commits so far, push) is already
+done and live on `origin/seperate` at `a89a258`.
