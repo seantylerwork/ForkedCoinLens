@@ -44,7 +44,7 @@ USE_MOCK_COIN_RESPONSE = os.environ.get("USE_MOCK_COIN_RESPONSE", "false").lower
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 # M6 cost protection: independent of any OpenAI-side spending limit.
-DAILY_SCAN_LIMIT = int(os.environ.get("DAILY_SCAN_LIMIT", "20"))
+DAILY_SCAN_LIMIT = int(os.environ.get("DAILY_SCAN_LIMIT", "5"))
 MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", str(8 * 1024 * 1024)))
 
 # V1: eBay listing generation is disabled by default (not part of the V1
@@ -596,11 +596,18 @@ def score_numista_candidate(identification, candidate):
     return score
 
 
+# Numista raw response bodies are logged truncated to this length - long
+# enough to see the actual field shape (the thing we're verifying), short
+# enough not to flood Render logs on every scan.
+NUMISTA_LOG_BODY_CHARS = 1500
+
+
 def search_numista_types(identification):
     """Returns a list of candidate Numista types, or None if the lookup
     itself failed (as opposed to succeeding with zero results)."""
     query = " ".join(filter(None, [identification.get("country"), identification.get("denomination")])).strip()
     if not query:
+        app.logger.info("[numista] search skipped: no country/denomination to build a query from")
         return []
     try:
         upstream = requests.get(
@@ -609,10 +616,24 @@ def search_numista_types(identification):
             headers={"Numista-API-Key": NUMISTA_API_KEY},
             timeout=NUMISTA_TIMEOUT,
         )
-        upstream.raise_for_status()
-        return _numista_result_list(upstream.json())
-    except (requests.RequestException, ValueError):
+    except requests.RequestException as error:
+        app.logger.error("[numista] search request failed: query=%r error=%s", query, error)
         return None
+
+    app.logger.info(
+        "[numista] search response: query=%r status=%s body=%s",
+        query, upstream.status_code, upstream.text[:NUMISTA_LOG_BODY_CHARS],
+    )
+
+    try:
+        upstream.raise_for_status()
+        results = _numista_result_list(upstream.json())
+    except (requests.RequestException, ValueError) as error:
+        app.logger.error("[numista] search response unusable: query=%r error=%s", query, error)
+        return None
+
+    app.logger.info("[numista] search found %d candidate(s) for query=%r", len(results), query)
+    return results
 
 
 def fetch_numista_type_detail(type_id):
@@ -624,9 +645,15 @@ def fetch_numista_type_detail(type_id):
         )
         upstream.raise_for_status()
         data = upstream.json()
-        return data if isinstance(data, dict) else None
-    except (requests.RequestException, ValueError):
+    except (requests.RequestException, ValueError) as error:
+        app.logger.warning("[numista] type detail fetch failed: type_id=%s error=%s", type_id, error)
         return None
+
+    app.logger.info(
+        "[numista] type detail response: type_id=%s status=%s body=%s",
+        type_id, upstream.status_code, upstream.text[:NUMISTA_LOG_BODY_CHARS],
+    )
+    return data if isinstance(data, dict) else None
 
 
 def select_best_numista_match(identification, candidates):
@@ -635,12 +662,19 @@ def select_best_numista_match(identification, candidates):
     if not candidates:
         return None
     scored = sorted(candidates, key=lambda c: score_numista_candidate(identification, c), reverse=True)
+    ranked = [(score_numista_candidate(identification, c), c.get("id"), c.get("title")) for c in scored[:3]]
+    app.logger.info("[numista] top candidates (score, id, title): %s", ranked)
+
     best = scored[0]
     best_score = score_numista_candidate(identification, best)
     if best_score < 3:
+        app.logger.info("[numista] no confident match: top score %s below threshold 3", best_score)
         return None
     if len(scored) > 1 and score_numista_candidate(identification, scored[1]) == best_score:
+        app.logger.info("[numista] no confident match: top score %s tied with runner-up", best_score)
         return None
+
+    app.logger.info("[numista] selected match: id=%s title=%r score=%s", best.get("id"), best.get("title"), best_score)
     return best
 
 
@@ -651,8 +685,17 @@ def lookup_numista(identification):
     if should_use_mock_coin_response():
         log_mock_response("lookup_numista")
         return dict(MOCK_NUMISTA)
-    if not NUMISTA_API_KEY or identification.get("identifiable") is False:
+    if not NUMISTA_API_KEY:
+        app.logger.info("[numista] lookup skipped: no NUMISTA_API_KEY configured")
         return None
+    if identification.get("identifiable") is False:
+        return None
+
+    app.logger.info(
+        "[numista] lookup starting for identification: country=%r denomination=%r year=%r grade=%r",
+        identification.get("country"), identification.get("denomination"),
+        identification.get("year"), identification.get("estimated_grade"),
+    )
 
     candidates = search_numista_types(identification)
     if candidates is None:
@@ -676,26 +719,45 @@ def fetch_numista_price(type_id, grade):
             headers={"Numista-API-Key": NUMISTA_API_KEY},
             timeout=NUMISTA_TIMEOUT,
         )
-        if upstream.status_code in (401, 402, 403, 404):
-            return None
+    except requests.RequestException as error:
+        app.logger.error("[numista] price request failed: type_id=%s error=%s", type_id, error)
+        return None
+
+    app.logger.info(
+        "[numista] price response: type_id=%s grade=%r status=%s body=%s",
+        type_id, grade, upstream.status_code, upstream.text[:NUMISTA_LOG_BODY_CHARS],
+    )
+
+    if upstream.status_code in (401, 402, 403, 404):
+        app.logger.info("[numista] price unavailable for type_id=%s (status=%s)", type_id, upstream.status_code)
+        return None
+    try:
         upstream.raise_for_status()
         data = upstream.json()
-    except (requests.RequestException, ValueError):
+    except (requests.RequestException, ValueError) as error:
+        app.logger.error("[numista] price response unusable: type_id=%s error=%s", type_id, error)
         return None
 
     prices = data.get("prices") if isinstance(data, dict) else None
     if not isinstance(prices, list) or not prices:
+        app.logger.info("[numista] price response had no usable 'prices' list: type_id=%s", type_id)
         return None
 
     grade_text = _text_of(grade)
     for entry in prices:
         if isinstance(entry, dict) and _text_of(entry.get("grade")) == grade_text and entry.get("price") is not None:
+            app.logger.info("[numista] exact grade price match: type_id=%s grade=%r price=%s", type_id, grade, entry["price"])
             return {"value": entry["price"], "grade": entry.get("grade"), "exact_grade_match": True}
 
     priced = [entry for entry in prices if isinstance(entry, dict) and entry.get("price") is not None]
     if not priced:
+        app.logger.info("[numista] no priced grade entries found: type_id=%s", type_id)
         return None
     middle = priced[len(priced) // 2]
+    app.logger.info(
+        "[numista] no exact grade match, using nearest available: type_id=%s requested_grade=%r used_grade=%r price=%s",
+        type_id, grade, middle.get("grade"), middle["price"],
+    )
     return {"value": middle["price"], "grade": middle.get("grade"), "exact_grade_match": False}
 
 
@@ -708,6 +770,7 @@ def lookup_pcgs(numista_data):
     references = numista_data.get("references") or []
     pcgs_reference = next((ref for ref in references if ref.get("type") == "PCGS" and ref.get("number")), None)
     if not pcgs_reference:
+        app.logger.info("[pcgs] skipped: no PCGS reference number in Numista match")
         return None
     try:
         upstream = requests.get(
@@ -719,8 +782,10 @@ def lookup_pcgs(numista_data):
         data = upstream.json()
         if isinstance(data, dict):
             data.setdefault("source_note", "PCGS priceguide lookup by Numista PCGS reference number; this is not automated grading.")
+        app.logger.info("[pcgs] lookup succeeded: pcgs_number=%s price=%s", pcgs_reference["number"], data.get("price") if isinstance(data, dict) else None)
         return data
-    except (requests.RequestException, ValueError):
+    except (requests.RequestException, ValueError) as error:
+        app.logger.warning("[pcgs] lookup failed: pcgs_number=%s error=%s", pcgs_reference["number"], error)
         return {"error": "PCGS lookup unavailable."}
 
 
@@ -736,16 +801,20 @@ def estimate_value(identification, numista_data):
         return {"status": "unavailable", "currency": "USD", "source": "CoinLens", "reason": "Coin was not identifiable."}
 
     if not isinstance(numista_data, dict) or numista_data.get("error"):
+        app.logger.info("[valuation] unavailable: no confident Numista catalog match")
         return {"status": "unavailable", "currency": "USD", "source": "CoinLens", "reason": "No confident Numista catalog match."}
 
     type_id = numista_data.get("numista_type_id") or numista_data.get("id")
     if type_id is None:
+        app.logger.info("[valuation] unavailable: Numista match had no usable type id")
         return {"status": "unavailable", "currency": "USD", "source": "CoinLens", "reason": "No confident Numista catalog match."}
 
     price = fetch_numista_price(type_id, identification.get("estimated_grade"))
     if not price:
+        app.logger.info("[valuation] unavailable: Numista match found (type_id=%s) but no usable price", type_id)
         return {"status": "unavailable", "currency": "USD", "source": "Numista", "reason": "Numista match found but no usable price for this grade."}
 
+    app.logger.info("[valuation] available from Numista: type_id=%s value=%s", type_id, price["value"])
     return {
         "status": "available",
         "estimated_value": round(float(price["value"]), 2),
@@ -793,6 +862,12 @@ def build_coinlens_result(front_image, back_image=None):
         return build_mock_coin_result(True, back_image is not None)
 
     identification = identify_coin_with_ai(front_image, back_image)
+    app.logger.info(
+        "[identify] OpenAI result: status=%s confidence=%s country=%r denomination=%r year=%r grade=%r",
+        identification.get("status"), identification.get("confidence"),
+        identification.get("country"), identification.get("denomination"),
+        identification.get("year"), identification.get("estimated_grade"),
+    )
     if identification.get("identifiable") is False:
         return {
             "identification": identification,
@@ -804,6 +879,7 @@ def build_coinlens_result(front_image, back_image=None):
     pcgs_data = lookup_pcgs(numista_data)
     valuation = estimate_value(identification, numista_data)
     if valuation.get("status") != "available" and isinstance(pcgs_data, dict) and pcgs_data.get("price") is not None:
+        app.logger.info("[valuation] promoted to PCGS fallback: price=%s", pcgs_data["price"])
         valuation = {
             "status": "available",
             "estimated_value": round(float(pcgs_data["price"]), 2),
@@ -811,6 +887,10 @@ def build_coinlens_result(front_image, back_image=None):
             "source": "PCGS",
             "condition_assumed": pcgs_data.get("grade") or identification.get("estimated_grade"),
         }
+    app.logger.info(
+        "[identify] final valuation: status=%s source=%s value=%s",
+        valuation.get("status"), valuation.get("source"), valuation.get("estimated_value"),
+    )
     summary = build_coin_summary(identification, valuation)
     return {
         "identification": identification,
@@ -965,6 +1045,7 @@ def identify_coin():
         update_api_usage(usage_id, {"status": "error"})
         return error_response(CoinLensError("scan_insert_failed", "Identification succeeded but the scan could not be saved.", 500))
 
+    app.logger.info("[identify] scan persisted: id=%s user_id=%s source=%s", scan_row.get("id"), g.user_id, source)
     update_api_usage(usage_id, {"status": "identified", "scan_id": scan_row.get("id")})
 
     body = dict(result)
