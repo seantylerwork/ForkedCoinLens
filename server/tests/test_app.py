@@ -384,6 +384,131 @@ class CoinLensApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 502)
         self.assertEqual(body["error"]["code"], "malformed_ai_response")
 
+    # -- confidence-means-complete-identification (semantic fix) -----------
+    # These exercise normalize_identification() directly with the shape a
+    # real model response takes for each scenario, since the actual prompt
+    # wording can't be asserted by calling a live model in a unit test.
+
+    def test_normalize_identification_fully_identified_coin_is_high_confidence(self):
+        data = {
+            "status": "identified",
+            "coin_name": "1965 United States Washington Quarter",
+            "country": "United States",
+            "denomination": "Quarter Dollar",
+            "year": "1965",
+            "mint_mark": "D",
+            "estimated_grade": "VF-30",
+            "confidence": 92,
+            "description": "Clear obverse and reverse, legible date and mint mark.",
+            "mint_errors": [],
+            "varieties": None,
+            "error_premium": False,
+            "special_notes": "",
+            "unidentifiable_reason": None,
+            "alternatives": [],
+        }
+
+        result = coinlens_app.normalize_identification(data)
+
+        self.assertEqual(result["status"], "identified")
+        self.assertTrue(result["identifiable"])
+        self.assertGreaterEqual(result["confidence"], 70)
+        self.assertEqual(result["year"], "1965")
+        self.assertEqual(result["mint_mark"], "D")
+
+    def test_normalize_identification_illegible_year_is_uncertain_and_low_confidence(self):
+        # Mirrors the real production case this fix addresses: country and
+        # denomination were clear (Hong Kong, 10 cents) but the year could
+        # not be read, so confidence must be low and status uncertain -
+        # not a high number attached to an incomplete identification.
+        data = {
+            "status": "uncertain",
+            "coin_name": "Hong Kong 10 Cents",
+            "country": "Hong Kong",
+            "denomination": "10 Cents",
+            "year": "Not legible",
+            "mint_mark": None,
+            "estimated_grade": "Unknown",
+            "confidence": 15,
+            "description": "Country and denomination are clear but the date is worn away.",
+            "mint_errors": [],
+            "varieties": None,
+            "error_premium": False,
+            "special_notes": "",
+            "unidentifiable_reason": "The date is too worn to read confidently. A sharper, well-lit photo of the date would help.",
+            "alternatives": [],
+        }
+
+        result = coinlens_app.normalize_identification(data)
+
+        self.assertEqual(result["status"], "uncertain")
+        self.assertFalse(result["identifiable"])
+        self.assertLess(result["confidence"], coinlens_app.MIN_IDENTIFICATION_CONFIDENCE)
+        # Country/denomination are still surfaced even though the overall
+        # identification isn't complete enough to proceed to Numista.
+        self.assertEqual(result["country"], "Hong Kong")
+        self.assertEqual(result["denomination"], "10 Cents")
+
+    def test_normalize_identification_non_coin_is_uncertain(self):
+        data = {
+            "status": "uncertain",
+            "coin_name": None,
+            "country": None,
+            "denomination": None,
+            "year": None,
+            "mint_mark": None,
+            "estimated_grade": None,
+            "confidence": 3,
+            "description": "This appears to be a button, not a coin.",
+            "mint_errors": [],
+            "varieties": None,
+            "error_premium": False,
+            "special_notes": "",
+            "unidentifiable_reason": "This does not appear to be a coin.",
+            "alternatives": [],
+        }
+
+        result = coinlens_app.normalize_identification(data)
+
+        self.assertEqual(result["status"], "uncertain")
+        self.assertFalse(result["identifiable"])
+        self.assertLess(result["confidence"], coinlens_app.MIN_IDENTIFICATION_CONFIDENCE)
+        self.assertEqual(result["country"], "Unknown")
+        self.assertEqual(result["denomination"], "Unknown")
+
+    def test_identify_coin_illegible_year_returns_422_without_numista(self):
+        # End-to-end version of the middle case above: the full route must
+        # still 422 and never reach Numista when the model (correctly, per
+        # the updated prompt) reports low confidence for an incomplete id.
+        self._authenticate()
+        coinlens_app.OPENAI_API_KEY = "test-key"
+        uncertain = {
+            "coin_name": "Hong Kong 10 Cents", "country": "Hong Kong", "denomination": "10 Cents",
+            "year": "Unknown", "mint_mark": None, "estimated_grade": "Unknown", "description": "",
+            "mint_errors": [], "varieties": None, "error_premium": False, "special_notes": "",
+            "status": "uncertain", "identifiable": False,
+            "unidentifiable_reason": "The date is too worn to read confidently.", "confidence": 15, "alternatives": [],
+        }
+        with mock.patch.object(coinlens_app, "identify_coin_with_ai", return_value=uncertain), \
+             mock.patch.object(coinlens_app, "insert_api_usage", return_value={"id": "usage-1"}), \
+             mock.patch.object(coinlens_app, "count_api_usage_since", return_value=0), \
+             mock.patch.object(coinlens_app, "update_api_usage") as mock_update, \
+             mock.patch.object(coinlens_app, "search_numista_types") as mock_numista_search, \
+             mock.patch.object(coinlens_app, "insert_scan") as mock_insert:
+            response = self.client.post(
+                "/api/identify-coin",
+                json={"front_image": JPEG_BASE64, "source": "camera"},
+                headers=self.auth_headers,
+            )
+        body = response.get_json()
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(body["identification"]["status"], "uncertain")
+        self.assertLess(body["identification"]["confidence"], coinlens_app.MIN_IDENTIFICATION_CONFIDENCE)
+        mock_numista_search.assert_not_called()
+        mock_insert.assert_not_called()
+        mock_update.assert_called_once_with("usage-1", {"status": "uncertain"})
+
 
 if __name__ == "__main__":
     unittest.main()

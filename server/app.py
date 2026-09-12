@@ -359,15 +359,26 @@ collector app. Examine the image(s) closely: obverse/front design, reverse/back 
 inscriptions and mottos, the date and mint mark exactly as visible, country and denomination text, metal color, \
 surface wear and condition, and any doubling, off-center strikes, die cracks or other notable anomalies.
 
-Set "status" to "identified" only when you are reasonably confident of the country, denomination, and year. Set it \
-to "uncertain" when the photo is blurry, too dark, cropped, glare-obscured, or otherwise not clear enough to be \
-confident - in that case explain in "unidentifiable_reason" what a better photo would need to show (for example: \
-sharper focus, more even lighting, the full coin in frame, or the reverse side). Never invent an identification you \
-are not reasonably confident in.
+Set "status" to "identified" only when you are reasonably confident of the country, denomination, year, and mint \
+mark (when the country/denomination normally carries one). Set it to "uncertain" whenever any of those fields is \
+illegible, guessed, or unknown - even if the others are perfectly clear - or when the photo is blurry, too dark, \
+cropped, glare-obscured, or otherwise not clear enough to be confident. When uncertain, explain in \
+"unidentifiable_reason" what a better photo would need to show (for example: sharper focus, more even lighting, \
+the full coin in frame, the reverse side, or a clearer view of the date). Never invent an identification you are \
+not reasonably confident in.
+
+"confidence" is a 0-100 self-assessment of how confident you are in the COMPLETE identification as a whole - \
+country AND denomination AND year AND mint mark (when relevant) together - not just whichever parts happen to be \
+clearly visible. This number is what downstream code uses to decide whether to search a coin catalog by country, \
+denomination, and year, so a partial identification must score low even when some individual fields are obvious. \
+For example: if the country and denomination are unmistakable but the year is worn away, cropped out, or \
+otherwise not legible, confidence must be low (well under 40) and status must be "uncertain" - do not give a high \
+confidence score just because part of the coin was easy to read. Only score confidence high (70 or above) when \
+every field needed to look up this exact coin - country, denomination, year, and mint mark when relevant - is \
+clearly legible with no guessing involved.
 
 "estimated_grade" is your own visual estimate using the Sheldon scale (e.g. "VF-30") - make clear this is an \
-estimate, not a professional certified grade. "confidence" is your own 0-100 self-assessment of how sure you are; \
-it does not need to be a precise probability, just your honest sense of certainty.
+estimate, not a professional certified grade.
 
 Return ONLY the structured fields requested. Do not include any text outside the JSON object."""
 
@@ -375,14 +386,21 @@ IDENTIFICATION_JSON_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
-        "status": {"type": "string", "enum": ["identified", "uncertain"]},
+        "status": {
+            "type": "string",
+            "enum": ["identified", "uncertain"],
+            "description": "identified only if country, denomination, year, and mint mark (when relevant) are all legible; uncertain if any of those is illegible, guessed, or unknown.",
+        },
         "coin_name": {"type": "string"},
         "country": {"type": "string"},
         "denomination": {"type": "string"},
         "year": {"type": "string"},
         "mint_mark": {"type": ["string", "null"]},
         "estimated_grade": {"type": "string"},
-        "confidence": {"type": "integer"},
+        "confidence": {
+            "type": "integer",
+            "description": "0-100 confidence in the COMPLETE identification (country + denomination + year + mint mark together), not just the clearest individual field. Must be well under 40 if any of those fields is not legible.",
+        },
         "description": {"type": "string"},
         "mint_errors": {"type": "array", "items": {"type": "string"}},
         "varieties": {"type": ["string", "null"]},
