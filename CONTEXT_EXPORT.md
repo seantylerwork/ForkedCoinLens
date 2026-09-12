@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `fe9369d` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `2f45558` (origin/seperate).
 
 ---
 
@@ -425,7 +425,104 @@ happened yet in this session (no `NUMISTA_API_KEY` was available here). The
 
 ---
 
-## 7. Pending external actions
+## 7. Follow-up change: manual capture button replaces auto-capture
+
+**Trigger**: the user reported the camera scan flow as "impractical and
+broken" — it showed the scanning animation, auto-snapped the front photo
+after a fixed ~2.5s timer, then auto-snapped the back photo ~2.5s after the
+"flip the coin" prompt, with no way to control shutter timing.
+
+**Root cause**: a single `useEffect` in `src/screens/scan/ScanScreen.js`
+started a `setTimeout` calling `capture()` automatically whenever the camera
+was ready, restarting itself every time `captureStage` flipped from
+`front` → `back`. The round indicator under the camera preview was purely
+decorative (an `Animated.View`, not a button) — there was no manual capture
+path to fall back to at all.
+
+**Fix** (commit `d04e3e8`, 4 files):
+- `src/screens/scan/ScanScreen.js` — deleted the auto-capture `useEffect`
+  and its timer ref entirely. Kept the scanning animation (corner brackets,
+  scan-line sweep) unchanged. Wired the existing `capture()` state machine
+  (front → back → identify — already correct, it just needed a manual
+  trigger instead of a timer) to a tap on the round indicator, now a real
+  `TouchableOpacity`. Added an `isCapturing` guard so a rapid double-tap
+  can't fire two captures at once, and disabled the button until
+  `cameraReady`.
+- `src/theme/styles.js` — two small additive styles: `captureIndicatorDisabled`
+  (dims the button while disabled/capturing) and `captureButtonInner` (a
+  solid inner dot so the ring reads visually as a shutter button).
+- `scanFlowLogic.js` — updated the front/back hint copy to say "tap the
+  button below to capture the front/back of the coin" instead of "will
+  capture automatically"; kept the "Flip the Coin" title as asked; dropped
+  the now-unused `autoCaptureDelayMs`.
+- `__tests__/scanFlowLogic.test.js` — updated the two assertions that
+  specifically tested the old "automatically"/`autoCaptureDelayMs` behavior.
+
+**Tests**: 22/22 JS passing. No Python files touched.
+
+---
+
+## 8. Follow-up change: identification confidence now means the COMPLETE id
+
+**Trigger**: a real (non-mock) scan produced `status=uncertain,
+confidence=84, country=Hong Kong, denomination=10 cents, year=Not legible`.
+The 422/no-Numista behavior was already *correct* (status=uncertain
+correctly blocked the scan) — the problem was purely semantic: a
+confidence of 84 reads as "very sure" right next to "uncertain," which is
+confusing and would be actively misleading if confidence were ever surfaced
+to a user or used for any downstream decision. The model was evidently
+scoring confidence based on how clearly it could read country/denomination,
+ignoring that the year - also required for a Numista catalog lookup - was
+illegible.
+
+**Fix** (`server/app.py` only, prompt/schema text - no logic or contract
+changes):
+- `IDENTIFICATION_PROMPT` rewritten so `confidence` is explicitly defined as
+  confidence in the *complete* identification needed for a Numista lookup -
+  country **and** denomination **and** year **and** mint mark (when
+  relevant) together, not just whichever field is easiest to read. Explicit
+  worked example: "if the country and denomination are unmistakable but the
+  year is worn away... confidence must be low (well under 40) and status
+  must be 'uncertain'." `status` guidance updated to match (any one of those
+  fields being illegible/guessed/unknown means uncertain, even if the rest
+  are clear).
+- `IDENTIFICATION_JSON_SCHEMA` — added non-breaking `"description"`
+  annotations to the `status` and `confidence` properties reinforcing the
+  same guidance directly in the structured-output schema (types/required/
+  enum unchanged, so the wire contract is identical).
+- `MIN_IDENTIFICATION_CONFIDENCE` (40) and `normalize_identification()`'s
+  `identifiable = status == "identified" and confidence >= 40` logic were
+  **not** changed — the 422 behavior was already correct; this fix is about
+  making the *value* the model reports consistent with that behavior, not
+  about how the server interprets it. No server-side clamping was added
+  (e.g. forcibly capping confidence when status is "uncertain") since this
+  was scoped as a prompt/schema fix, not a defensive-code fix.
+
+**Tests added** (`server/tests/test_app.py`, all passing): since a live
+model can't be invoked in a unit test, these exercise
+`normalize_identification()` directly with realistic response shapes for
+each scenario, plus one full-route test:
+- `test_normalize_identification_fully_identified_coin_is_high_confidence` —
+  all fields legible → `identified`, confidence ≥ 70.
+- `test_normalize_identification_illegible_year_is_uncertain_and_low_confidence` —
+  the exact reported scenario (country/denomination clear, year illegible)
+  → `uncertain`, confidence < 40, country/denomination still surfaced.
+- `test_normalize_identification_non_coin_is_uncertain` — nothing legible →
+  `uncertain`, confidence < 40, fields fall back to "Unknown".
+- `test_identify_coin_illegible_year_returns_422_without_numista` — full
+  `/api/identify-coin` route test asserting 422, confidence below threshold,
+  and that Numista search and scan persistence are never reached.
+
+**Tests**: 28/28 Python passing (24 → 28), 22/22 JS passing (unaffected).
+
+**Not yet verified against a real model call** — no `OPENAI_API_KEY` is
+available in this environment, so whether GPT actually complies with the
+strengthened prompt on real photos (like the reported Hong Kong 10 cents
+case) still needs a live test scan to confirm.
+
+---
+
+## 9. Pending external actions
 
 1. Run this in the Supabase SQL editor (unchanged from §3/§5 in the earlier
    version of this doc — code is committed, but nothing has executed it
@@ -443,5 +540,10 @@ happened yet in this session (no `NUMISTA_API_KEY` was available here). The
    `body=...` in the log line shows exactly what to fix in
    `search_numista_types` / `fetch_numista_price` / `score_numista_candidate`.
 
-Everything else from today (code, tests, three commits, push) is already
-done and live on `origin/seperate` at `fe9369d`.
+3. While doing that real scan, also check whether the illegible-year case
+   (§8) now comes back with a confidence that actually reads as low/uncertain
+   rather than a high number next to "uncertain" - the prompt fix is
+   unverified against a live model.
+
+Everything from today (code, tests, seven commits so far, push) is already
+done and live on `origin/seperate` at `2f45558`.
