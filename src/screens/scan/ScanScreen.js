@@ -300,7 +300,7 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
   }
 
   if (phase === "error") {
-    const ed = errorDetail ?? { icon: "!", title: "Something Went Wrong", body: "An unexpected error occurred.", tip: "Try scanning again." };
+    const ed = errorDetail ?? { icon: "!", title: "Something Went Wrong", body: "An unexpected error occurred.", tip: "Try scanning again.", retryable: true };
     return (
       <SafeAreaView style={styles.safeArea}>
         <Header title="Scan Coin" onBack={() => navigate("home")} />
@@ -314,9 +314,15 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
               <Text style={styles.errorTipText}>{ed.tip}</Text>
             </View>
           ) : null}
-          <TouchableOpacity style={styles.primaryBtn} onPress={startNewScan}>
-            <Text style={styles.primaryBtnText}>Try Again</Text>
-          </TouchableOpacity>
+          {ed.retryable === false ? (
+            <TouchableOpacity style={styles.primaryBtn} onPress={() => { startNewScan(); navigate("home"); }}>
+              <Text style={styles.primaryBtnText}>Back to Home</Text>
+            </TouchableOpacity>
+          ) : (
+            <TouchableOpacity style={styles.primaryBtn} onPress={startNewScan}>
+              <Text style={styles.primaryBtnText}>Try Again</Text>
+            </TouchableOpacity>
+          )}
         </View>
       </SafeAreaView>
     );
