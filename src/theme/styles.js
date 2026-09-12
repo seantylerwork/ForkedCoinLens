@@ -193,6 +193,13 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     ...GOLD_GLOW,
   },
+  captureIndicatorDisabled: { opacity: 0.4 },
+  captureButtonInner: {
+    width: 60,
+    height: 60,
+    borderRadius: 30,
+    backgroundColor: GOLD,
+  },
 
   // Loading / error
   loadingStep: { marginTop: 20, fontSize: 16, color: GOLD, fontWeight: "600", textAlign: "center" },

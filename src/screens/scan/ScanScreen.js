@@ -55,11 +55,11 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
   const [listingError, setListingError] = useState("");
   const [cameraReady, setCameraReady] = useState(false);
   const [flashActive, setFlashActive] = useState(false);
+  const [isCapturing, setIsCapturing] = useState(false);
   const [selectedUpload, setSelectedUpload] = useState(null);
   const scanAnim = useRef(new Animated.Value(0)).current;
   const flashAnim = useRef(new Animated.Value(0)).current;
   const cameraRef = useRef(null);
-  const autoCaptureTimerRef = useRef(null);
   const captureMeta = getCaptureStageMeta(captureStage);
 
   useEffect(() => {
@@ -74,10 +74,6 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
   }, []);
 
   function startNewScan() {
-    if (autoCaptureTimerRef.current) {
-      clearTimeout(autoCaptureTimerRef.current);
-      autoCaptureTimerRef.current = null;
-    }
     setPhase("choose");
     setCaptureStage("front");
     setFrontImage(null);
@@ -85,6 +81,7 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
     setLoadingStep("");
     setErrorDetail(null);
     setCameraReady(false);
+    setIsCapturing(false);
     setEbayListing(null);
     setListingError("");
     setListingLoading(false);
@@ -102,15 +99,13 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
   }
 
   async function capture() {
-    if (autoCaptureTimerRef.current) {
-      clearTimeout(autoCaptureTimerRef.current);
-      autoCaptureTimerRef.current = null;
-    }
+    if (isCapturing) return;
     if (!cameraRef.current) {
       setErrorDetail(makeErrorDetail(new ScanError("camera", "The camera hasn't finished initializing. Wait a moment and try again.")));
       setPhase("error");
       return;
     }
+    setIsCapturing(true);
     try {
       setFlashActive(true);
       if (captureStage === "front") {
@@ -151,6 +146,8 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
     } catch (e) {
       setErrorDetail(makeErrorDetail(e));
       setPhase("error");
+    } finally {
+      setIsCapturing(false);
     }
   }
 
@@ -164,27 +161,6 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
     animation.start(() => setFlashActive(false));
     return () => animation.stop();
   }, [flashActive, flashAnim]);
-
-  useEffect(() => {
-    if (phase !== "scanning" || !permission?.granted || !cameraReady) return undefined;
-
-    if (autoCaptureTimerRef.current) {
-      clearTimeout(autoCaptureTimerRef.current);
-    }
-
-    autoCaptureTimerRef.current = setTimeout(() => {
-      if (cameraRef.current) {
-        void capture();
-      }
-    }, captureMeta.autoCaptureDelayMs);
-
-    return () => {
-      if (autoCaptureTimerRef.current) {
-        clearTimeout(autoCaptureTimerRef.current);
-        autoCaptureTimerRef.current = null;
-      }
-    };
-  }, [cameraReady, captureMeta.autoCaptureDelayMs, captureStage, permission?.granted, phase]);
 
   async function uploadPhoto() {
     const permissionResult = await ImagePicker.requestMediaLibraryPermissionsAsync(false);
@@ -604,14 +580,25 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
         </View>
         <Text style={styles.scanHint}>{captureMeta.title}</Text>
         <Text style={styles.scanSubHint}>{captureMeta.body}</Text>
-        <Animated.View style={[
-          styles.captureIndicator,
-          flashActive && {
-            transform: [{ scale: flashAnim.interpolate({ inputRange: [0, 1], outputRange: [1, 1.18] }) }],
-            backgroundColor: flashAnim.interpolate({ inputRange: [0, 1], outputRange: ["rgba(255,215,0,0.08)", GOLD] }),
-            borderColor: flashAnim.interpolate({ inputRange: [0, 1], outputRange: ["rgba(255,215,0,0.25)", "#fff6b0"] }),
-          },
-        ]} />
+        <TouchableOpacity
+          onPress={capture}
+          disabled={!cameraReady || isCapturing}
+          activeOpacity={0.7}
+          accessibilityRole="button"
+          accessibilityLabel={captureStage === "front" ? "Capture front of coin" : "Capture back of coin"}
+        >
+          <Animated.View style={[
+            styles.captureIndicator,
+            (!cameraReady || isCapturing) && styles.captureIndicatorDisabled,
+            flashActive && {
+              transform: [{ scale: flashAnim.interpolate({ inputRange: [0, 1], outputRange: [1, 1.18] }) }],
+              backgroundColor: flashAnim.interpolate({ inputRange: [0, 1], outputRange: ["rgba(255,215,0,0.08)", GOLD] }),
+              borderColor: flashAnim.interpolate({ inputRange: [0, 1], outputRange: ["rgba(255,215,0,0.25)", "#fff6b0"] }),
+            },
+          ]}>
+            <View style={styles.captureButtonInner} />
+          </Animated.View>
+        </TouchableOpacity>
       </View>
     </SafeAreaView>
   );
