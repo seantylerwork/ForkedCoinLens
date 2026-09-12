@@ -1,8 +1,10 @@
 import os
+import re
 import base64
 import binascii
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 
 import requests
 from dotenv import load_dotenv
@@ -11,7 +13,13 @@ from flask_cors import CORS
 
 from auth import require_auth
 from require_user import require_user
-from supabase_admin import insert_scan, SupabaseAdminError
+from supabase_admin import (
+    insert_scan,
+    insert_api_usage,
+    update_api_usage,
+    count_api_usage_since,
+    SupabaseAdminError,
+)
 from mock_openai import (
     MOCK_EBAY_LISTING,
     MOCK_MARKER,
@@ -19,7 +27,6 @@ from mock_openai import (
     MOCK_PCGS,
     MOCK_SCAN_ROW,
     build_mock_coin_result as deterministic_mock_coin_result,
-    build_mock_reply,
 )
 
 load_dotenv()
@@ -32,14 +39,43 @@ ADMIN_CODE = os.environ.get("ADMIN_CODE", "")
 MOCK_MODE = os.environ.get("MOCK_MODE", "false").lower() == "true"
 USE_MOCK_COIN_RESPONSE = os.environ.get("USE_MOCK_COIN_RESPONSE", "false").lower() == "true" or MOCK_MODE
 
+# Configurable so the identification model can be changed (e.g. for cost or
+# capability reasons) without a code change.
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
+
+# M6 cost protection: independent of any OpenAI-side spending limit.
+DAILY_SCAN_LIMIT = int(os.environ.get("DAILY_SCAN_LIMIT", "20"))
+MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", str(8 * 1024 * 1024)))
+
+# V1: eBay listing generation is disabled by default (not part of the V1
+# scope). The implementation is kept intact behind this flag so it can be
+# re-enabled later without rebuilding it.
+ENABLE_EBAY_LISTING = os.environ.get("ENABLE_EBAY_LISTING", "false").lower() == "true"
+
+OPENAI_TIMEOUT = int(os.environ.get("OPENAI_TIMEOUT_SECONDS", "60"))
+NUMISTA_TIMEOUT = int(os.environ.get("NUMISTA_TIMEOUT_SECONDS", "20"))
+PCGS_TIMEOUT = int(os.environ.get("PCGS_TIMEOUT_SECONDS", "20"))
+
 OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
+# Current OpenAI multimodal + structured-output endpoint. Used for the single
+# identification call so the vision model returns schema-conformant JSON
+# directly, instead of the old free-text-then-reparse approach.
+OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+NUMISTA_TYPES_URL = "https://api.numista.com/api/v3/types"
 NUMISTA_COINS_URL = "https://api.numista.com/api/v3/coins"
 PCGS_PRICE_URL = "https://api.pcgs.com/publicapi/priceguide/getpricedata/{pcgs_number}"
 
 REQUEST_TIMEOUT = 60
 
+US_COUNTRY_NAMES = {"united states", "usa", "u.s.", "u.s.a.", "united states of america"}
+MIN_IDENTIFICATION_CONFIDENCE = 40
+
 app = Flask(__name__)
 CORS(app)
+# Two coin photos as base64 JSON comfortably fit well under this; guards
+# against a client accidentally posting something enormous before we ever
+# get to per-image validation.
+app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_CONTENT_LENGTH_BYTES", str(24 * 1024 * 1024)))
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
 app.logger.handlers = logging.getLogger("gunicorn.error").handlers or app.logger.handlers
@@ -83,6 +119,11 @@ def handle_coinlens_error(error):
     return error_response(error)
 
 
+@app.errorhandler(413)
+def handle_payload_too_large(_error):
+    return error_response(CoinLensError("payload_too_large", "Upload is too large.", 413))
+
+
 @app.errorhandler(Exception)
 def handle_unexpected_error(_error):
     return error_response(CoinLensError("server_error", "Unexpected server failure.", 500))
@@ -110,49 +151,28 @@ def me():
     return jsonify({"id": g.user_id, "email": g.user_email})
 
 
-@app.route("/api/openai/chat", methods=["POST"])
-@require_auth
-def openai_chat():
-    payload = request.get_json(force=True, silent=True) or {}
-
-    if should_use_mock_coin_response():
-        log_mock_response("/api/openai/chat")
-        content = build_mock_reply(payload)
-        return jsonify({"choices": [{"message": {"content": content}}]})
-
-    if not OPENAI_API_KEY:
-        return jsonify({"error": {"message": "Server is missing OPENAI_API_KEY."}}), 500
-
-    upstream = requests.post(
-        OPENAI_CHAT_URL,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-        },
-        json=payload,
-        timeout=REQUEST_TIMEOUT,
-    )
-    return proxy_response(upstream)
-
-
 def get_model_candidates(primary_model):
     if not primary_model:
-        return ["gpt-4o-mini"]
-    if primary_model == "gpt-4o":
-        return ["gpt-4o", "gpt-4o-mini"]
-    return [primary_model]
+        return [OPENAI_MODEL]
+    if primary_model == OPENAI_MODEL:
+        return [OPENAI_MODEL]
+    return [primary_model, OPENAI_MODEL]
 
 
 def is_retryable_openai_error(status, message):
     text = (message or "").lower()
+    # Billing/spend-limit failures must never trigger a retry against another
+    # model candidate - that just spends the same exhausted budget again.
+    if status == 402 or "quota" in text or "billing" in text:
+        return False
     return status in (400, 403, 404, 429) or "model" in text or "unsupported" in text or "not found" in text
 
 
-def openai_chat_content(messages, max_tokens=400, model="gpt-4o-mini"):
+def openai_chat_content(messages, max_tokens=400, model=None):
     if not OPENAI_API_KEY:
         raise CoinLensError("key_missing", "Server is missing OPENAI_API_KEY.", 500)
 
-    candidates = get_model_candidates(model)
+    candidates = get_model_candidates(model or OPENAI_MODEL)
     last_error = None
     for index, candidate_model in enumerate(candidates):
         payload = {"model": candidate_model, "messages": messages, "max_tokens": max_tokens}
@@ -164,7 +184,7 @@ def openai_chat_content(messages, max_tokens=400, model="gpt-4o-mini"):
                     "Authorization": f"Bearer {OPENAI_API_KEY}",
                 },
                 json=payload,
-                timeout=REQUEST_TIMEOUT,
+                timeout=OPENAI_TIMEOUT,
             )
         except requests.RequestException:
             last_error = CoinLensError("upstream_failure", "AI provider request failed.", 502)
@@ -178,16 +198,19 @@ def openai_chat_content(messages, max_tokens=400, model="gpt-4o-mini"):
 
         if not upstream.ok:
             message = data.get("error", {}).get("message", "")
+            if upstream.status_code == 401:
+                raise CoinLensError("key_invalid", "AI provider rejected the API key.", 401)
+            if upstream.status_code == 402:
+                raise CoinLensError("quota", "AI provider billing limit reached.", 402)
+            if upstream.status_code == 429:
+                code = "quota" if "quota" in message.lower() or "billing" in message.lower() else "rate_limit"
+                if code == "quota":
+                    raise CoinLensError(code, "AI provider rate or quota limit reached.", 429)
             if is_retryable_openai_error(upstream.status_code, message) and index < len(candidates) - 1:
                 last_error = CoinLensError("upstream_failure", "AI provider rejected the requested model.", 502)
                 continue
-            if upstream.status_code == 401:
-                raise CoinLensError("key_invalid", "AI provider rejected the API key.", 401)
             if upstream.status_code == 429:
-                code = "quota" if "quota" in message.lower() or "billing" in message.lower() else "rate_limit"
-                raise CoinLensError(code, "AI provider rate or quota limit reached.", 429)
-            if upstream.status_code == 402:
-                raise CoinLensError("quota", "AI provider billing limit reached.", 402)
+                raise CoinLensError("rate_limit", "AI provider rate limit reached.", 429)
             raise CoinLensError("upstream_failure", "AI provider request failed.", 502)
 
         content = data.get("choices", [{}])[0].get("message", {}).get("content")
@@ -262,6 +285,11 @@ def guess_image_mime(image_bytes, supplied_mime=""):
     raise CoinLensError("invalid_image", "Unsupported or invalid image.", 415)
 
 
+def check_image_size(image_bytes):
+    if len(image_bytes) > MAX_IMAGE_BYTES:
+        raise CoinLensError("image_too_large", "Image is too large. Use a smaller photo.", 413)
+
+
 def decode_base64_image(value):
     if not value or not isinstance(value, str):
         raise CoinLensError("missing_image", "Front image is required.", 400)
@@ -280,6 +308,7 @@ def decode_base64_image(value):
     if not image_bytes:
         raise CoinLensError("invalid_image", "Unsupported or invalid image.", 415)
 
+    check_image_size(image_bytes)
     mime = guess_image_mime(image_bytes, mime)
     return {"bytes": image_bytes, "mime": mime, "data_url": f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"}
 
@@ -294,6 +323,7 @@ def read_uploaded_image(file_storage, required=False):
         if required:
             raise CoinLensError("missing_image", "Front image is required.", 400)
         return None
+    check_image_size(image_bytes)
     mime = guess_image_mime(image_bytes, file_storage.mimetype or "")
     return {"bytes": image_bytes, "mime": mime, "data_url": f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"}
 
@@ -312,12 +342,88 @@ def read_identification_images():
     return front, back
 
 
+def read_request_field(name):
+    """Reads a plain (non-image) field from either a multipart or JSON body."""
+    if request.files:
+        return request.form.get(name)
+    payload = request.get_json(force=True, silent=True) or {}
+    return payload.get(name)
+
+
+# ---------------------------------------------------------------------------
+# Coin identification (single OpenAI call, structured output)
+# ---------------------------------------------------------------------------
+
+IDENTIFICATION_PROMPT = """You are an expert numismatist identifying a coin from one or two photos for a \
+collector app. Examine the image(s) closely: obverse/front design, reverse/back design if shown, portraits, \
+inscriptions and mottos, the date and mint mark exactly as visible, country and denomination text, metal color, \
+surface wear and condition, and any doubling, off-center strikes, die cracks or other notable anomalies.
+
+Set "status" to "identified" only when you are reasonably confident of the country, denomination, and year. Set it \
+to "uncertain" when the photo is blurry, too dark, cropped, glare-obscured, or otherwise not clear enough to be \
+confident - in that case explain in "unidentifiable_reason" what a better photo would need to show (for example: \
+sharper focus, more even lighting, the full coin in frame, or the reverse side). Never invent an identification you \
+are not reasonably confident in.
+
+"estimated_grade" is your own visual estimate using the Sheldon scale (e.g. "VF-30") - make clear this is an \
+estimate, not a professional certified grade. "confidence" is your own 0-100 self-assessment of how sure you are; \
+it does not need to be a precise probability, just your honest sense of certainty.
+
+Return ONLY the structured fields requested. Do not include any text outside the JSON object."""
+
+IDENTIFICATION_JSON_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "status": {"type": "string", "enum": ["identified", "uncertain"]},
+        "coin_name": {"type": "string"},
+        "country": {"type": "string"},
+        "denomination": {"type": "string"},
+        "year": {"type": "string"},
+        "mint_mark": {"type": ["string", "null"]},
+        "estimated_grade": {"type": "string"},
+        "confidence": {"type": "integer"},
+        "description": {"type": "string"},
+        "mint_errors": {"type": "array", "items": {"type": "string"}},
+        "varieties": {"type": ["string", "null"]},
+        "error_premium": {"type": "boolean"},
+        "special_notes": {"type": "string"},
+        "unidentifiable_reason": {"type": ["string", "null"]},
+        "alternatives": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "coin": {"type": "string"},
+                    "confidence": {"type": "integer"},
+                },
+                "required": ["coin", "confidence"],
+            },
+        },
+    },
+    "required": [
+        "status", "coin_name", "country", "denomination", "year", "mint_mark",
+        "estimated_grade", "confidence", "description", "mint_errors", "varieties",
+        "error_premium", "special_notes", "unidentifiable_reason", "alternatives",
+    ],
+}
+
+
 def normalize_identification(data):
     if not isinstance(data, dict):
         raise CoinLensError("malformed_ai_response", "AI identification was not an object.", 502)
 
-    identifiable = data.get("identifiable", True)
-    if identifiable is False:
+    confidence = data.get("confidence", 0)
+    try:
+        confidence = max(0, min(100, int(confidence)))
+    except (TypeError, ValueError):
+        confidence = 0
+
+    status = data.get("status")
+    identifiable = status == "identified" and confidence >= MIN_IDENTIFICATION_CONFIDENCE
+
+    if not identifiable:
         return {
             "coin_name": data.get("coin_name") or "Unidentified coin",
             "country": data.get("country") or "Unknown",
@@ -330,9 +436,10 @@ def normalize_identification(data):
             "varieties": data.get("varieties"),
             "error_premium": bool(data.get("error_premium")),
             "special_notes": data.get("special_notes") or "",
+            "status": "uncertain",
             "identifiable": False,
             "unidentifiable_reason": data.get("unidentifiable_reason") or "The coin could not be identified confidently.",
-            "confidence": int(data.get("confidence") or 0),
+            "confidence": confidence,
             "alternatives": data.get("alternatives") if isinstance(data.get("alternatives"), list) else [],
         }
 
@@ -340,11 +447,6 @@ def normalize_identification(data):
     denomination = str(data.get("denomination") or "Unknown").strip() or "Unknown"
     year = str(data.get("year") or "Unknown").strip() or "Unknown"
     coin_name = data.get("coin_name") or " ".join(part for part in [year, country, denomination] if part and part != "Unknown") or "Identified coin"
-    confidence = data.get("confidence", 0)
-    try:
-        confidence = max(0, min(100, int(confidence)))
-    except (TypeError, ValueError):
-        confidence = 0
 
     return {
         "coin_name": coin_name,
@@ -358,71 +460,243 @@ def normalize_identification(data):
         "varieties": data.get("varieties"),
         "error_premium": bool(data.get("error_premium")),
         "special_notes": data.get("special_notes") or "",
+        "status": "identified",
         "identifiable": True,
         "confidence": confidence,
         "alternatives": data.get("alternatives") if isinstance(data.get("alternatives"), list) else [],
     }
 
 
-def build_identification_messages(front_image, back_image=None):
-    visual_prompt = """You are an expert numismatist examining a coin. Describe everything you can see in exhaustive detail:
-- Obverse/front and reverse/back designs, portraits, inscriptions, mottos
-- Date and mint mark, using exact visible characters
-- Country and denomination text
-- Metal color and composition clues
-- Surface condition: luster, wear, contact marks, scratches, toning
-- Doubling, off-center strike, planchet irregularities, die cracks, or other anomalies
-- Overall grade estimate using the Sheldon scale
-Be specific and literal. Describe exactly what you observe, not what you assume."""
+def extract_responses_output_text(data):
+    if isinstance(data, dict) and isinstance(data.get("output_text"), str) and data["output_text"].strip():
+        return data["output_text"].strip()
+    for item in (data.get("output") or []) if isinstance(data, dict) else []:
+        for piece in item.get("content") or []:
+            text = piece.get("text")
+            if piece.get("type") in ("output_text", "text") and text:
+                return text.strip()
+    return None
 
-    content = [{"type": "text", "text": visual_prompt}, {"type": "image_url", "image_url": {"url": front_image["data_url"], "detail": "high"}}]
+
+def identify_coin_with_ai(front_image, back_image=None):
+    if not OPENAI_API_KEY:
+        raise CoinLensError("key_missing", "Server is missing OPENAI_API_KEY.", 500)
+
+    content = [{"type": "input_text", "text": IDENTIFICATION_PROMPT}]
+    content.append({"type": "input_image", "image_url": front_image["data_url"]})
     if back_image:
-        content.append({"type": "image_url", "image_url": {"url": back_image["data_url"], "detail": "high"}})
-    return [{"role": "user", "content": content}]
+        content.append({"type": "input_image", "image_url": back_image["data_url"]})
+
+    payload = {
+        "model": OPENAI_MODEL,
+        "input": [{"role": "user", "content": content}],
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "coin_identification",
+                "schema": IDENTIFICATION_JSON_SCHEMA,
+                "strict": True,
+            }
+        },
+        "max_output_tokens": 1000,
+    }
+
+    try:
+        upstream = requests.post(
+            OPENAI_RESPONSES_URL,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+            },
+            json=payload,
+            timeout=OPENAI_TIMEOUT,
+        )
+    except requests.RequestException:
+        raise CoinLensError("upstream_failure", "AI provider request failed.", 502)
+
+    try:
+        data = upstream.json()
+    except ValueError:
+        raise CoinLensError("upstream_failure", "AI provider returned an unreadable response.", 502)
+
+    if not upstream.ok:
+        message = (data.get("error") or {}).get("message", "") if isinstance(data, dict) else ""
+        if upstream.status_code == 401:
+            raise CoinLensError("key_invalid", "AI provider rejected the API key.", 401)
+        if upstream.status_code == 402:
+            raise CoinLensError("quota", "AI provider billing limit reached.", 402)
+        if upstream.status_code == 429:
+            code = "quota" if "quota" in message.lower() or "billing" in message.lower() else "rate_limit"
+            raise CoinLensError(code, "AI provider rate or quota limit reached.", 429)
+        raise CoinLensError("upstream_failure", "AI provider request failed.", 502)
+
+    text = extract_responses_output_text(data)
+    if not text:
+        raise CoinLensError("identification_failure", "AI provider returned an empty response.", 422)
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        raise CoinLensError("malformed_ai_response", "AI returned malformed JSON.", 502)
+
+    return normalize_identification(parsed)
 
 
-def identify_with_ai(front_image, back_image=None):
-    description = openai_chat_content(build_identification_messages(front_image, back_image), 800, "gpt-4o")
-    extraction_prompt = f"""Based on this numismatist's description of a coin, return ONLY a raw JSON object with these exact keys:
-- "country": string
-- "denomination": string
-- "year": string
-- "mint_mark": string or null
-- "estimated_grade": string
-- "mint_errors": array of strings
-- "varieties": string or null
-- "error_premium": boolean
-- "special_notes": string
-- "identifiable": boolean
-- "unidentifiable_reason": string, only when identifiable is false
-- "confidence": integer 0-100
-- "alternatives": array of up to 3 objects with "coin" and "confidence"
+# ---------------------------------------------------------------------------
+# Numista-first valuation
+# ---------------------------------------------------------------------------
 
-Description:
-{description}"""
-    return normalize_identification(extract_json(openai_chat_content([{"role": "user", "content": extraction_prompt}], 600)))
+def _numista_result_list(payload):
+    if not isinstance(payload, dict):
+        return []
+    for key in ("types", "items", "results"):
+        value = payload.get(key)
+        if isinstance(value, list):
+            return value
+    return []
+
+
+def _text_of(value):
+    return str(value or "").strip().lower()
+
+
+def _candidate_country_text(candidate):
+    issuer = candidate.get("issuer")
+    if isinstance(issuer, dict):
+        return _text_of(issuer.get("name"))
+    return _text_of(issuer or candidate.get("country"))
+
+
+def score_numista_candidate(identification, candidate):
+    if not isinstance(candidate, dict):
+        return 0
+    country = _text_of(identification.get("country"))
+    denomination = _text_of(identification.get("denomination"))
+    year = _text_of(identification.get("year"))
+    title = _text_of(candidate.get("title"))
+    cand_country = _candidate_country_text(candidate)
+
+    score = 0
+    if country and country in cand_country:
+        score += 3
+    if country and country in title:
+        score += 1
+    if denomination and denomination in title:
+        score += 2
+    if year and year in title:
+        score += 1
+    min_year = candidate.get("min_year") or candidate.get("min_date")
+    max_year = candidate.get("max_year") or candidate.get("max_date")
+    try:
+        if year.isdigit() and min_year is not None and max_year is not None:
+            if int(min_year) <= int(year) <= int(max_year):
+                score += 2
+    except (TypeError, ValueError):
+        pass
+    return score
+
+
+def search_numista_types(identification):
+    """Returns a list of candidate Numista types, or None if the lookup
+    itself failed (as opposed to succeeding with zero results)."""
+    query = " ".join(filter(None, [identification.get("country"), identification.get("denomination")])).strip()
+    if not query:
+        return []
+    try:
+        upstream = requests.get(
+            NUMISTA_TYPES_URL,
+            params={"q": query, "category": "coin", "count": 8},
+            headers={"Numista-API-Key": NUMISTA_API_KEY},
+            timeout=NUMISTA_TIMEOUT,
+        )
+        upstream.raise_for_status()
+        return _numista_result_list(upstream.json())
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def fetch_numista_type_detail(type_id):
+    try:
+        upstream = requests.get(
+            f"{NUMISTA_TYPES_URL}/{type_id}",
+            headers={"Numista-API-Key": NUMISTA_API_KEY},
+            timeout=NUMISTA_TIMEOUT,
+        )
+        upstream.raise_for_status()
+        data = upstream.json()
+        return data if isinstance(data, dict) else None
+    except (requests.RequestException, ValueError):
+        return None
+
+
+def select_best_numista_match(identification, candidates):
+    """Picks the strongest candidate, but only when it is unambiguously best -
+    a weak or tied top score means we don't have a confident match."""
+    if not candidates:
+        return None
+    scored = sorted(candidates, key=lambda c: score_numista_candidate(identification, c), reverse=True)
+    best = scored[0]
+    best_score = score_numista_candidate(identification, best)
+    if best_score < 3:
+        return None
+    if len(scored) > 1 and score_numista_candidate(identification, scored[1]) == best_score:
+        return None
+    return best
 
 
 def lookup_numista(identification):
+    """Finds the strongest practical Numista type match for the identified
+    coin. Returns None when no confident match exists - callers must not
+    treat that as an error, only as "no catalog match"."""
     if should_use_mock_coin_response():
         log_mock_response("lookup_numista")
         return dict(MOCK_NUMISTA)
     if not NUMISTA_API_KEY or identification.get("identifiable") is False:
         return None
-    query = " ".join(filter(None, [identification.get("country"), identification.get("denomination"), identification.get("year")])).strip()
-    if not query:
+
+    candidates = search_numista_types(identification)
+    if candidates is None:
+        return {"error": "Numista lookup unavailable."}
+    best = select_best_numista_match(identification, candidates)
+    if not best:
         return None
+
+    type_id = best.get("id")
+    detail = fetch_numista_type_detail(type_id) if type_id is not None else None
+    merged = {**best, **(detail or {})}
+    merged["numista_type_id"] = type_id
+    return merged
+
+
+def fetch_numista_price(type_id, grade):
     try:
         upstream = requests.get(
-            NUMISTA_COINS_URL,
-            params={"q": query, "count": 1},
+            f"{NUMISTA_TYPES_URL}/{type_id}/prices",
+            params={"currency": "USD"},
             headers={"Numista-API-Key": NUMISTA_API_KEY},
-            timeout=REQUEST_TIMEOUT,
+            timeout=NUMISTA_TIMEOUT,
         )
+        if upstream.status_code in (401, 402, 403, 404):
+            return None
         upstream.raise_for_status()
-        return (upstream.json().get("items") or [None])[0]
+        data = upstream.json()
     except (requests.RequestException, ValueError):
-        return {"error": "Numista lookup unavailable."}
+        return None
+
+    prices = data.get("prices") if isinstance(data, dict) else None
+    if not isinstance(prices, list) or not prices:
+        return None
+
+    grade_text = _text_of(grade)
+    for entry in prices:
+        if isinstance(entry, dict) and _text_of(entry.get("grade")) == grade_text and entry.get("price") is not None:
+            return {"value": entry["price"], "grade": entry.get("grade"), "exact_grade_match": True}
+
+    priced = [entry for entry in prices if isinstance(entry, dict) and entry.get("price") is not None]
+    if not priced:
+        return None
+    middle = priced[len(priced) // 2]
+    return {"value": middle["price"], "grade": middle.get("grade"), "exact_grade_match": False}
 
 
 def lookup_pcgs(numista_data):
@@ -439,7 +713,7 @@ def lookup_pcgs(numista_data):
         upstream = requests.get(
             PCGS_PRICE_URL.format(pcgs_number=pcgs_reference["number"]),
             headers={"Authorization": f"bearer {PCGS_BEARER_TOKEN}"},
-            timeout=REQUEST_TIMEOUT,
+            timeout=PCGS_TIMEOUT,
         )
         upstream.raise_for_status()
         data = upstream.json()
@@ -451,47 +725,62 @@ def lookup_pcgs(numista_data):
 
 
 def estimate_value(identification, numista_data):
+    """Numista is the primary valuation source. PCGS is an optional fallback.
+    Never invents a number - if there's no confident catalog match or no
+    usable price, valuation is reported as unavailable."""
     if should_use_mock_coin_response():
         log_mock_response("estimate_value")
         return dict(deterministic_mock_coin_result()["valuation"])
+
     if identification.get("identifiable") is False:
         return {"status": "unavailable", "currency": "USD", "source": "CoinLens", "reason": "Coin was not identifiable."}
-    try:
-        prompt = f"""You are an expert numismatist with deep knowledge of auction results and retail prices. Estimate this coin's current market value.
 
-Coin data: {json.dumps(identification)}
-Numista specs: {json.dumps(numista_data)}
+    if not isinstance(numista_data, dict) or numista_data.get("error"):
+        return {"status": "unavailable", "currency": "USD", "source": "CoinLens", "reason": "No confident Numista catalog match."}
 
-Return ONLY a raw JSON object with keys:
-- "low": lowest realistic retail/auction value in USD, number
-- "high": highest realistic retail/auction value in USD, number
-- "condition_assumed": grade/condition used
-- "error_value_note": string or null
-- "reasoning": 1-2 sentences"""
-        data = extract_json(openai_chat_content([{"role": "user", "content": prompt}], 350, "gpt-4o"))
-        low = data.get("low")
-        high = data.get("high")
-        estimated = None
-        if isinstance(low, (int, float)) and isinstance(high, (int, float)):
-            estimated = round((low + high) / 2, 2)
-        data.update({"status": "available", "estimated_value": estimated, "currency": "USD", "source": "AI estimate"})
-        return data
-    except CoinLensError:
-        return {"status": "unavailable", "currency": "USD", "source": "AI estimate", "reason": "Valuation unavailable."}
+    type_id = numista_data.get("numista_type_id") or numista_data.get("id")
+    if type_id is None:
+        return {"status": "unavailable", "currency": "USD", "source": "CoinLens", "reason": "No confident Numista catalog match."}
+
+    price = fetch_numista_price(type_id, identification.get("estimated_grade"))
+    if not price:
+        return {"status": "unavailable", "currency": "USD", "source": "Numista", "reason": "Numista match found but no usable price for this grade."}
+
+    return {
+        "status": "available",
+        "estimated_value": round(float(price["value"]), 2),
+        "currency": "USD",
+        "source": "Numista",
+        "condition_assumed": price.get("grade") or identification.get("estimated_grade"),
+        "grade_matched_exactly": price.get("exact_grade_match", False),
+    }
 
 
-def generate_coin_summary(identification, numista_data, pcgs_data):
-    if should_use_mock_coin_response():
-        log_mock_response("generate_coin_summary")
-        return deterministic_mock_coin_result()["summary"]
-    try:
-        prompt = f"""You are a friendly numismatist app. Write 3 exciting sentences about this coin for a beginner.
-AI ID: {json.dumps(identification)}
-Numista: {json.dumps(numista_data)}
-PCGS: {json.dumps(pcgs_data)}"""
-        return openai_chat_content([{"role": "user", "content": prompt}], 200)
-    except CoinLensError:
-        return None
+def build_coin_summary(identification, valuation):
+    """Templated, not AI-generated - keeps the scan pipeline to a single
+    OpenAI call while still giving the UI a human-readable summary."""
+    label = " ".join(
+        part for part in [identification.get("year"), identification.get("country"), identification.get("denomination")]
+        if part and part != "Unknown"
+    ) or identification.get("coin_name") or "This coin"
+
+    sentences = [f"This looks like a {label}."]
+
+    grade = identification.get("estimated_grade")
+    if grade and grade != "Unknown":
+        sentences.append(f"Estimated grade: {grade} (AI visual estimate, not a professional certified grade).")
+
+    if valuation.get("status") == "available" and valuation.get("estimated_value") is not None:
+        sentences.append(
+            f"Numista-based estimated value: ${valuation['estimated_value']:.2f} {valuation.get('currency', 'USD')}."
+        )
+    else:
+        sentences.append("A reliable market value wasn't available for this specific coin and grade.")
+
+    if identification.get("mint_errors"):
+        sentences.append("Possible mint errors were noted - see the details below.")
+
+    return " ".join(sentences)
 
 
 def build_mock_coin_result(front_image_present=True, back_image_present=False):
@@ -502,17 +791,27 @@ def build_coinlens_result(front_image, back_image=None):
     if should_use_mock_coin_response():
         log_mock_response("/api/identify-coin")
         return build_mock_coin_result(True, back_image is not None)
-    identification = identify_with_ai(front_image, back_image)
+
+    identification = identify_coin_with_ai(front_image, back_image)
     if identification.get("identifiable") is False:
         return {
             "identification": identification,
             "valuation": {"status": "unavailable", "currency": "USD", "source": "CoinLens", "reason": "Coin was not identifiable."},
             "summary": identification.get("unidentifiable_reason"),
         }
+
     numista_data = lookup_numista(identification)
     pcgs_data = lookup_pcgs(numista_data)
     valuation = estimate_value(identification, numista_data)
-    summary = generate_coin_summary(identification, numista_data, pcgs_data)
+    if valuation.get("status") != "available" and isinstance(pcgs_data, dict) and pcgs_data.get("price") is not None:
+        valuation = {
+            "status": "available",
+            "estimated_value": round(float(pcgs_data["price"]), 2),
+            "currency": "USD",
+            "source": "PCGS",
+            "condition_assumed": pcgs_data.get("grade") or identification.get("estimated_grade"),
+        }
+    summary = build_coin_summary(identification, valuation)
     return {
         "identification": identification,
         "valuation": valuation,
@@ -522,19 +821,169 @@ def build_coinlens_result(front_image, back_image=None):
     }
 
 
+# ---------------------------------------------------------------------------
+# Authoritative persistence (M3)
+# ---------------------------------------------------------------------------
+
+def canonicalize_denomination(denomination, coin_name):
+    text = f"{denomination or ''} {coin_name or ''}".lower()
+    if "wheat" in text:
+        return "wheat-penny"
+    if "cent" in text or "penny" in text:
+        return "penny"
+    if "nickel" in text or "five cent" in text:
+        return "nickel"
+    if "dime" in text or "ten cent" in text:
+        return "dime"
+    if "quarter" in text or "twenty-five cent" in text or "twenty five cent" in text:
+        return "quarter"
+    if "half dollar" in text or "half-dollar" in text:
+        return "half-dollar"
+    if "dollar" in text:
+        return "dollar"
+    slug = re.sub(r"[^a-z0-9]+", "-", (denomination or "").lower()).strip("-")
+    return slug or None
+
+
+def is_foreign_country(country):
+    text = _text_of(country)
+    if not text:
+        return False
+    return text not in US_COUNTRY_NAMES
+
+
+def compute_local_date_hour(tz_offset_minutes):
+    """tz_offset_minutes matches JS Date.getTimezoneOffset(): minutes to ADD
+    to local time to reach UTC. Falls back to UTC (offset 0) if the client
+    didn't send one."""
+    try:
+        offset = int(tz_offset_minutes)
+    except (TypeError, ValueError):
+        offset = 0
+    offset = max(-14 * 60, min(14 * 60, offset))
+    local_dt = datetime.now(timezone.utc) - timedelta(minutes=offset)
+    return local_dt.date().isoformat(), local_dt.hour
+
+
+def parse_year(value):
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def persist_scan(user_id, identification, valuation, source, tz_offset_minutes):
+    local_date, local_hour = compute_local_date_hour(tz_offset_minutes)
+    payload = {
+        "user_id": user_id,
+        "coin_name": identification.get("coin_name"),
+        "country": identification.get("country"),
+        "denomination": identification.get("denomination"),
+        "year": parse_year(identification.get("year")),
+        "mint_mark": identification.get("mint_mark"),
+        "estimated_grade": identification.get("estimated_grade"),
+        "estimated_value": valuation.get("estimated_value") if valuation.get("status") == "available" else None,
+        "source": source,
+        "denom_canonical": canonicalize_denomination(identification.get("denomination"), identification.get("coin_name")),
+        "is_foreign": is_foreign_country(identification.get("country")),
+        "local_date": local_date,
+        "local_hour": local_hour,
+    }
+    return insert_scan(payload)
+
+
+# ---------------------------------------------------------------------------
+# M6: daily AI-attempt quota (Supabase-backed, survives restarts/multi-worker)
+# ---------------------------------------------------------------------------
+
+def daily_window_start_iso():
+    return datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+
+
+def check_and_reserve_quota(user_id):
+    """Counts today's AI attempts (successful or not) and, if under the
+    limit, reserves this attempt immediately - before OpenAI is called - so a
+    burst of concurrent requests can't blow past the limit while each request
+    is still waiting on its own OpenAI call."""
+    since = daily_window_start_iso()
+    try:
+        count = count_api_usage_since(user_id, since)
+    except SupabaseAdminError as error:
+        app.logger.error("quota count failed for user_id=%s: %s", user_id, error)
+        raise CoinLensError("quota_check_failed", "Could not verify your usage limit. Try again shortly.", 503)
+
+    if count >= DAILY_SCAN_LIMIT:
+        raise CoinLensError(
+            "quota_exceeded",
+            f"Daily scan limit of {DAILY_SCAN_LIMIT} reached. Try again tomorrow.",
+            429,
+        )
+
+    try:
+        usage_row = insert_api_usage({"user_id": user_id, "endpoint": "identify-coin", "status": "attempted"})
+    except SupabaseAdminError as error:
+        app.logger.error("quota reserve failed for user_id=%s: %s", user_id, error)
+        raise CoinLensError("quota_check_failed", "Could not reserve a scan attempt. Try again shortly.", 503)
+
+    remaining = max(0, DAILY_SCAN_LIMIT - count - 1)
+    return usage_row.get("id"), remaining
+
+
 @app.route("/api/identify-coin", methods=["POST"])
 @require_auth
 def identify_coin():
+    source = read_request_field("source")
+    if source not in ("camera", "gallery"):
+        return error_response(CoinLensError("invalid_source", "source must be 'camera' or 'gallery'.", 400))
+
     front_image, back_image = read_identification_images()
-    result = build_coinlens_result(front_image, back_image)
-    if result.get("identification", {}).get("identifiable") is False:
-        return jsonify(result), 422
-    return jsonify(result)
+    tz_offset_minutes = read_request_field("tz_offset_minutes")
+
+    mock = should_use_mock_coin_response()
+    usage_id, remaining = (None, None)
+    if not mock:
+        usage_id, remaining = check_and_reserve_quota(g.user_id)
+
+    try:
+        result = build_coinlens_result(front_image, back_image)
+    except CoinLensError:
+        update_api_usage(usage_id, {"status": "error"})
+        raise
+
+    identification = result.get("identification", {})
+    if identification.get("identifiable") is False:
+        update_api_usage(usage_id, {"status": "uncertain"})
+        body = dict(result)
+        if remaining is not None:
+            body["remaining_today"] = remaining
+        return jsonify(body), 422
+
+    try:
+        scan_row = persist_scan(g.user_id, identification, result.get("valuation") or {}, source, tz_offset_minutes)
+    except SupabaseAdminError as error:
+        app.logger.error("scan insert failed for user_id=%s: %s", g.user_id, error)
+        update_api_usage(usage_id, {"status": "error"})
+        return error_response(CoinLensError("scan_insert_failed", "Identification succeeded but the scan could not be saved.", 500))
+
+    update_api_usage(usage_id, {"status": "identified", "scan_id": scan_row.get("id")})
+
+    body = dict(result)
+    body["scan"] = scan_row
+    if remaining is not None:
+        body["remaining_today"] = remaining
+    return jsonify(body)
 
 
 @app.route("/api/generate-ebay-listing", methods=["POST"])
 @require_auth
 def generate_ebay_listing():
+    if not ENABLE_EBAY_LISTING:
+        return jsonify({
+            "feature_disabled": True,
+            "feature": "ebay_listing",
+            "message": "eBay listing generation is disabled in this version.",
+        }), 200
+
     payload = request.get_json(force=True, silent=True) or {}
     if should_use_mock_coin_response():
         log_mock_response("/api/generate-ebay-listing")
@@ -554,7 +1003,7 @@ Return ONLY a raw JSON object with these exact keys:
 - "description": string
 - "item_specifics": array of objects with "label" and "value"
 - "shipping_notes": string"""
-        return jsonify(extract_json(openai_chat_content([{"role": "user", "content": prompt}], 800, "gpt-4o")))
+        return jsonify(extract_json(openai_chat_content([{"role": "user", "content": prompt}], 800)))
     except CoinLensError as error:
         return error_response(error)
 
@@ -572,7 +1021,7 @@ def numista_specs():
         NUMISTA_COINS_URL,
         params={"q": request.args.get("q", ""), "count": request.args.get("count", 1)},
         headers={"Numista-API-Key": NUMISTA_API_KEY},
-        timeout=REQUEST_TIMEOUT,
+        timeout=NUMISTA_TIMEOUT,
     )
     return proxy_response(upstream)
 
@@ -591,7 +1040,7 @@ def pcgs_value(pcgs_number):
     upstream = requests.get(
         PCGS_PRICE_URL.format(pcgs_number=pcgs_number),
         headers={"Authorization": f"bearer {PCGS_BEARER_TOKEN}"},
-        timeout=REQUEST_TIMEOUT,
+        timeout=PCGS_TIMEOUT,
     )
     return proxy_response(upstream)
 

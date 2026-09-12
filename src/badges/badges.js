@@ -1,33 +1,37 @@
-function _nw(scans) { return scans.reduce((s, c) => s + (c.value ?? 0), 0); }
+// Badge predicates operate on real Supabase `scans` rows (see
+// server/app.py's persist_scan / supabase/migrations for the exact shape),
+// not a client-side approximation. denom_canonical, is_foreign, year,
+// local_date and local_hour are all computed authoritatively by Flask at
+// insert time, so badges just read them instead of re-deriving them from a
+// display string.
+
+function _nw(scans) { return scans.reduce((s, c) => s + (c.estimated_value ?? 0), 0); }
 function _days(createdAt) { return Math.floor((Date.now() - createdAt) / 86400000); }
+
+function _localDateParts(scan) {
+  const raw = scan.local_date || (scan.scanned_at ? scan.scanned_at.slice(0, 10) : null);
+  if (!raw) return null;
+  const [year, month, day] = raw.split("-").map(Number);
+  return { year, month, day, date: new Date(year, month - 1, day) };
+}
+
 function _onMonthDay(scans, month, day) {
   return scans.filter(s => {
-    const d = new Date(s.time);
-    return d.getMonth() + 1 === month && d.getDate() === day;
+    const parts = _localDateParts(s);
+    return parts && parts.month === month && parts.day === day;
   }).length;
 }
 function _onFridayThe13th(scans) {
   return scans.filter(s => {
-    const d = new Date(s.time);
-    return d.getDate() === 13 && d.getDay() === 5;
+    const parts = _localDateParts(s);
+    return parts && parts.day === 13 && parts.date.getDay() === 5;
   }).length;
 }
 function _onThanksgiving(scans) {
   return scans.filter(s => {
-    const d = new Date(s.time);
-    return d.getMonth() === 10 && d.getDay() === 4 && d.getDate() >= 22 && d.getDate() <= 28;
+    const parts = _localDateParts(s);
+    return parts && parts.month === 11 && parts.date.getDay() === 4 && parts.day >= 22 && parts.day <= 28;
   }).length;
-}
-function _denomOf(coinStr) {
-  const c = (coinStr || "").toLowerCase();
-  if (c.includes("wheat")) return "wheat-penny";
-  if (c.includes("nickel") || c.includes("five cent")) return "nickel";
-  if (c.includes("dime") || c.includes("ten cent")) return "dime";
-  if (c.includes("quarter")) return "quarter";
-  if (c.includes("half dollar")) return "half-dollar";
-  if (c.includes("dollar")) return "dollar";
-  if (c.includes("penny") || c.includes("cent")) return "penny";
-  return null;
 }
 function _maxStreak(scans, matchFn) {
   let max = 0, cur = 0;
@@ -38,12 +42,12 @@ function _maxStreak(scans, matchFn) {
   return max;
 }
 function _maxDenomStreak(scans, denom) {
-  return _maxStreak(scans, s => _denomOf(s.coin) === denom);
+  return _maxStreak(scans, s => s.denom_canonical === denom);
 }
 function _maxAnyDenomStreak(scans) {
   let max = 0, cur = 0, last = null;
   for (const s of scans) {
-    const d = _denomOf(s.coin);
+    const d = s.denom_canonical;
     cur = (d && d === last) ? cur + 1 : (d ? 1 : 0);
     last = d;
     if (cur > max) max = cur;
@@ -51,40 +55,28 @@ function _maxAnyDenomStreak(scans) {
   return max;
 }
 function _hasAllDenoms(scans, denoms) {
-  const owned = new Set(scans.map(s => _denomOf(s.coin)));
+  const owned = new Set(scans.map(s => s.denom_canonical));
   return denoms.every(d => owned.has(d));
 }
 function _hasScanInHourRange(scans, startH, endH) {
-  return scans.some(s => {
-    const h = new Date(s.time).getHours();
-    return h >= startH && h < endH;
-  });
+  return scans.some(s => typeof s.local_hour === "number" && s.local_hour >= startH && s.local_hour < endH);
 }
 function _hasRapidPair(scans, withinMs) {
-  const times = scans.map(s => new Date(s.time).getTime()).sort((a, b) => a - b);
+  const times = scans.map(s => new Date(s.scanned_at).getTime()).filter(t => !Number.isNaN(t)).sort((a, b) => a - b);
   for (let i = 1; i < times.length; i++) {
     if (times[i] - times[i - 1] <= withinMs) return true;
   }
   return false;
 }
-function _yearOf(scan) {
-  const m = (scan.coin || "").match(/\b(1[5-9]\d{2}|20\d{2})\b/);
-  return m ? parseInt(m[0], 10) : null;
-}
 function _hasOldCoin(scans, beforeYear) {
-  return scans.some(s => { const y = _yearOf(s); return y != null && y < beforeYear; });
+  return scans.some(s => typeof s.year === "number" && s.year < beforeYear);
 }
 function _yearSpan(scans) {
-  const years = scans.map(_yearOf).filter(y => y != null);
+  const years = scans.map(s => s.year).filter(y => typeof y === "number");
   return years.length < 2 ? 0 : Math.max(...years) - Math.min(...years);
 }
-function _isForeign(coinStr) {
-  const c = (coinStr || "").toLowerCase();
-  if (!c.trim()) return false;
-  return !c.includes("united states") && !c.includes("usa") && !c.includes("u.s.");
-}
 function _hasDenom(scans, denom) {
-  return scans.some(s => _denomOf(s.coin) === denom);
+  return scans.some(s => s.denom_canonical === denom);
 }
 
 export const BADGES = [
@@ -120,7 +112,7 @@ export const BADGES = [
   { id: "mem_365",  icon: "🎂", name: "Veteran",                desc: "Be a member for 1 year",             category: "Member",    check: (s, u) => u.createdAt && _days(u.createdAt) >= 365  },
   { id: "mem_730",  icon: "🏛️", name: "Pillar of the Community",desc: "Be a member for 2 years",            category: "Member",    check: (s, u) => u.createdAt && _days(u.createdAt) >= 730  },
   { id: "mem_1825", icon: "🌐", name: "Living Legend",          desc: "Be a member for 5 years",            category: "Member",    check: (s, u) => u.createdAt && _days(u.createdAt) >= 1825 },
-  // — Seasonal / holiday
+  // — Seasonal / holiday (evaluated against the device-local calendar date at scan time)
   { id: "season_halloween",    icon: "🎃", name: "Trick-or-Treasure",   desc: "Scan 5 coins on Halloween (Oct 31)",        category: "Seasonal", check: (s) => _onMonthDay(s, 10, 31) >= 5 },
   { id: "season_friday13",     icon: "🕷️", name: "Unlucky for Some",    desc: "Scan a coin on Friday the 13th",            category: "Seasonal", check: (s) => _onFridayThe13th(s) >= 1    },
   { id: "season_christmas",    icon: "🎄", name: "Silver Bells",        desc: "Scan a coin on Christmas Day (Dec 25)",     category: "Seasonal", check: (s) => _onMonthDay(s, 12, 25) >= 1 },
@@ -129,7 +121,7 @@ export const BADGES = [
   { id: "season_stpatrick",    icon: "🍀", name: "Pot of Gold",         desc: "Scan a coin on St. Patrick's Day (Mar 17)", category: "Seasonal", check: (s) => _onMonthDay(s, 3, 17) >= 1   },
   { id: "season_july4",        icon: "🎇", name: "Independence Stack",  desc: "Scan 4 coins on Independence Day (Jul 4)",  category: "Seasonal", check: (s) => _onMonthDay(s, 7, 4) >= 4    },
   { id: "season_thanksgiving", icon: "🦃", name: "Turkey Day Treasure", desc: "Scan a coin on Thanksgiving",               category: "Seasonal", check: (s) => _onThanksgiving(s) >= 1      },
-  // — Variety & streaks
+  // — Variety & streaks (streaks assume `scans` is ordered oldest -> newest)
   { id: "var_nickel_streak",   icon: "🪙", name: "Nickel Streak",       desc: "Scan 5 nickels in a row",                       category: "Variety", check: (s) => _maxDenomStreak(s, "nickel") >= 5   },
   { id: "var_penny_streak",    icon: "🅿️", name: "Penny Pincher",       desc: "Scan 5 pennies in a row",                       category: "Variety", check: (s) => _maxDenomStreak(s, "penny") >= 5    },
   { id: "var_dime_streak",     icon: "🎙️", name: "Dime Dash",           desc: "Scan 5 dimes in a row",                         category: "Variety", check: (s) => _maxDenomStreak(s, "dime") >= 5     },
@@ -150,7 +142,23 @@ export const BADGES = [
   { id: "type_half",    icon: "🎖️", name: "Half Measures", desc: "Scan a half dollar",                 category: "Coin Types", check: (s) => _hasDenom(s, "half-dollar") },
   { id: "type_dollar",  icon: "💵", name: "Dollar Sign",   desc: "Scan a dollar coin",                 category: "Coin Types", check: (s) => _hasDenom(s, "dollar")      },
   { id: "type_wheat",   icon: "🌾", name: "Wheat Field",   desc: "Scan a wheat penny",                 category: "Coin Types", check: (s) => _hasDenom(s, "wheat-penny") },
-  { id: "type_foreign", icon: "🌍", name: "World Traveler",desc: "Scan a coin from outside the U.S.",  category: "Coin Types", check: (s) => s.some(x => _isForeign(x.coin)) },
+  { id: "type_foreign", icon: "🌍", name: "World Traveler",desc: "Scan a coin from outside the U.S.",  category: "Coin Types", check: (s) => s.some(x => x.is_foreign) },
 ];
 
 export const BADGE_CATEGORIES = ["Scanning", "Net Worth", "Member", "Seasonal", "Variety", "Coin Types"];
+
+// Tier-only approximation used for OTHER users on the leaderboard, where we
+// only have safe aggregate fields (scan_count, total_value, member days) and
+// must not fetch another user's raw scan history to compute their real
+// badges. Uses the same thresholds as the Scanning/Net Worth/Member badges
+// above so the count stays meaningful.
+export function tierBadgeCount({ scanned, netWorth, memberDays }) {
+  const scanTiers  = [1, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
+  const worthTiers = [1, 10, 50, 100, 500, 1000, 10000, 25000, 100000, 500000, 1000000];
+  const dayTiers   = [0, 7, 30, 180, 365, 730, 1825];
+  return (
+    scanTiers.filter(t => scanned >= t).length +
+    worthTiers.filter(t => netWorth >= t).length +
+    dayTiers.filter(t => memberDays >= t).length
+  );
+}

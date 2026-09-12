@@ -42,6 +42,12 @@ const ERROR_DISPLAY = {
   auth_required: { icon: "!", title: "Sign In Required", tip: "Sign in or create an account to identify and value coins." },
   auth_missing: { icon: "!", title: "Sign In Required", tip: "Sign in or create an account to identify and value coins." },
   auth_invalid: { icon: "!", title: "Session Expired", tip: "Sign out and sign back in, then try again." },
+  quota_exceeded: { icon: "!", title: "Daily Scan Limit Reached", tip: "You've used today's scans. Try again tomorrow." },
+  quota_check_failed: { icon: "!", title: "Service Issue", tip: "Couldn't verify your scan limit. Try again shortly." },
+  image_too_large: { icon: "!", title: "Photo Too Large", tip: "Try a smaller or more compressed photo." },
+  payload_too_large: { icon: "!", title: "Upload Too Large", tip: "Try a smaller or more compressed photo." },
+  invalid_source: { icon: "!", title: "Something Went Wrong", tip: "Try scanning again." },
+  scan_insert_failed: { icon: "!", title: "Couldn't Save Scan", tip: "The coin was identified but saving it failed. Try again." },
   unknown: { icon: "!", title: "Something Went Wrong", tip: "Try scanning again." },
 };
 
@@ -91,7 +97,7 @@ export function toLegacyScanResult(result) {
   };
 }
 
-export async function identifyCoin(frontImage, backImage = null) {
+export async function identifyCoin(frontImage, backImage = null, source = "camera") {
   const token = await getAccessToken();
   if (!token) {
     throw new ScanError("auth_required", "Sign in to identify and value coins.");
@@ -102,7 +108,15 @@ export async function identifyCoin(frontImage, backImage = null) {
     res = await apiFetch(`/api/identify-coin`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ front_image: frontImage, back_image: backImage || undefined }),
+      body: JSON.stringify({
+        front_image: frontImage,
+        back_image: backImage || undefined,
+        source,
+        // Matches JS Date.getTimezoneOffset(): minutes to ADD to local time
+        // to reach UTC. Flask uses this only for display grouping (seasonal/
+        // time-of-day badges), never for identity or valuation.
+        tz_offset_minutes: new Date().getTimezoneOffset(),
+      }),
     });
   } catch {
     throw new ScanError("network", "No internet connection. Could not reach CoinLens.");

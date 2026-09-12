@@ -1,32 +1,11 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { SafeAreaView, ScrollView, Text, TouchableOpacity, View } from "react-native";
 import Header from "../../components/Header";
 import styles from "../../theme/styles";
-import { BADGES } from "../../badges/badges";
+import { BADGES, tierBadgeCount } from "../../badges/badges";
+import { fetchLeaderboard } from "../../api/scans";
 
-function _fakeBadges({ scanned, netWorth, memberDays }) {
-  const scanTiers  = [1, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000];
-  const worthTiers = [1, 10, 50, 100, 500, 1000, 10000, 25000, 100000, 500000, 1000000];
-  const dayTiers   = [0, 7, 30, 180, 365, 730, 1825];
-  return (
-    scanTiers.filter(t => scanned >= t).length +
-    worthTiers.filter(t => netWorth >= t).length +
-    dayTiers.filter(t => memberDays >= t).length
-  );
-}
-
-const FAKE_USERS = [
-  { name: "CoinKing99",    scanned: 312, netWorth: 4820,  memberDays: 841  },
-  { name: "SilverHunter",  scanned: 274, netWorth: 11340, memberDays: 612  },
-  { name: "MintErrorMike", scanned: 198, netWorth: 28900, memberDays: 390  },
-  { name: "PennyCollector",scanned: 165, netWorth: 390,   memberDays: 1204 },
-  { name: "AncientRome",   scanned: 143, netWorth: 7650,  memberDays: 520  },
-  { name: "QuarterQueen",  scanned: 121, netWorth: 1120,  memberDays: 278  },
-  { name: "BuffaloNickel", scanned: 97,  netWorth: 3200,  memberDays: 730  },
-  { name: "GoldEagleFan",  scanned: 84,  netWorth: 52000, memberDays: 95   },
-  { name: "WheatBackWill", scanned: 61,  netWorth: 940,   memberDays: 1560 },
-  { name: "NewCollector",  scanned: 12,  netWorth: 85,    memberDays: 8    },
-].map(u => ({ ...u, badges: _fakeBadges(u) }));
+const REFRESH_INTERVAL_MS = 15000;
 
 const LB_CATEGORIES = [
   { key: "scanned",  label: "Most Scanned", field: "scanned",  format: v => `${v} coins`   },
@@ -39,57 +18,94 @@ function withAvgValue(u) {
   return { ...u, avgValue: u.scanned > 0 ? u.netWorth / u.scanned : 0 };
 }
 
+function memberDaysFrom(memberSince) {
+  if (!memberSince) return 0;
+  return Math.max(1, Math.floor((Date.now() - new Date(memberSince).getTime()) / 86400000));
+}
+
+// Safe aggregate rows from the leaderboard() RPC - scan_count/total_value/
+// member_since only, never another user's raw scan history. Matches "is this
+// me" on user_id when the RPC returns it; falls back to display_name so the
+// screen still degrades gracefully against an older function signature.
+function mapRpcRow(row, myUserId, myName) {
+  const memberDays = memberDaysFrom(row.member_since);
+  const isMe = row.user_id ? row.user_id === myUserId : row.display_name === myName;
+  return {
+    key: row.user_id || row.display_name,
+    name: row.display_name || "Member",
+    scanned: row.scan_count ?? 0,
+    netWorth: Number(row.total_value ?? 0),
+    memberDays,
+    isMe,
+    // Filled in below: my own row gets the real badge count from my own
+    // scans; every other row gets the safe tier-only approximation.
+  };
+}
+
 export default function LeaderboardScreen({ navigate, user, userScans }) {
   const [cat, setCat] = useState("scanned");
-  const [liveUsers, setLiveUsers] = useState(FAKE_USERS.map(u => ({ ...u })));
-  const [lastUpdated, setLastUpdated] = useState(new Date());
+  const [rows, setRows] = useState([]);
+  const [lastUpdated, setLastUpdated] = useState(null);
   const [flashedName, setFlashedName] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState("");
+  const previousCountsRef = useRef({});
   const category = LB_CATEGORIES.find(c => c.key === cat);
 
   useEffect(() => {
-    function tick() {
-      setLiveUsers(prev => {
-        const next = prev.map(u => ({ ...u }));
-        const count = Math.random() < 0.4 ? 2 : 1;
-        const picked = [];
-        while (picked.length < count) {
-          const idx = Math.floor(Math.random() * next.length);
-          if (!picked.includes(idx)) picked.push(idx);
-        }
-        picked.forEach(idx => {
-          if (Math.random() < 0.7) next[idx].scanned += 1;
-          next[idx].netWorth += Math.floor(Math.random() * 120);
+    let mounted = true;
+
+    async function load() {
+      try {
+        const data = await fetchLeaderboard();
+        if (!mounted) return;
+
+        const previous = previousCountsRef.current;
+        const next = {};
+        let changedName = null;
+        data.forEach(row => {
+          const key = row.user_id || row.display_name;
+          next[key] = row.scan_count;
+          if (previous[key] != null && row.scan_count > previous[key]) {
+            changedName = row.display_name;
+          }
         });
-        setFlashedName(next[picked[0]].name);
-        setTimeout(() => setFlashedName(null), 800);
-        return next;
-      });
-      setLastUpdated(new Date());
+        previousCountsRef.current = next;
+
+        setRows(data.map(row => mapRpcRow(row, user.id, user.name)));
+        setLastUpdated(new Date());
+        setLoadError("");
+        if (changedName) {
+          setFlashedName(changedName);
+          setTimeout(() => setFlashedName(null), 800);
+        }
+      } catch {
+        if (mounted) setLoadError("Couldn't load the leaderboard. Pull to refresh.");
+      } finally {
+        if (mounted) setLoading(false);
+      }
     }
 
-    const id = setInterval(tick, 7000 + Math.random() * 5000);
-    return () => clearInterval(id);
-  }, []);
+    load();
+    const id = setInterval(load, REFRESH_INTERVAL_MS);
+    return () => { mounted = false; clearInterval(id); };
+  }, [user.id]);
 
-  const myDays = user.createdAt
-    ? Math.max(1, Math.floor((Date.now() - user.createdAt) / 86400000))
-    : 1;
+  const myBadgeCount = BADGES.filter(b => b.check(userScans || [], user)).length;
 
-  const myEntry = {
-    name: user.name,
-    scanned: userScans.length,
-    netWorth: userScans.reduce((s, c) => s + (c.value ?? 0), 0),
-    memberDays: myDays,
-    badges: BADGES.filter(b => b.check(userScans, user)).length,
-    isMe: true,
-  };
-
-  const all = [...liveUsers.map(u => withAvgValue({ ...u, isMe: false })), withAvgValue(myEntry)]
+  const all = rows
+    .map(row => ({
+      ...row,
+      badges: row.isMe ? myBadgeCount : tierBadgeCount(row),
+    }))
+    .map(withAvgValue)
     .sort((a, b) => b[category.field] - a[category.field])
     .map((u, i) => ({ ...u, rank: i + 1 }));
 
   const medals = ["🥇", "🥈", "🥉"];
-  const updatedStr = lastUpdated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  const updatedStr = lastUpdated
+    ? lastUpdated.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" })
+    : "--";
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -109,8 +125,14 @@ export default function LeaderboardScreen({ navigate, user, userScans }) {
           ))}
         </View>
 
-        {all.map((entry) => (
-          <View key={entry.name} style={[styles.lbRow, entry.isMe && styles.lbRowMe, flashedName === entry.name && styles.lbRowFlash]}>
+        {loading ? (
+          <Text style={styles.searchEmpty}>Loading leaderboard…</Text>
+        ) : loadError ? (
+          <Text style={styles.searchEmpty}>{loadError}</Text>
+        ) : all.length === 0 ? (
+          <Text style={styles.searchEmpty}>No collectors yet.</Text>
+        ) : all.map((entry) => (
+          <View key={entry.key} style={[styles.lbRow, entry.isMe && styles.lbRowMe, flashedName === entry.name && styles.lbRowFlash]}>
             <Text style={styles.lbRank}>
               {entry.rank <= 3 ? medals[entry.rank - 1] : `#${entry.rank}`}
             </Text>
