@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `d5cd4b7` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `fe9369d` (origin/seperate).
 
 ---
 
@@ -148,6 +148,14 @@ isolation confirmed, real persist round-trip confirmed), then deleted.
 - No secrets staged (`.env`/`.env.local`/`server/.env` correctly ignored).
 - Pushed to `origin/seperate` (`f3f7357..d5cd4b7`).
 
+### 1e. Follow-up commits (same day, after the incident in §3)
+
+Three more focused commits, pushed together (`d5cd4b7..fe9369d`):
+- `c2ee5d9` — the `service_role` grant fix for `api_usage` (§3/§4b).
+- `4a7adce` — Numista/PCGS pipeline observability logging + a bugfix found
+  while adding it (§6).
+- `fe9369d` — this context export document itself.
+
 ---
 
 ## 2. Assumptions made (things a future session should sanity-check)
@@ -245,9 +253,10 @@ wall next):
 grant select, insert, update on public.api_usage to service_role;
 ```
 
-**Status**: fix has been written into the repo (see §4) but **has not yet
-been confirmed run** against production by the user — that's the one
-pending external action from today.
+**Status**: fix is committed and pushed (`c2ee5d9`, see §4) but **has not
+yet been confirmed run against the live database** — a `git push` does not
+execute SQL against Supabase. That's still the one pending external action
+from today (§7).
 
 ---
 
@@ -353,15 +362,86 @@ included only so the full picture of what touched the live database today
 
 ---
 
-## 5. Pending external action
+## 6. Follow-up change: Numista/PCGS pipeline observability + bugfix
 
-Run this in the Supabase SQL editor (the one thing from today not yet done):
+**Trigger**: the user wanted to verify the Numista API contract end-to-end
+(the assumptions flagged in §2 were made without a live key) and pointed out
+that no Numista/PCGS response or error was being logged anywhere — so a
+wrong field-name assumption would only ever show up as a silent "valuation
+unavailable," never as a visible discrepancy.
 
-```sql
-grant select, insert, update on public.api_usage to service_role;
-```
+**What was added** (`server/app.py` only, `commit 4a7adce`): tagged,
+greppable `app.logger.info`/`.warning`/`.error` calls at every stage of the
+pipeline, so a real test scan's Render logs read top-to-bottom against the
+actual stages:
 
-(Equivalently: run `supabase/migrations/0002_grant_api_usage_service_role.sql`.)
+| Tag | What it shows |
+|---|---|
+| `[identify]` | OpenAI's structured result (status/confidence/country/denomination/year/grade); final valuation decision; scan-persisted confirmation with row id |
+| `[numista]` | search query sent + **raw response body** (truncated to 1500 chars); candidate count; top 3 scored candidates (score, id, title); which one was selected and why, or why none qualified (score too low / tied with runner-up); type-detail fetch result; price-endpoint **raw response body**; exact-grade match vs. nearest-available-grade fallback |
+| `[pcgs]` | whether the optional fallback was attempted, skipped (no PCGS reference), succeeded, or failed |
+| `[valuation]` | final available/unavailable decision and why |
 
-Everything else from today (code, tests, commit, push) is already done and
-live on `origin/seperate` at `d5cd4b7`.
+Raw response bodies are logged (truncated, not full) specifically so the
+*actual* Numista JSON shape can be read directly from Render logs and
+compared against the field names the code assumes
+(`types`/`items`/`results`, `issuer.name`, `min_year`/`max_year`,
+`prices[].grade`/`.price`) — this is the concrete mechanism for verifying
+the contract in §2's first assumption.
+
+**Bug found and fixed while adding this**: `fetch_numista_price`'s "no exact
+grade match, use nearest available" fallback branch read a price entry via
+`middle["value"]` instead of `middle["price"]` (the actual key on a Numista
+price-list entry, consistent with the exact-match branch a few lines above
+it, which already used `entry["price"]` correctly). This would have raised
+`KeyError: 'price'` the first time a real scan's grade didn't exactly match
+a priced grade in Numista's response — i.e. probably on the very first real
+test scan. Caught by re-reading the diff before testing, not by a test
+catching it.
+
+**Verification performed**: wrote a one-off script (not committed — it was
+throwaway) that patches `requests.get` to return realistic canned Numista
+responses (a Canada 5 Cents search hit → type detail → a `prices` array with
+no exact `"VF-30"` entry, forcing the nearest-available fallback) and ran
+`lookup_numista()` + `estimate_value()` against it directly. Confirmed: no
+crash, correct value selected, and every log line described above actually
+appears in the expected order/format. This is the same technique available
+for verifying real Numista responses later, just with real data instead of
+a canned fixture.
+
+**No behavior changed**: matching thresholds, scoring, valuation
+decision logic, and return shapes are all identical to before — this was
+purely additive logging plus the one real bug fix.
+
+**Tests**: 24/24 Python (`python -m unittest discover -s tests` from
+`server/`), 22/22 JS (`npm test`) — unaffected, since no existing test
+exercises the Numista/PCGS HTTP calls directly (all gated behind
+`NUMISTA_API_KEY`/mock mode in every current test, so none of them reach the
+new logging code).
+
+**Still not done**: an actual real scan against the live Numista API has not
+happened yet in this session (no `NUMISTA_API_KEY` was available here). The
+`[numista]` log lines are ready to read the moment that happens on Render.
+
+---
+
+## 7. Pending external actions
+
+1. Run this in the Supabase SQL editor (unchanged from §3/§5 in the earlier
+   version of this doc — code is committed, but nothing has executed it
+   against the live database yet):
+   ```sql
+   grant select, insert, update on public.api_usage to service_role;
+   ```
+   (Equivalently: run `supabase/migrations/0002_grant_api_usage_service_role.sql`.)
+
+2. Once that grant is applied, run a real scan with `MOCK_MODE`/mock coin
+   response off (needs `OPENAI_API_KEY` and `NUMISTA_API_KEY` set on Render)
+   and read the `[identify]`/`[numista]`/`[pcgs]`/`[valuation]` lines in
+   Render's logs in order (§6) to confirm the real Numista response shape
+   matches what the code assumes. If a field name doesn't match, the raw
+   `body=...` in the log line shows exactly what to fix in
+   `search_numista_types` / `fetch_numista_price` / `score_numista_candidate`.
+
+Everything else from today (code, tests, three commits, push) is already
+done and live on `origin/seperate` at `fe9369d`.
