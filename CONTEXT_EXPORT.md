@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `124344c` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `3c2a4f3` (origin/seperate).
 
 ---
 
@@ -1399,7 +1399,96 @@ leaderboard, scan schema.
 
 ---
 
-## 22. Pending external actions
+## 22. Follow-up fix: prefer standard-circulation Numista variant on a year tie
+
+**Trigger**: the §20 issuer-resolution fix worked - a real 2012 UK 20 pence
+scan's structured search returned three real candidates, all with a valid
+2012 issue: a non-circulating 1/10oz fine-silver type (29106), the
+standard circulation type (5628, "Royal Shield"), and a silver-proof
+variant of it (208022). The §17 ambiguity guard correctly refused to guess
+between them and reported unavailable - correct per its own rules, but
+leaving an obvious win on the table: for an ordinary circulating coin, the
+right answer among these three is usually clear from information Numista
+already returns.
+
+**Exact variant-ranking rule** (`server/app.py`):
+`looks_special_or_proof(candidate)` - true when a candidate's
+`object_type.name` is anything other than `"Standard circulation coins"`,
+**or** its title mentions `proof` / `fine silver` / `fine gold` / `bullion`
+/ `specimen` / `commemorative` / `platinum`. Deliberately does **not**
+trigger on bare `"silver"`/`"gold"` in a candidate's title - plenty of
+genuinely standard circulation coins are historically silver or gold
+(e.g. pre-1947 British coinage), and object_type already catches the
+modern non-circulating/commemorative cases those bare words were meant to
+flag. `ai_indicates_special_variant(identification)` - true when the AI's
+own `description`/`special_notes`/`coin_name`/`varieties`/`estimated_grade`
+text mentions `proof`/`silver`/`gold`/`platinum`/`bullion`/`specimen`/
+`commemorative` (the fuller word list, including bare metal names, is safe
+here since a live AI describing an ordinary coin essentially never says
+"silver"/"gold" unless it actually means it).
+
+**Whether an existing helper was reused**: no - despite the task
+suggesting to check for an existing `looks_special_or_proof()`, none
+existed before this change; both classifier functions were built fresh,
+reusing only the existing `_text_of()` string-normalization helper.
+
+**Where it plugs in** (`resolve_numista_type_and_issue`, unchanged
+ordering otherwise): after the year/issue gate produces its `matches`
+list (the mandatory, untouched correctness check), if there's still a tie
+**and** the AI didn't itself flag a special variant, narrow `matches` to
+whichever aren't `looks_special_or_proof` - but only when at least one
+non-special candidate exists; if the narrowed set has exactly one entry,
+that's the answer, if it still has 2+ (two circulation-type candidates
+still tied) it falls straight through to the existing ambiguous ->
+unavailable path unchanged. When the AI *did* flag something special, the
+narrowing step is skipped entirely (never force-selects circulation on
+the AI's behalf) and the original tie stands, going to the same
+ambiguous -> unavailable path.
+
+**Regression test result for the UK 2012 20p**: passes -
+`test_uk_2012_20p_regression_prefers_standard_circulation_type_5628` feeds
+the exact three real candidates (ids 29106/5628/208022) with an ordinary,
+non-special AI description and asserts type **5628 wins**, with issue
+`iss-5628-2012`.
+
+**Other new tests, all passing**: AI explicitly saying "silver proof"
+does *not* auto-select circulation (stays ambiguous/unavailable, asserted
+both as "not 5628" and as the actual `None, None` result); two standard-
+circulation candidates that are themselves still tied stay unavailable
+(no false narrowing to a single winner); the standard-circulation type
+itself lacking a 2012 issue (only the proof variant has one) still
+correctly selects the proof one - proves the year/issue gate still wins
+over "prefer the ordinary one" when there's no ordinary match to prefer;
+plus direct unit tests for both classifier functions.
+
+**Files changed**: `server/app.py` (two new module-level keyword tuples +
+two new functions + the narrowing step inserted into
+`resolve_numista_type_and_issue`), `server/tests/test_numista.py` (7 new
+tests, one new `VariantDisambiguationTests` class).
+
+**Not changed** (confirmed by re-running the full suite unmodified):
+OpenAI prompt/schema, issuer lookup (§20), structured search (§20), issue
+fetching (§17), auth, quota/rate-limit handling (§18/§19), persistence,
+badges/leaderboard, PCGS, scan schema.
+
+**All test results**: 89/89 Python passing (82 → 89, 7 new). 31/31 JS
+passing (unaffected - no JS files touched). Commit `3c2a4f3`, pushed.
+
+**Exact next live scan to perform**: the same 2012 UK 20 pence coin (or
+any other UK coin) again. Render logs should now show, after the usual
+`[numista] all candidates scored`/`issues inspected` lines, a new
+`[numista] variant disambiguation: preferring 1 standard-circulation
+candidate(s), deprioritizing special-variant match(es): [...]` line
+naming the fine-silver and silver-proof candidates as deprioritized,
+followed by `[numista] selected type+issue: type_id=5628 ...` and -
+finally, for the first time across every real scan so far this session -
+an actual `[numista] price response: type_id=5628 issue_id=...` line,
+giving the first real confirmation of the still-unverified
+`/types/{id}/issues/{issue_id}/prices` response shape from §17.
+
+---
+
+## 23. Pending external actions
 
 1. ~~Run this in the Supabase SQL editor~~ — **now believed applied**: the
    real scan in §14 ran with `MOCK_MODE` off and reached
@@ -1489,10 +1578,16 @@ leaderboard, scan schema.
     `AdminScreen.js` ever needs attention, it should be pointed at Supabase
     like the rest of the app instead of SheetDB/AsyncStorage.
 
-Everything through §21 (code, tests, all commits through `124344c`) is
+13. See §22 for the variant-disambiguation fix - run the "exact next live
+    scan to perform" there (the same UK 2012 20p) to confirm it now
+    resolves to type 5628 and to get the first real confirmation of the
+    issue-price endpoint's response shape.
+
+Everything through §22 (code, tests, all commits through `3c2a4f3`) is
 committed and pushed to `origin/seperate`. §15 (rate limit) + §16
 (truncated response) are confirmed fixed by real, non-mock scans; §17-§20
 (Numista matching/pricing, 429 diagnostics, retry_after_seconds, issuer
-resolution) are implemented and pushed but not yet exercised end-to-end
-by a real scan that reaches a confident valuation. §21 (summary/log-scan
-fixes) is implemented, tested, and pushed.
+resolution), §21 (summary/log-scan fixes), and §22 (variant
+disambiguation) are all implemented, tested, and pushed - but no real scan
+has yet reached a confident valuation end-to-end (§22's next live scan is
+the one most likely to finally do so).
