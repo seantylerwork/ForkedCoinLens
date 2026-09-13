@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `e159aaf` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `1d07df6` (origin/seperate).
 
 ---
 
@@ -915,7 +915,224 @@ no JS files touched).
 
 ---
 
-## 17. Pending external actions
+## 17. Investigation + fix: Numista type-vs-issue matching and pricing endpoint
+
+**Trigger**: two different real, non-mock scans (a 2016 Canada 1 dollar,
+and the 2012 UK 20 pence from §16) both came back "Estimated Value: Not
+available." The user asked whether hooking up PCGS would help, and then
+asked for a full investigation per an explicit brief: inspect the exact
+query, `score_numista_candidate`, `select_best_numista_match`, the real
+logged candidate fields, and the type-detail/pricing assumptions; determine
+whether the failure was a search problem, a scoring problem, or a
+type-vs-issue problem; do not just lower the confidence threshold.
+
+**Why PCGS wouldn't have helped either failure**: `lookup_pcgs()` only ever
+runs off a PCGS cross-reference number that comes from an already-confident
+Numista *type* match (`numista_data.get("references")`) - it returns `None`
+immediately otherwise. Both failures happened at the Numista *matching*
+stage, before there was ever a type to pull a PCGS number from. PCGS is
+also almost entirely a US-coins database; neither example coin is American.
+
+**Evidence directly from the two real scans' logs** (not hypothetical -
+this is what made root-causing possible without a live Numista key in this
+environment):
+- Canada query: `search response: query='Canada 1 dollar' ... body={"count":1559,"types":[{"title":"1 Dollar - Elizabeth II (4th Portrait - Rotary Centenary)","issuer":{"code":"australie","name":"Australia"},...},{"title":"1 Dollar - Elizabeth II (...Olympic Team...)","issuer":{"name":"Australia"},...},...`
+  - Numista's own free-text relevance search returned **Australian** "1
+    Dollar" types ranked ahead of the actual Canadian coin, because the
+    2-word query matches the denomination phrase for *any* country.
+  - Our own scorer then re-ranked what came back and put Canadian "1 Cent
+    - Victoria" (country match, wrong 1800s denomination, score 3) above
+    everything, because a bare country-name match (+3) outweighs no match
+    at all - it never saw a correctly-denominated Canadian dollar
+    candidate score higher, implying one either wasn't in the small
+    `count=8` window or didn't literally contain "1 dollar" in its title.
+- UK query: `search response: query='United Kingdom 20 pence' ... body={"count":366,"types":[{"title":"20 Cents - Elizabeth II...","issuer":{"name":"Australia"},...},{"title":"25 Pence - Charles III...","issuer":{"name":"Alderney"},...},{"title":"20 Pence - Elizabeth II (Viking Arms and Armour"` (cut off by the 1500-char log truncation before its `issuer` field)
+  - Same pattern: non-UK candidates (Australia, Alderney) surfaced ahead of
+    what looks like the genuinely correct UK type (id 10799), which then
+    only scored 2 (denomination-only) in our own ranking - its `issuer`
+    field was truncated out of the log, so whether it failed the country
+    check for a real reason or a logging-truncation artifact could not be
+    confirmed from existing logs alone. This is exactly why fuller
+    candidate logging (added below) was necessary, not optional.
+
+**Independent, code-level confirmation of a third root cause** (not
+inferable from our logs at all): `fetch_numista_price` was calling
+`GET /types/{id}/prices`. Numista's docs (`en.numista.com/api/doc/...`)
+are Cloudflare-blocked from this sandbox and the schema endpoint
+(`api.numista.com/api/doc/swagger.yaml`) requires an API key we don't have
+here, so this was verified instead against a hand-written third-party
+Python SDK (`namachieli/numista-api-sdk` on GitHub) whose source explicitly
+builds requests from Numista's own `swagger.yaml` (`API_SCHEMA_URL` in its
+source) - its `getPrices()` method builds
+`f"/types/{type_id}/issues/{issue_id}/prices"`, and it separately confirms
+a `GET /types/{type_id}/issues` endpoint exists (`getIssues()`) distinct
+from `GET /types/{type_id}` (`getType()`). This matches the user's own
+architectural hint exactly: **pricing is issue-specific, not type-level**.
+Every real scan that reached the pricing stage - regardless of matching
+quality - was hitting a URL that doesn't match Numista's real API.
+
+**Root cause: a combination, all three categories, not one**:
+- **(A) Search** - confirmed directly from real log bodies: Numista's own
+  relevance ranking for a bare `"{country} {denomination}"` query does not
+  reliably surface the correct country's match near the top of even a
+  modest `count=8` window.
+- **(B) Scoring** - likely a contributing factor (title-substring matching
+  is brittle against real Numista title conventions - e.g. a type titled
+  just "Dollar" rather than "1 Dollar" would silently lose the
+  denomination-match points), but not fully confirmed for the UK case
+  specifically due to log truncation cutting off the one candidate that
+  mattered.
+- **(C) Type-vs-issue** - confirmed independently of the two real scans,
+  via the third-party SDK's source: the pricing endpoint was simply wrong,
+  and a type's own min/max-year range is not a substitute for checking a
+  specific issue.
+
+**Fix** (`server/app.py`, commit `1d07df6`, **not yet pushed**) - replaces
+score-and-threshold matching with score-to-shortlist, then require-a-real-
+issue matching, per the user's specified flow (search -> rank -> inspect
+top few types' real issues -> require an issue matching the year, mint
+mark to disambiguate -> select type+issue -> fetch prices for that issue):
+- `score_numista_candidate` is now backed by
+  `_score_numista_candidate_breakdown`, which returns *why* a candidate
+  scored what it did (a dict of named components), not just a number.
+  `resolve_numista_type_and_issue` logs this breakdown, plus the exact
+  `cand_country` text compared, for **every** candidate returned by the
+  search (not just the top 3 as before) - the single change that makes
+  the next real scan's failure mode (A vs. B) conclusively diagnosable
+  instead of inferred from partial log excerpts.
+- New `fetch_numista_issues(type_id)` calls the now-confirmed
+  `GET /types/{id}/issues` and logs the response + the years found.
+- New `_issue_matches_year` (exact year, or within an issue's own
+  min/max range) and `_issue_mint_text`/`_select_issue_for_year` (mint
+  mark used only to disambiguate multiple same-year issues, never as a
+  hard requirement - not every denomination carries one).
+- New `resolve_numista_type_and_issue`: scores all candidates, takes the
+  top `NUMISTA_MATCH_CANDIDATES_TO_INSPECT` (3) scoring at least
+  `NUMISTA_MATCH_MIN_SCORE` (2), and for each (in score order) fetches its
+  issues and requires one to match the identified year. **The first one
+  with a real matching issue wins - even if a different, higher-scored
+  candidate was checked first and rejected.** This directly fixes the
+  observed failure mode: a wrong-era title match that scores well no
+  longer wins just because of its score. If nothing among the inspected
+  candidates has a matching issue, the result is `(None, None)` -
+  unavailable, never invented, same honesty guarantee as before.
+- `fetch_numista_price(type_id, issue_id, grade)` now takes an
+  `issue_id` and calls the issue-scoped URL; `estimate_value` requires
+  both a `numista_type_id` and `numista_issue_id` before attempting a
+  price lookup.
+- `search_numista_types`'s `count` raised 8 -> 12 (still one search call;
+  gives the new inspect-top-3 step a wider net, directly addressing the
+  (A) search-window evidence above).
+- `_numista_result_list` now also unwraps a bare list or an `"issues"` key
+  (previously only `"types"`/`"items"`/`"results"`), since the issues
+  endpoint's exact wrapper shape is unconfirmed without a live key.
+
+**Explicitly not done, per the brief**: the confidence threshold number
+itself (a bare title/country score of 3) was **not** lowered or removed as
+an acceptance rule - it no longer exists as an acceptance rule at all,
+replaced by a strictly more rigorous factual check (a real issue for the
+identified year). `NUMISTA_MATCH_MIN_SCORE` (2) is a *pre-filter* for
+which candidates are worth an extra HTTP call, not an acceptance
+threshold - a candidate can score 2 and still be correctly selected (as
+the UK-style candidates would be), and a candidate can score 7 and still
+be correctly rejected (as demonstrated by the new regression test). Also
+not done: OpenAI identification, auth/quota/persistence/badges/leaderboard,
+and no new database columns (none were needed - `numista_issue_id` lives
+only in the in-memory `numista_data` dict passed between functions within
+one request, not persisted).
+
+**Numista endpoints actually confirmed** (via the third-party SDK's
+source, cross-referenced against our own real logged responses where
+possible):
+- `GET /types` (search) - `q`, `issuer`, `category`, `page`, `count`,
+  `lang` (default `en` - ruling out an earlier locale hypothesis about
+  country-name mismatches). Our own real log bodies already confirm the
+  response shape (`{"count", "types":[{"id","title","issuer":{"code","name"},"min_year","max_year",...}]}`).
+  **Not used yet**: the `issuer` param (issuer code) would let us filter
+  search by country precisely instead of relying on free-text ranking -
+  deliberately deferred (see below), not forgotten.
+- `GET /types/{id}` - full type detail (`fetch_numista_type_detail`,
+  unchanged).
+- `GET /types/{id}/issues` - **newly added**, confirmed to exist via the
+  SDK; its exact response field names (`year` vs. a date range, mint
+  field name) are **still unconfirmed against a live response** - this is
+  exactly what the new `[numista] issues response`/`issues inspected` log
+  lines will reveal on the next real scan that reaches this step.
+- `GET /types/{id}/issues/{issue_id}/prices` - **corrected from the old,
+  wrong `/types/{id}/prices`** - confirmed via the SDK; the `prices` array
+  shape (`grade`/`price` fields) is carried over as a reasonable
+  assumption from before, not yet confirmed live either.
+- Numista's own documentation site (`en.numista.com/api/doc/...`) and
+  schema endpoint (`api.numista.com/api/doc/swagger.yaml`) could **not**
+  be fetched directly in this session (Cloudflare block / requires an API
+  key this sandbox doesn't have) - all of the above is corroborated
+  through the third-party SDK's source code, not a first-party call.
+
+**Deferred (V2) idea, not implemented**: using `searchTypes`'s `issuer`
+parameter to filter search by Numista's own issuer code instead of
+free-text country matching would likely fix the (A) search-ranking
+problem more directly than a wider `count`. Not done here because it
+requires either a maintained country-name -> Numista-issuer-code mapping
+(risk of a wrong guess *silently* returning zero results, since `issuer`
+is a strict filter) or an extra live `/issuers` lookup call per scan -
+both real design decisions better made with a live key in hand, and out
+of scope for "smallest robust V1."
+
+**Tests added** (`server/tests/test_numista.py`, new file, 17 tests):
+scoring-breakdown correctness (including the real Australian-"1 Dollar"
+false-country-credit scenario), `_issue_matches_year`/`_select_issue_for_year`
+(exact year, range, no match, mint-mark disambiguation, mint-unspecified
+fallback), and - the core regression guard -
+`test_prefers_issue_confirmed_candidate_over_a_higher_scored_wrong_one`,
+which constructs a wrong-era candidate that deliberately outscores the
+correct one (mirroring the real title-omits-the-leading-"1" scoring gap
+hypothesized above) and asserts the issue check still picks correctly;
+plus a candidate-cap bound test, the corrected price-URL test, and two
+`lookup_numista` integration tests.
+
+**Tests**: 58/58 Python passing (41 -> 58), 25/25 JS passing (unaffected -
+no JS files touched).
+
+**Housekeeping note**: this commit (`1d07df6`) was staged with a plain
+`git add server/app.py`, which - unlike earlier commits in this session -
+did **not** carve out the pre-existing, unrelated `DAILY_SCAN_LIMIT`
+5→20 default-value change still sitting in the working tree since before
+this session started. That line was already swept into the earlier
+`5747051` commit (`max_output_tokens` fix) by the same oversight and is
+already pushed. Flagging this for transparency, not because it's harmful
+(it's the user's own pre-existing edit and a plausible intentional
+default) - just that the "keep unrelated changes separate" discipline
+slipped for that one line partway through the session.
+
+**Exact next real coin test to perform**: scan a **common, undamaged,
+well-known coin** (ideally one where the AI's country/denomination/year
+are all clean) - the two coins tried so far were both somewhat
+unusual/damaged (a worn/mint-error-flagged UK 20p, and whatever made the
+Canadian dollar not resolve), which may itself be contributing to weak
+Numista search relevance. Concretely, read the Render logs for, in order:
+1. `[numista] all candidates scored: ...` - check whether the correct
+   type is present at all among the (now up to 12) candidates, and if so,
+   whether its score reflects a real country+denomination match. Presence
+   with a low score = confirms (B); absence entirely = confirms (A).
+2. `[numista] issues response ...` / `issues inspected: ... years=...` -
+   confirms the real field shape of an issue record (does `year` exist as
+   named, or is it a min/max range? is there a mint field, and what is it
+   called?).
+3. `[numista] selected type+issue: ...` - confirms resolution worked
+   end-to-end.
+4. `[numista] price response: type_id=... issue_id=... ... body=...` -
+   the first-ever real confirmation of the issue-scoped price endpoint's
+   actual response shape, since neither real scan so far has reached
+   pricing.
+If step 1 shows the correct type present but scoring low specifically
+because its title omits a leading "1" (or similar formatting variance),
+that confirms hypothesis (B) concretely and would justify a follow-up:
+normalizing denomination text (e.g. also trying without a leading "1 ")
+before the substring check.
+
+---
+
+## 18. Pending external actions
 
 1. ~~Run this in the Supabase SQL editor~~ — **now believed applied**: the
    real scan in §14 ran with `MOCK_MODE` off and reached
@@ -930,19 +1147,15 @@ no JS files touched).
    ```
    (Equivalently: `supabase/migrations/0002_grant_api_usage_service_role.sql`.)
 
-2. The §14 real scan also answered part of the original Numista-contract
-   question from §2/§6: the search endpoint's real response shape matched
-   the code's assumption (`{"count": ..., "types": [...]}`, with
-   `issuer.name`/`min_year`/`max_year` present and used correctly to score
-   candidates — see the `[numista] search response`/`top candidates` log
-   lines in §14). **Still unconfirmed**: the type-detail fetch and the
-   `/types/{id}/prices` endpoint's shape (`prices[].grade`/`.price`). A
-   second real scan (§16 verification, a 2012 UK 20p with reverse damage)
-   again never reached a confident match (top score only 2, below the
-   ambiguity threshold of 3 - even lower confidence than §14's tie at 3),
-   so neither endpoint has been exercised for real yet across two separate
-   scans. Needs a scan of a common, undamaged coin to get an unambiguous
-   top Numista match and exercise those two endpoints for real.
+2. ~~Numista type-detail/pricing endpoint assumptions~~ — **superseded by
+   §17**: the `/types/{id}/prices` assumption was wrong (confirmed via a
+   third-party SDK to actually be `/types/{id}/issues/{issue_id}/prices`)
+   and is now fixed, but still **unconfirmed against a live response** -
+   see §17's "exact next real coin test to perform" for what to check.
+
+2b. See §17 for the full matching-algorithm investigation and fix
+   (search-vs-scoring-vs-type/issue root cause, before/after algorithm,
+   and the specific next real-scan test to run).
 
 3. Also check whether the illegible-year case (§8) now comes back with a
    confidence that actually reads as low/uncertain rather than a high
@@ -981,7 +1194,12 @@ no JS files touched).
    correctly "unavailable"), and scan persistence all completed normally
    end-to-end with no errors.
 
-Everything through §16 (code, tests, all commits through `870dae7`) is
+8. See §17 for the Numista type-vs-issue matching + pricing investigation
+   and fix (the "estimated value not available" question) and its "exact
+   next real coin test to perform" section.
+
+Everything through §16 (code, tests, all commits through `8d104f0`) is
 committed and pushed to `origin/seperate`, and §15 (rate limit) + §16
 (truncated response) are now both confirmed fixed by real, non-mock scans
-rather than just unit tests.
+rather than just unit tests. §17 (Numista matching/pricing fix, `1d07df6`)
+is committed locally but **not yet pushed**.
