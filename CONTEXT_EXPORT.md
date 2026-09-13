@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `55bc51e` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `c62706a` (origin/seperate).
 
 ---
 
@@ -1585,7 +1585,93 @@ since §17).
 
 ---
 
-## 24. Pending external actions
+## 24. Investigation: live UK 2012 20p regression could not be reproduced
+
+**Trigger**: the user reported a live scan where type 5628 (the correct UK
+20p type, per §23's fix) was rejected with `"no issue matches
+year='2012'"` even though Numista returned three real 2012 issues for it
+(144284 ordinary, 520198 "BU", 180337 "Proof") - apparently contradicting
+the §23 unit tests, which claimed this exact scenario resolves correctly.
+
+**What was done**: per explicit instruction to trace the exact predicate
+before guessing a fix, reproduced the live evidence *verbatim* - the
+exact issue dicts (including `is_dated`/`gregorian_year`/`mintage` fields
+the existing simplified test fixtures didn't include) and the exact AI
+identification (`country="United Kingdom"`, `denomination="20 pence"`,
+`year="2012"`, `grade="VF-20"`, `description="ordinary circulating coin,
+normal wear/scratches"`) - first via a standalone script calling
+`_select_issue_for_year` directly, then via the full
+`resolve_numista_type_and_issue` end-to-end with all three real
+candidates (29106 Fine Silver, 5628 standard circulation, 208022 Silver
+Proof). **Both reproductions correctly selected type 5628 / issue 144284
+with the code as it stood at commit `55bc51e`** - the failure described
+could not be made to happen with the exact data given. Traced through
+every predicate the task asked about (year comparison, `None`/empty-string
+mint-mark handling, missing-`comment` handling, whether the issue-level
+helper requires a field to exist) and each behaves correctly; none
+explain the reported live behavior.
+
+**Most likely explanation, not provable from here**: either (a) the live
+scan ran against a Render deployment that hadn't yet picked up the §23
+push (the fix landed the same session, and Render deploys are not
+instant), or (b) the real AI `description`/`special_notes` text contained
+something not captured in the user's paraphrase - e.g. a *negated* mention
+of a special keyword (a live AI often phrases things like "not a proof
+strike" or "no evidence of a proof/specimen finish" when explicitly ruling
+a special variant *out*), which `ai_indicates_special_variant`'s naive
+substring keyword check would misread as a *positive* signal, since it
+has no negation handling. That function is shared with the §22 type-level
+logic and explicitly off-limits for this task ("do not touch... type-level
+variant rules"), so even if (b) is the real cause, it could not be fixed
+here without violating that scope boundary - flagged for a possible
+future task explicitly scoped to include that shared function.
+
+**Fix made regardless, per the explicit task requirements** (`server/app.py`,
+commit `c62706a`):
+- `_select_issue_for_year` now returns `(selected_issue, reason)` instead
+  of just the issue. `reason` is `None` on success or a specific string:
+  `"no issue matches year"`, `"year matched but multiple ordinary issues
+  remain indistinguishable"`, `"year matched but AI indicated a special
+  issue and multiple candidates remain ambiguous"`, or `"year matched but
+  no compatible ordinary/mint variant remained"`. `resolve_numista_type_and_issue`
+  now logs the *real* reason instead of the old single generic message,
+  which the task correctly identified as misleading whenever a year
+  match existed but was filtered out for an unrelated reason.
+- New per-issue diagnostic logging (kept permanently, not temporary - one
+  concise line per year-matching issue): `[numista] issue evaluation:
+  type_id=... issue_id=... year_match=true mint_match=... special=...
+  comment='...' decision=accepted|rejected (...)`. This is what will
+  give ground truth on the very next live scan if the bug is real and
+  environment-specific.
+- `_select_issue_for_year` gained an optional `type_id` param (for the
+  new logging only) - all 6 existing direct-call test sites needed
+  updating to unpack the new `(issue, reason)` return value.
+
+**New regression test** (`server/tests/test_numista.py`): uses the exact
+live issue response shape (including `is_dated`/`gregorian_year`/
+`mintage`) with the exact live identification fields, asserting issue_id
+144284 wins - passes against current code, serving as a permanent guard
+against this exact real shape (as opposed to the simplified dicts used by
+older tests in this file).
+
+**Tests**: 102/102 Python passing (101 → 102). 31/31 JS passing
+(unaffected - no JS touched). Confirmed unchanged (re-ran the full suite
+unmodified): OpenAI, Numista structured search, issuer cache, denomination
+scoring, type-level variant disambiguation (§22), price parsing, auth,
+quota/rate-limit, persistence, frontend, database.
+
+**Confirmed next expected live path**: type 5628 → issue 144284 → price
+endpoint - **assuming this was a deployment-timing artifact**, which is
+the best-supported explanation given the reproduction attempts. If the
+*next* live scan still rejects 5628, the new `[numista] issue evaluation`
+log lines will show the exact `mint_match`/`special`/`comment` values Numista
+actually returned for each issue, and the rejection log will name the
+precise reason - enough to pinpoint hypothesis (b) (or something else
+entirely) conclusively, without further guessing.
+
+---
+
+## 25. Pending external actions
 
 1. ~~Run this in the Supabase SQL editor~~ — **now believed applied**: the
    real scan in §14 ran with `MOCK_MODE` off and reached
@@ -1685,12 +1771,25 @@ since §17).
     finally confirm an end-to-end confident valuation, including the
     still-unverified issue-price endpoint response shape.
 
-Everything through §23 (code, tests, all commits through `55bc51e`) is
+15. See §24 - a live scan reported type 5628 being incorrectly rejected
+    despite three real 2012 issues; could not be reproduced with the
+    exact data given (may be a deployment-timing artifact from §23
+    landing the same session). Watch the next live scan's new
+    `[numista] issue evaluation: ...` log lines and the rejection
+    reason string either way - if it still fails, those lines will show
+    the actual predicate values Numista returned, likely pointing at a
+    negation in the AI's description tripping `ai_indicates_special_variant`
+    (a shared, currently off-limits function - would need a follow-up
+    task scoped to include it).
+
+Everything through §24 (code, tests, all commits through `c62706a`) is
 committed and pushed to `origin/seperate`. §15 (rate limit) + §16
 (truncated response) are confirmed fixed by real, non-mock scans; §17-§20
 (Numista matching/pricing, 429 diagnostics, retry_after_seconds, issuer
 resolution), §21 (summary/log-scan fixes), §22 (type-level variant
-disambiguation), and §23 (denomination normalization + issue-level
-variant preference) are all implemented, tested, and pushed - but no real
-scan has yet reached a confident valuation end-to-end (§23's next live
-scan is the one most likely to finally do so).
+disambiguation), §23 (denomination normalization + issue-level variant
+preference), and §24 (diagnostic logging + accurate rejection reasons) are
+all implemented, tested, and pushed - but no real scan has yet reached a
+confident valuation end-to-end. The next live scan (type 5628 -> issue
+144284 -> price endpoint expected) is the one most likely to finally do
+so, or to reveal via the new logging exactly why not.
