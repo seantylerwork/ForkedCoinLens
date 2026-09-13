@@ -26,3 +26,46 @@ test('a plain (non-ScanError) error falls back to the retryable unknown display'
   assert.equal(detail.retryable, true);
   assert.equal(detail.body, 'boom');
 });
+
+// -- rate_limit: OpenAI's real retry-after propagated through ScanError,
+// with the action (Try Again vs Back to Home) driven by how long the wait
+// actually is, instead of a hardcoded "30 seconds" regardless of reality.
+
+test('rate_limit with a 30 second retry-after shows Try Again', () => {
+  const detail = makeErrorDetail(new ScanError('rate_limit', 'AI provider rate or quota limit reached.', { retryAfterSeconds: 30 }));
+  assert.equal(detail.code, 'rate_limit');
+  assert.equal(detail.title, 'Rate Limit Hit');
+  assert.equal(detail.retryable, true);
+  assert.equal(detail.tip, 'Try again in about 30 seconds.');
+});
+
+test('rate_limit with a 5 minute (300s) retry-after shows Back to Home', () => {
+  const detail = makeErrorDetail(new ScanError('rate_limit', 'AI provider rate or quota limit reached.', { retryAfterSeconds: 300 }));
+  assert.equal(detail.retryable, false);
+  assert.equal(detail.tip, 'Try again in about 5 minutes.');
+});
+
+test('rate_limit with an 11042s (~3 hour) retry-after shows Back to Home', () => {
+  const detail = makeErrorDetail(new ScanError('rate_limit', 'AI provider rate or quota limit reached.', { retryAfterSeconds: 11042 }));
+  assert.equal(detail.retryable, false);
+  assert.equal(detail.tip, 'Try again in about 3 hours.');
+});
+
+test('rate_limit with no retry-after falls back to a conservative Try Again, no false 30s claim', () => {
+  const detail = makeErrorDetail(new ScanError('rate_limit', 'AI provider rate or quota limit reached.'));
+  assert.equal(detail.retryable, true);
+  assert.equal(detail.tip, 'Wait a short time and try again.');
+  assert.doesNotMatch(detail.tip, /30 seconds/);
+});
+
+test('quota_exceeded Back to Home behavior is unaffected by the rate_limit change', () => {
+  const detail = makeErrorDetail(new ScanError('quota_exceeded', 'Daily scan limit of 20 reached. Try again tomorrow.'));
+  assert.equal(detail.retryable, false);
+  assert.equal(detail.title, 'Daily Scan Limit Reached');
+});
+
+test('another normal retryable error (network) keeps its existing Try Again behavior', () => {
+  const detail = makeErrorDetail(new ScanError('network', 'No internet connection. Could not reach CoinLens.'));
+  assert.equal(detail.retryable, true);
+  assert.equal(detail.title, 'No Internet');
+});

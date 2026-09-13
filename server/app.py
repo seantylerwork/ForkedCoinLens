@@ -84,11 +84,15 @@ app.logger.setLevel(logging.getLogger("gunicorn.error").level or logging.INFO)
 
 
 class CoinLensError(Exception):
-    def __init__(self, code, message, status=500):
+    def __init__(self, code, message, status=500, details=None):
         super().__init__(message)
         self.code = code
         self.message = message
         self.status = status
+        # Optional extra fields merged into the error response body (e.g.
+        # rate_limit's retry_after_seconds) - never used for anything
+        # sensitive; see error_response().
+        self.details = details or {}
 
 
 def proxy_response(upstream_response):
@@ -112,7 +116,9 @@ def log_mock_response(route):
 
 
 def error_response(error):
-    return jsonify({"error": {"code": error.code, "message": error.message}}), error.status
+    body = {"code": error.code, "message": error.message}
+    body.update(error.details)
+    return jsonify({"error": body}), error.status
 
 
 @app.errorhandler(CoinLensError)
@@ -550,6 +556,20 @@ def _log_openai_error_response(upstream):
     )
 
 
+def _parse_retry_after_seconds(value):
+    """Safely parses OpenAI's `retry-after` header (always sent as an
+    integer number of seconds, not an HTTP-date) into a positive int.
+    Returns None - never raises - for anything absent, non-numeric, or
+    non-positive, so a malformed header can never fail the request."""
+    if value is None:
+        return None
+    try:
+        seconds = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds > 0 else None
+
+
 def identify_coin_with_ai(front_image, back_image=None):
     if not OPENAI_API_KEY:
         raise CoinLensError("key_missing", "Server is missing OPENAI_API_KEY.", 500)
@@ -625,7 +645,12 @@ def identify_coin_with_ai(front_image, back_image=None):
             raise CoinLensError("quota", "AI provider billing limit reached.", 402)
         if upstream.status_code == 429:
             code = "quota" if "quota" in message.lower() or "billing" in message.lower() else "rate_limit"
-            raise CoinLensError(code, "AI provider rate or quota limit reached.", 429)
+            details = {}
+            if code == "rate_limit":
+                retry_after_seconds = _parse_retry_after_seconds(upstream.headers.get("retry-after"))
+                if retry_after_seconds is not None:
+                    details["retry_after_seconds"] = retry_after_seconds
+            raise CoinLensError(code, "AI provider rate or quota limit reached.", 429, details=details)
         raise CoinLensError("upstream_failure", "AI provider request failed.", 502)
 
     text = extract_responses_output_text(data)

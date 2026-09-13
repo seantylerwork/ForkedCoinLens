@@ -44,7 +44,10 @@ function throwForErrorResponse(res, data) {
 
   const code = data?.error?.code || (res.status >= 500 ? "server_error" : "unknown");
   const message = data?.error?.message || `CoinLens request failed (HTTP ${res.status}).`;
-  throw new ScanError(code, message);
+  const retryAfterSeconds = typeof data?.error?.retry_after_seconds === "number"
+    ? data.error.retry_after_seconds
+    : undefined;
+  throw new ScanError(code, message, { retryAfterSeconds });
 }
 
 export function toLegacyScanResult(result) {

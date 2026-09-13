@@ -569,6 +569,116 @@ class CoinLensApiTests(unittest.TestCase):
         self.assertNotIn(fake_base64_blob, log_line)
         self.assertIn("<redacted-base64>", log_line)
 
+    # -- retry_after_seconds: propagating OpenAI's real retry-after header
+    # to Expo so the UI can offer an accurate wait instead of a hardcoded
+    # "30 seconds" regardless of how long OpenAI actually says to wait. ---
+
+    def _post_rate_limited(self, retry_after_header, message="Rate limit reached for gpt-5.6-luna on tokens per min."):
+        headers = {} if retry_after_header is None else {"retry-after": retry_after_header}
+        with mock.patch.object(coinlens_app.requests, "post") as mock_post, \
+             mock.patch.object(coinlens_app, "count_api_usage_since", return_value=0), \
+             mock.patch.object(coinlens_app, "insert_api_usage", return_value={"id": "usage-1"}), \
+             mock.patch.object(coinlens_app, "update_api_usage"):
+            mock_post.return_value = mock.Mock(
+                ok=False,
+                status_code=429,
+                text='{"error": {"message": "%s"}}' % message,
+                headers=headers,
+                json=lambda: {"error": {"message": message}},
+            )
+            return self.client.post(
+                "/api/identify-coin",
+                json={"front_image": JPEG_BASE64, "source": "camera"},
+                headers=self.auth_headers,
+            )
+
+    def test_retry_after_30_seconds_is_propagated(self):
+        self._authenticate()
+        coinlens_app.OPENAI_API_KEY = "test-key"
+        response = self._post_rate_limited("30")
+        body = response.get_json()
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(body["error"]["code"], "rate_limit")
+        self.assertEqual(body["error"]["retry_after_seconds"], 30)
+
+    def test_retry_after_300_seconds_is_propagated(self):
+        self._authenticate()
+        coinlens_app.OPENAI_API_KEY = "test-key"
+        response = self._post_rate_limited("300")
+        body = response.get_json()
+        self.assertEqual(body["error"]["retry_after_seconds"], 300)
+
+    def test_retry_after_11042_seconds_is_propagated(self):
+        """The exact real-world example that prompted this change: a
+        multi-hour retry window, not the old hardcoded '30 seconds'."""
+        self._authenticate()
+        coinlens_app.OPENAI_API_KEY = "test-key"
+        response = self._post_rate_limited("11042")
+        body = response.get_json()
+        self.assertEqual(body["error"]["retry_after_seconds"], 11042)
+
+    def test_missing_retry_after_header_omits_the_field(self):
+        self._authenticate()
+        coinlens_app.OPENAI_API_KEY = "test-key"
+        response = self._post_rate_limited(None)
+        body = response.get_json()
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(body["error"]["code"], "rate_limit")
+        self.assertNotIn("retry_after_seconds", body["error"])
+
+    def test_malformed_retry_after_header_omits_the_field_without_crashing(self):
+        self._authenticate()
+        coinlens_app.OPENAI_API_KEY = "test-key"
+        for malformed_value in ("soon", "", "-5", "3.5", "Wed, 21 Oct 2026 07:28:00 GMT"):
+            with self.subTest(malformed_value=malformed_value):
+                response = self._post_rate_limited(malformed_value)
+                body = response.get_json()
+                self.assertEqual(response.status_code, 429)
+                self.assertEqual(body["error"]["code"], "rate_limit")
+                self.assertNotIn("retry_after_seconds", body["error"])
+
+    def test_rate_limit_response_never_exposes_raw_provider_details(self):
+        """Org/project id, x-request-id, raw body, token counts, and auth
+        info must never reach Expo - those stay in server-side logs only."""
+        self._authenticate()
+        coinlens_app.OPENAI_API_KEY = "test-key"
+        with mock.patch.object(coinlens_app.requests, "post") as mock_post, \
+             mock.patch.object(coinlens_app, "count_api_usage_since", return_value=0), \
+             mock.patch.object(coinlens_app, "insert_api_usage", return_value={"id": "usage-1"}), \
+             mock.patch.object(coinlens_app, "update_api_usage"):
+            mock_post.return_value = mock.Mock(
+                ok=False,
+                status_code=429,
+                text=(
+                    '{"error": {"message": "Rate limit reached for gpt-5.6-luna on tokens per min. '
+                    'Limit 100000, Used 96341, Requested 4085."}}'
+                ),
+                headers={
+                    "retry-after": "11042",
+                    "x-request-id": "req_super_secret_id",
+                    "x-ratelimit-limit-tokens": "100000",
+                    "x-ratelimit-remaining-tokens": "0",
+                    "openai-organization": "org-secretorgid",
+                    "openai-project": "proj-secretprojectid",
+                },
+                json=lambda: {"error": {"message": "Rate limit reached for gpt-5.6-luna on tokens per min."}},
+            )
+            response = self.client.post(
+                "/api/identify-coin",
+                json={"front_image": JPEG_BASE64, "source": "camera"},
+                headers=self.auth_headers,
+            )
+        body = response.get_json()
+
+        self.assertEqual(body["error"], {
+            "code": "rate_limit",
+            "message": "AI provider rate or quota limit reached.",
+            "retry_after_seconds": 11042,
+        })
+        response_text = response.get_data(as_text=True)
+        for leaked in ("req_super_secret_id", "org-secretorgid", "proj-secretprojectid", "96341", "100000", "Bearer test-key"):
+            self.assertNotIn(leaked, response_text)
+
     def test_identify_coin_logs_openai_token_usage_on_success(self):
         self._authenticate()
         coinlens_app.OPENAI_API_KEY = "test-key"

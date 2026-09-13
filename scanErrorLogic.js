@@ -3,9 +3,12 @@
 // be unit tested directly under `node --test`.
 
 class ScanError extends Error {
-  constructor(code, message) {
+  constructor(code, message, details = {}) {
     super(message);
     this.code = code;
+    // OpenAI's real retry-after window, in seconds, for a rate_limit error
+    // (server-provided; undefined when the server didn't include one).
+    this.retryAfterSeconds = details.retryAfterSeconds;
   }
 }
 
@@ -13,7 +16,10 @@ const ERROR_DISPLAY = {
   network: { icon: "!", title: "No Internet", tip: "Make sure WiFi or cellular data is enabled." },
   key_invalid: { icon: "!", title: "Invalid Server Key", tip: "Update the private key in the server environment." },
   key_missing: { icon: "!", title: "Server Key Missing", tip: "Add the private key to the server environment." },
-  rate_limit: { icon: "!", title: "Rate Limit Hit", tip: "Wait 30 seconds and try again." },
+  // tip is always overridden dynamically by describeRateLimit() below,
+  // based on the server's real retry_after_seconds - kept here only for
+  // icon/title consistency with every other entry in this table.
+  rate_limit: { icon: "!", title: "Rate Limit Hit" },
   quota: { icon: "!", title: "Usage Limit Reached", tip: "Check the server provider billing." },
   server_error: { icon: "!", title: "Service Issue", tip: "Try again in a few minutes." },
   upstream_failure: { icon: "!", title: "Service Issue", tip: "Try again in a few minutes." },
@@ -45,9 +51,51 @@ function isRetryableErrorCode(code) {
   return code !== "quota_exceeded";
 }
 
+const SECONDS_PER_MINUTE = 60;
+const SECONDS_PER_HOUR = 3600;
+
+function pluralize(value, unit) {
+  return `${value} ${unit}${value === 1 ? "" : "s"}`;
+}
+
+// Upstream OpenAI 429s can come with a retry-after ranging from a few
+// seconds to multiple hours (the server-side quota reset window) - a
+// short wait is worth sitting through with a retry, but a multi-minute or
+// multi-hour one should send the user back to the app instead of stranding
+// them on a dead-end screen. Never builds a countdown timer, just a
+// one-time human-readable estimate.
+function describeRateLimit(retryAfterSeconds) {
+  if (typeof retryAfterSeconds !== "number" || !Number.isFinite(retryAfterSeconds) || retryAfterSeconds <= 0) {
+    // The server didn't provide a usable retry-after - never claim a
+    // specific wait time we don't actually have.
+    return { tip: "Wait a short time and try again.", retryable: true };
+  }
+
+  if (retryAfterSeconds <= 60) {
+    return {
+      tip: `Try again in about ${pluralize(Math.round(retryAfterSeconds), "second")}.`,
+      retryable: true,
+    };
+  }
+
+  if (retryAfterSeconds < SECONDS_PER_HOUR) {
+    const minutes = Math.max(1, Math.round(retryAfterSeconds / SECONDS_PER_MINUTE));
+    return { tip: `Try again in about ${pluralize(minutes, "minute")}.`, retryable: false };
+  }
+
+  const hours = Math.max(1, Math.round(retryAfterSeconds / SECONDS_PER_HOUR));
+  return { tip: `Try again in about ${pluralize(hours, "hour")}.`, retryable: false };
+}
+
 function makeErrorDetail(e) {
   const code = e instanceof ScanError ? e.code : "unknown";
   const display = ERROR_DISPLAY[code] ?? ERROR_DISPLAY.unknown;
+
+  if (code === "rate_limit") {
+    const { tip, retryable } = describeRateLimit(e.retryAfterSeconds);
+    return { ...display, code, body: "The AI service is temporarily rate limited.", tip, retryable };
+  }
+
   return { ...display, code, body: e.message, retryable: isRetryableErrorCode(code) };
 }
 
@@ -56,4 +104,5 @@ module.exports = {
   ERROR_DISPLAY,
   makeErrorDetail,
   isRetryableErrorCode,
+  describeRateLimit,
 };
