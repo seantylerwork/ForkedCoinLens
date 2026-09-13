@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `f03a54d` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `895ee7b` (origin/seperate).
 
 ---
 
@@ -2056,7 +2056,87 @@ Caveat: this `CASE` is a second, hand-written mirror of the Python branches and 
 
 ---
 
-## 30. Pending external actions
+## 30. Follow-up fix: digit-vs-word denomination consistency (found before backfill/authoritative badges, as intended)
+
+**Trigger**: found during the pre-backfill/pre-authoritative-badges review
+§29b itself called for. §29b's fix left one remaining inconsistency: `"5
+cents"` fell through to the generic slug fallback, but spelled-out `"five
+cents"` still matched a *parallel* word-based check in the nickel branch
+(`"five cent" in text`) and became `"nickel"`. The same foreign coin could
+land in a different, US-specific badge category purely depending on
+whether OpenAI phrased the face value as a digit or a word - unsafe to
+backfill or build authoritative badges on top of.
+
+**Exact prior inconsistency**: the nickel/dime/quarter checks matched
+spelled-out face value (`"five cent"`, `"ten cent"`, `"twenty-five
+cent"`) as if it were an explicit coin-type signal, while the digit form
+had no equivalent check and fell through to the slug fallback - two
+parallel, inconsistent code paths carrying the same information.
+
+**Fix** (`server/app.py`, commit `895ee7b`):
+1. `_normalize_denomination_numbers()` converts spelled-out face-value
+   numbers to digits (longest phrases first, so `"twenty-five"`/`"twenty
+   five"` convert before the `"five"` inside them would) **before any
+   check runs** - `"five cents"` and `"5 cents"` become the identical
+   string, so every later check (including the slug fallback) treats them
+   identically.
+2. `nickel`/`dime`/`quarter` are now recognized **only** by their
+   explicit coin-name word - never by face value, digit or spelled-out,
+   at all. `"1 cent"`/`"one cent"` remains the one explicit numeric
+   exception (unchanged in effect) since that value has no separate US
+   coin name of its own - "penny" is both its name and its value.
+
+**Did country/context have to be added to the function?** No. Removing
+face-value-based inference entirely made the result already
+country-agnostic - a foreign and a US coin at the same face value now
+canonicalize identically unless a coin name is actually given. A genuine
+US nickel/dime is still correctly recognized because real identifications
+name the coin explicitly (`"Jefferson Nickel"`, `"Roosevelt Dime"`),
+confirmed with a direct test. No signature or call-site change was
+needed.
+
+**Canonical results** (digit and word forms, confirmed identical):
+`1 cent`/`one cent` → `penny` (unchanged); `5 cents`/`five cents` →
+`"5-cents"` (both - previously inconsistent); `10 cents`/`ten cents` →
+`"10-cents"`; `25 cents`/`twenty-five cents`/`twenty five cents` →
+`"25-cents"`; explicit `nickel`/`dime`/`quarter`/`penny` → themselves,
+unchanged; `2 dollars` → `dollar`, unchanged.
+
+**Tests**: 131/131 Python passing (127 → 131: one now-outdated test from
+§29b that itself asserted the exact inconsistency being fixed here was
+replaced). 34/34 JS passing (unaffected, no JS touched).
+
+**Not changed** (confirmed): Numista denomination matching, valuation,
+OpenAI prompt, leaderboard architecture, badge thresholds/rules, RLS,
+persistence schema.
+
+**Revised safe backfill recommendation - supersedes §29b's SQL-only
+plan**: with two successive rounds of fixes to this function now in one
+session, a third hand-written SQL mirror of its logic would itself be a
+real drift risk (exactly the caveat §29b already flagged, now doubly
+true). **Recommended approach**: export candidates with a narrow,
+safe, read-only query -
+```sql
+-- Only these four buckets could have been affected by either historical
+-- bug; dollar/half-dollar/wheat-penny/slug rows were never wrong.
+select id, user_id, denomination, coin_name, denom_canonical, scanned_at
+from public.scans
+where denom_canonical in ('penny', 'nickel', 'dime', 'quarter')
+order by scanned_at desc;
+```
+then, for each exported row, recompute `canonicalize_denomination(denomination,
+coin_name)` using the **current, real Python function** (not a SQL
+re-implementation) and compare to the stored `denom_canonical`; only rows
+where they differ get updated, via a small script issuing per-row (or
+batched, values-list-driven) `UPDATE`s built entirely from the script's
+computed results - never a hand-written SQL `CASE`. This is the more
+drift-proof option §29b already flagged as an alternative; it's now the
+primary recommendation rather than a caveat, given the fix has changed
+twice.
+
+---
+
+## 31. Pending external actions
 
 1. ~~Run this in the Supabase SQL editor~~ — **now believed applied**: the
    real scan in §14 ran with `MOCK_MODE` off and reached
@@ -2201,12 +2281,12 @@ Everything through §26 (code, tests, all commits through `88bd7b0`) is
     recommended but **not yet implemented** - a real follow-up task,
     needing a small DB migration plus a Python port of `badges.js`.
 
-21. See §29b - the `canonicalize_denomination` "penny" bug is fixed in
-    code (new scans persist correctly going forward), but **existing bad
-    rows in Supabase have not been touched**. Run the identification
-    SELECT in §29b first to see the real scope, then decide on the
-    backfill (SQL provided, or the safer real-function-based script
-    alternative) before applying anything to production data.
+21. See §30 (supersedes §29b's plan) - `canonicalize_denomination` is now
+    fixed and self-consistent in code (new scans persist correctly going
+    forward), but **existing bad rows in Supabase have not been
+    touched**. Run §30's export query first, recompute each row with the
+    current real Python function, and only then backfill genuine
+    mismatches - do not use §29b's now-superseded SQL `CASE` mirror.
 
 Everything through §29 (code, tests, all commits through `f03a54d`) is
 committed and pushed to `origin/seperate`. §15 (rate limit) + §16
@@ -2217,10 +2297,14 @@ disambiguation), §23 (denomination normalization + issue-level variant
 preference), §24 (diagnostic logging + accurate rejection reasons), §25
 (grade normalization), §26 (low reasoning effort + ai_incomplete), §27
 (issue-classifier keyword gap), §28 (trailing-parenthetical denomination
-titles), and §29b (`canonicalize_denomination` penny-bug fix) are all
-implemented, tested, and pushed. §29a (leaderboard badge architecture) is
-investigated and reported, with a recommended fix **not yet built**. The
-core Numista matching pipeline is validated by at least one fully
-successful real, live scan (Hong Kong $2) - remaining Numista work is
-cleanup on edge cases, not pipeline-blocking bugs; the badge/leaderboard
-work is a separate, still-open architectural item.
+titles), §29b (`canonicalize_denomination` penny-bug fix, superseded by
+§30's further correction), and §30 (digit/word denomination consistency)
+are all implemented, tested, and pushed. §29a (leaderboard badge
+architecture) is investigated and reported, with a recommended fix **not
+yet built**. `canonicalize_denomination` is now believed self-consistent
+enough to safely proceed with the existing-row backfill (§30) and the
+authoritative persisted-badges work (§29a Option B) - both still **not
+yet done**. The core Numista matching pipeline is validated by at least
+one fully successful real, live scan (Hong Kong $2) - remaining Numista
+work is cleanup on edge cases, not pipeline-blocking bugs; the
+badge/leaderboard work is a separate, still-open architectural item.
