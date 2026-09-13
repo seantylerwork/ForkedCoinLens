@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `3378126` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `88bd7b0` (origin/seperate).
 
 ---
 
@@ -1744,7 +1744,87 @@ first to show a real `estimated_value` in the app, not "unavailable."
 
 ---
 
-## 26. Pending external actions
+## 26. Follow-up fix: explicit low reasoning effort + a distinct ai_incomplete error
+
+**Trigger**: an intermittent real-scan failure, independent of §25's price
+fix. `input_tokens=4584, output_tokens=2000, reasoning_tokens=2000,
+total_tokens=6584, response_status=incomplete, http_status=200,
+incomplete_details={"reason":"max_output_tokens"}` - the model's default
+reasoning effort consumed the *entire* `max_output_tokens` budget with
+nothing left for visible JSON. The image was clear; this was never a
+"can't recognize this coin" situation, but the server reported it
+identically to one (`identification_failure` -> "Coin Not Recognized, try
+better lighting"), actively misleading the user about what went wrong.
+
+**Previous reasoning configuration**: absent entirely - the Responses API
+payload in `identify_coin_with_ai` had no `"reasoning"` key at all, so the
+model's default effort applied, whatever that happened to be.
+
+**Exact new OpenAI request field** (`server/app.py`, commit `88bd7b0`):
+```json
+"reasoning": {"effort": "low"}
+```
+added alongside the existing `"max_output_tokens": 2000` (left unchanged,
+deliberately - low reasoning effort is being tested in isolation first,
+before considering raising the cap further).
+
+**Backend error contract for incomplete/max_output_tokens**: a response
+with `status == "incomplete"` and `incomplete_details.reason ==
+"max_output_tokens"` is now detected **before** the generic
+empty-output-text fallback and raises a new, distinct
+`CoinLensError("ai_incomplete", "The AI service couldn't finish
+processing this scan.", 503)` - retryable, never
+`identification_failure`/`unidentifiable`. Any *other* incomplete reason
+(e.g. a hypothetical `content_filter`) still falls through to the
+existing generic handling unchanged - the new branch is scoped
+specifically to the `max_output_tokens` reason this real failure showed,
+not incomplete responses in general. The existing usage log (input/
+output/reasoning tokens, `response_status`, `http_status`,
+`incomplete_details`) is completely untouched, so the real numbers for
+low-reasoning-effort scans stay visible in Render logs going forward -
+this is what will let a future session verify whether low effort actually
+reduced real-world `reasoning_tokens` usage.
+
+**Expo UX for `ai_incomplete`** (`scanErrorLogic.js`): title "AI
+Processing Interrupted", body "The AI service couldn't finish processing
+this scan." (the server's own message, via the existing generic
+`body: e.message` path - no special-case override needed), no tip box,
+automatically retryable (`isRetryableErrorCode` already treats every code
+except `quota_exceeded` as retryable) -> renders "Try Again".
+`ScanScreen.js` needed **zero changes**: button rendering was already
+generic on the existing `retryable` field, exactly as it was for §19's
+`rate_limit` buckets and §11's `quota_exceeded`.
+
+**Genuine unidentifiable behavior preserved**: `normalize_identification`'s
+status/confidence logic and the 422/`unidentifiable`
+"Coin Not Recognized" flow for a real `completed` response with
+`status: "uncertain"` are completely untouched, and now have an explicit
+test (`test_identify_coin_genuine_uncertain_identification_unchanged`)
+asserting they stay distinct from the new `ai_incomplete` path.
+
+**Tests**: 111/111 Python passing (108 → 111: 1 existing test updated to
+assert the corrected `ai_incomplete`/503 behavior instead of the old
+`identification_failure`/422 it used to encode - that test's prior
+expectation *was* this exact bug - plus 2 more new backend tests). 34/34
+JS passing (31 → 34: the AI-processing-interrupted message + retryable,
+no lighting/image/recognition language, and distinct from
+`identification_failure`).
+
+**Confirmed untouched** (re-ran full suites unmodified): model, image
+resolution/preprocessing, structured output schema, identification prompt
+semantics, confidence threshold, Numista (§17/§20/§22-24), grade
+normalization (§25), persistence, quota accounting, auth.
+
+**Not yet done**: not verified against a real OpenAI call in this session
+(no live key here) - the next real scan's Render logs should show whether
+`reasoning_tokens` actually drops with explicit low effort, and, if the
+exhaustion still happens occasionally, the app should now correctly show
+"AI Processing Interrupted" + Try Again instead of the misleading "Coin
+Not Recognized" message.
+
+---
+
+## 27. Pending external actions
 
 1. ~~Run this in the Supabase SQL editor~~ — **now believed applied**: the
    real scan in §14 ran with `MOCK_MODE` off and reached
@@ -1862,14 +1942,23 @@ first to show a real `estimated_value` in the app, not "unavailable."
     or another - this may be the one that finally gets all the way
     through).
 
-Everything through §25 (code, tests, all commits through `3378126`) is
+17. See §26 - watch the next real scan's `[identify] OpenAI usage: ...`
+    log line for whether `reasoning=` actually drops with explicit low
+    effort, and whether the intermittent `max_output_tokens` exhaustion
+    stops recurring. If it still happens occasionally, confirm the app
+    now shows "AI Processing Interrupted" + Try Again, not "Coin Not
+    Recognized".
+
+Everything through §26 (code, tests, all commits through `88bd7b0`) is
 committed and pushed to `origin/seperate`. §15 (rate limit) + §16
 (truncated response) are confirmed fixed by real, non-mock scans; §17-§20
 (Numista matching/pricing, 429 diagnostics, retry_after_seconds, issuer
 resolution), §21 (summary/log-scan fixes), §22 (type-level variant
 disambiguation), §23 (denomination normalization + issue-level variant
-preference), §24 (diagnostic logging + accurate rejection reasons), and
-§25 (grade normalization) are all implemented, tested, and pushed - but
-no real scan has yet shown a confident `estimated_value` end-to-end. The
-next live scan (type 5628 -> issue 144284 -> grade "f" -> price $0.28) is
-the one most likely to finally do so.
+preference), §24 (diagnostic logging + accurate rejection reasons), §25
+(grade normalization), and §26 (low reasoning effort + ai_incomplete) are
+all implemented, tested, and pushed - but no real scan has yet shown a
+confident `estimated_value` end-to-end. The next live scan (type 5628 ->
+issue 144284 -> grade "f" -> price $0.28, now hopefully without an
+intermittent reasoning-exhaustion failure along the way) is the one most
+likely to finally do so.
