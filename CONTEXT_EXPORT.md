@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `41abbf9` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `9bc4a87` (origin/seperate).
 
 ---
 
@@ -1205,7 +1205,59 @@ of this change.
 
 ---
 
-## 19. Pending external actions
+## 19. Follow-up change: propagate OpenAI's real retry-after to the rate_limit UI
+
+**Trigger**: a real OpenAI 429 came back with `retry-after: 11042` (~3
+hours), but the app always said "Wait 30 seconds and try again" regardless
+- a hardcoded, inaccurate wait time for `rate_limit` specifically (not
+`quota_exceeded`, which is CoinLens's own separate daily limit).
+
+**Backend error contract, before vs. after** (`server/app.py`, commit
+`9bc4a87`):
+```
+before: {"error": {"code": "rate_limit", "message": "..."}}
+after:  {"error": {"code": "rate_limit", "message": "...", "retry_after_seconds": 11042}}
+```
+`retry_after_seconds` is present only when OpenAI's `retry-after` header
+parses to a positive integer; otherwise the field is simply absent (never
+`null`, never a guessed value) and every other error's JSON is unchanged.
+`CoinLensError` gained an optional `details` dict merged into the body -
+unused by every other `CoinLensError` call site, so this is additive only.
+
+**UI behavior** (`scanErrorLogic.js`/`src/api/client.js`, `rate_limit`
+only; `ScanScreen.js` needed **zero changes** - its button was already
+driven generically by the existing `retryable` field):
+- `<=60s`: "Try again in about N seconds." + **Try Again**.
+- `>60s, <3600s`: "Try again in about N minutes." + **Back to Home**
+  (existing reset-and-navigate-home path, no API call, no camera reopen).
+- `>=3600s`: "Try again in about N hours." + **Back to Home**.
+- missing/malformed retry-after: "Wait a short time and try again." +
+  **Try Again** (never claims a false specific wait time).
+
+**Confirmed unchanged**: `quota_exceeded` behavior (still its own
+Back-to-Home path, untouched), `DAILY_SCAN_LIMIT`/`api_usage`/quota
+accounting (nothing here touches quota reservation or "refunds" an
+attempt), OpenAI request payload/image preprocessing, auth, persistence,
+Numista, PCGS, mock mode, and the existing §18 429 diagnostic
+header/body logging (left fully intact - this task only adds a second,
+narrower thing derived from the same response: the parsed retry-after,
+returned to Expo rather than only logged server-side).
+
+**Tests**: 67/67 Python passing (61 -> 67, 6 new: 30s/300s/11042s
+propagated, missing/malformed header omits the field without crashing,
+org/project id + x-request-id + raw body + token counts confirmed never
+reaching Expo). 31/31 JS passing (25 -> 31, 6 new: the three time buckets,
+the missing-header fallback, and explicit confirmation that
+`quota_exceeded` and another normal error's behavior are unaffected).
+
+**Not yet done**: not verified against a real OpenAI 429 in this session
+(no live key here) - the next real rate-limit hit should show
+`retry_after_seconds` in the JSON response and the matching bucketed UI
+text/button on device.
+
+---
+
+## 20. Pending external actions
 
 1. ~~Run this in the Supabase SQL editor~~ — **now believed applied**: the
    real scan in §14 ran with `MOCK_MODE` off and reached
@@ -1277,8 +1329,14 @@ of this change.
    window state (remaining requests/tokens, reset timers) rather than just
    passing its unit tests.
 
-Everything through §18 (code, tests, all commits through `41abbf9`) is
+10. See §19 for the `retry_after_seconds`/rate_limit-UI change - watch
+    Render logs and the app for the next real OpenAI 429 to confirm the
+    bucketed wait text and Try Again/Back to Home split actually appear
+    correctly on device.
+
+Everything through §19 (code, tests, all commits through `9bc4a87`) is
 committed and pushed to `origin/seperate`. §15 (rate limit) + §16
 (truncated response) are confirmed fixed by real, non-mock scans; §17
-(Numista matching/pricing) and §18 (429 diagnostics) are implemented and
-pushed but not yet exercised by a real scan/rate-limit hit.
+(Numista matching/pricing), §18 (429 diagnostics), and §19
+(retry_after_seconds propagation) are implemented and pushed but not yet
+exercised by a real scan/rate-limit hit.
