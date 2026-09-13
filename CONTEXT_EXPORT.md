@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `c62706a` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `3378126` (origin/seperate).
 
 ---
 
@@ -1671,7 +1671,80 @@ entirely) conclusively, without further guessing.
 
 ---
 
-## 25. Pending external actions
+## 25. Follow-up fix: Sheldon-scale grade normalization for Numista pricing
+
+**Trigger**: the type/issue matching pipeline finally worked end-to-end
+for real on a live UK 2012 20p scan (type 5628 -> issue 144284, per §24) -
+and that same successful scan surfaced the next bug, in pricing. The AI's
+`estimated_grade` was `"F-12 (visual estimate)"`; Numista's real price
+list for that issue was `g/vg=0.266846, f/vf=0.280911, xf=0.359662,
+au=0.406070, unc=1.160200`. The log showed `"no exact grade match, using
+nearest available: requested_grade='F-12 (visual estimate)'
+used_grade='vf'"` - wrong (should be `f`), silently masked because `f`
+and `vf` happened to be priced identically on this particular coin.
+
+**Root cause**: `fetch_numista_price`'s exact-grade-match loop compared
+the AI's raw grade string against Numista's short grade codes
+(`g`/`vg`/`f`/`vf`/`xf`/`au`/`unc`) via plain lowercase/strip equality -
+no normalization existed at all, so `"f-12 (visual estimate)"` could
+never equal `"f"`, and every real scan fell through to the crude
+"nearest available" fallback (literally `priced[len(priced)//2]`, the
+middle-indexed priced entry - not even a real nearest-by-grade-order
+heuristic).
+
+**Fix** (`server/app.py`, commit `3378126`): `normalize_numista_grade(grade)`
+strips explanatory parenthetical suffixes (`"(visual estimate)"`,
+`"(visual estimate; not professionally certified)"`), then maps to
+Numista's short code primarily via the **Sheldon-scale number** when
+present - numeric bands `1-3 ag, 4-7 g, 8-11 vg, 12-19 f, 20-39 vf,
+40-49 xf, 50-59 au, 60-70 unc` - since the number is the authoritative
+signal (this is *why* `XF-40` and `EF-40`, different letter prefixes for
+the same band, both correctly resolve to `xf` without hardcoding every
+combination). Falls back to a small letter-only alias map
+(`{"ag","g","vg","f","vf","xf","ef":"xf","au","unc","ms":"unc","bu":"unc"}`)
+for numberless grades like bare `"UNC"`. Applying it to an
+already-short code (e.g. `"vf"`) is a safe no-op, so `fetch_numista_price`
+now normalizes **both** the requested grade and each price entry's own
+grade before comparing - guaranteeing the exact-match branch is tried,
+and wins when present, before ever falling back to the nearest-available
+heuristic.
+
+**Normalization mapping** (exactly as specified): `G-4→g, VG-8→vg,
+F-12→f, F-15→f, VF-20/25/30/35→vf, XF-40/45→xf, EF-40/45→xf, AU-50/53/
+55/58→au, MS-60+→unc, UNC→unc, MS-63→unc`.
+
+**Tests added** (`server/tests/test_numista.py`, 6 new): the full
+task-specified grade-form table in one parametrized test; parenthetical-
+suffix stripping specifically; already-short codes as a no-op; blank/`None`
+handling; and - using the real live UK 20p price list verbatim - the
+exact F-12 regression (now correctly selects `"f"` at `0.280911`, not the
+`"vf"` fallback) plus a second grade (`AU-55`) confirming exact-match
+wins generally, not just for this one coin's coincidental price tie.
+
+**Tests**: 108/108 Python passing (102 → 108), 31/31 JS passing
+(unaffected - no JS touched).
+
+**Not changed** (confirmed): Numista search, issuer resolution,
+type/issue matching (§17/§24), variant disambiguation (§22/§23), the
+price endpoint URL itself, OpenAI prompt, auth, quota/rate-limit,
+persistence, frontend.
+
+**Confirms the UK F-12 case now selects Numista `f`**: yes, directly
+verified both via a standalone normalization check across all 19
+task-specified grade forms and via `fetch_numista_price` against the
+real live UK 20p price list, returning `{"grade": "f", "value":
+0.280911, "exact_grade_match": True}` for `"F-12 (visual estimate)"`.
+
+**What this means for the pipeline overall**: with §24's type/issue
+matching confirmed working live, and this grade-normalization fix now
+in place, the full pipeline (search → score → issue match → variant
+disambiguation → **correct grade-matched price**) should be complete for
+a coin like this. The next live UK 20p scan (or similar) should be the
+first to show a real `estimated_value` in the app, not "unavailable."
+
+---
+
+## 26. Pending external actions
 
 1. ~~Run this in the Supabase SQL editor~~ — **now believed applied**: the
    real scan in §14 ran with `MOCK_MODE` off and reached
@@ -1782,14 +1855,21 @@ entirely) conclusively, without further guessing.
     (a shared, currently off-limits function - would need a follow-up
     task scoped to include it).
 
-Everything through §24 (code, tests, all commits through `c62706a`) is
+16. See §25 - grade normalization is now fixed and unit-verified against
+    the real live UK 20p price list, but not yet confirmed by an actual
+    live scan showing a real `estimated_value` in the app (every real
+    scan so far this session has stopped at "unavailable" for one reason
+    or another - this may be the one that finally gets all the way
+    through).
+
+Everything through §25 (code, tests, all commits through `3378126`) is
 committed and pushed to `origin/seperate`. §15 (rate limit) + §16
 (truncated response) are confirmed fixed by real, non-mock scans; §17-§20
 (Numista matching/pricing, 429 diagnostics, retry_after_seconds, issuer
 resolution), §21 (summary/log-scan fixes), §22 (type-level variant
 disambiguation), §23 (denomination normalization + issue-level variant
-preference), and §24 (diagnostic logging + accurate rejection reasons) are
-all implemented, tested, and pushed - but no real scan has yet reached a
-confident valuation end-to-end. The next live scan (type 5628 -> issue
-144284 -> price endpoint expected) is the one most likely to finally do
-so, or to reveal via the new logging exactly why not.
+preference), §24 (diagnostic logging + accurate rejection reasons), and
+§25 (grade normalization) are all implemented, tested, and pushed - but
+no real scan has yet shown a confident `estimated_value` end-to-end. The
+next live scan (type 5628 -> issue 144284 -> grade "f" -> price $0.28) is
+the one most likely to finally do so.
