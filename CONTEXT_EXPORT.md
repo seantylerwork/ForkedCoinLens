@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `895ee7b` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `f7ff5dd` (origin/seperate).
 
 ---
 
@@ -2136,7 +2136,122 @@ twice.
 
 ---
 
-## 31. Pending external actions
+## 31. Follow-up implementation: exact leaderboard badge counts via a trusted backend evaluator (commit `f7ff5dd`)
+
+**Trigger**: direct follow-up to §29a's audit/recommendation. Before this, badges
+were derived-current-state, every category monotonic, no scan delete/edit
+capability existed anywhere, and the recommended architecture was "Option 3"
+(compute exact badge_count live on leaderboard read, via a trusted backend,
+with no persistence) - this section implements exactly that, superseding
+§29a's "Option B" (persisted `badge_count` column) recommendation, which
+would have needed a migration this approach avoids entirely.
+
+**Authoritative badge evaluator - `server/badges.py` (new file)**: a 1:1 port
+of all ~57 rules from `src/badges/badges.js` (same ids, thresholds,
+categories - scan-count, net-worth, membership-age, denomination/type,
+streak, seasonal/date, time-of-day, rapid-scan). `evaluate_badges(scans,
+member_created_at)` returns `(badge_count, earned_badge_ids)`. Confirmed by
+script: badge ids and their order are identical between `badges.py` and
+`badges.js` (57/57, zero diff either direction). The one porting subtlety:
+JS `Date.getDay()` (Sun=0…Sat=6) vs Python `date.weekday()` (Mon=0…Sun=6) -
+handled correctly (`weekday()==4` for Friday the 13th, `weekday()==3` for
+Thanksgiving Thursday), verified against real calendar dates
+(`2024-09-13` = a real Friday the 13th, `2026-11-26` = the actual 4th
+Thursday of November 2026).
+
+**New endpoints (`server/app.py`), both behind `@require_auth` (JWT-only
+identity, `g.user_id`; a client can never supply or spoof another user's
+id)**:
+- `GET /api/badges/me` - fetches the caller's own scans
+  (`fetch_scans_for_user`) and real profile `created_at`
+  (`fetch_profile_created_at`) via the service-role client, runs
+  `evaluate_badges`, returns `{"badge_count": N, "earned_badge_ids": [...]}`.
+  A `?user_id=` query param, if present, is silently ignored - identity comes
+  only from the token.
+- `GET /api/leaderboard` - calls the existing `leaderboard()` RPC
+  (unchanged) via `fetch_leaderboard_rows`, collects every row's `user_id`,
+  fetches all of their scans in **one batched query**
+  (`fetch_scans_for_users`, `user_id=in.(...)`) rather than one query per
+  user, groups by `user_id`, and runs `evaluate_badges` per user using that
+  row's own `member_since` as the trusted membership date. Returns the
+  existing fields (`user_id`, `display_name`, `scan_count`, `total_value`,
+  `avg_value`, `member_since`) plus a new `badge_count` - never the raw scan
+  rows themselves. New `supabase_admin.py` helper functions
+  (`fetch_scans_for_user`, `fetch_scans_for_users`,
+  `fetch_profile_created_at`, `fetch_leaderboard_rows`) all reuse the
+  existing `_request_with_gateway_retry`/`SupabaseAdminError` patterns; both
+  routes return 503 `*_fetch_failed` on any Supabase error rather than a raw
+  500.
+
+**Retained-profile / zero-scans-after-reset scenario handled correctly**:
+`evaluate_badges([], member_created_at)` still awards membership badges from
+the real, unchanged `profiles.created_at` even with an empty scan list -
+covered directly by
+`test_zero_scans_can_still_have_membership_badges` (`server/tests/test_badges.py`).
+This is exactly the behavior the task warned an account with zero scans is
+*not* guaranteed to have zero badges after the planned `scans`/`api_usage`
+reset.
+
+**Frontend**:
+- `src/api/scans.js`'s `fetchLeaderboard()` now calls `apiFetch("/api/leaderboard")`
+  instead of `supabase.rpc("leaderboard")` directly.
+- `src/api/client.js` gained `fetchMyBadges()`, calling `GET /api/badges/me`.
+- `src/screens/leaderboard/LeaderboardScreen.js`: removed the `BADGES`/
+  `tierBadgeCount` import and the `row.isMe ? myBadgeCount : tierBadgeCount(row)`
+  branch entirely (this was the exact root cause §29a diagnosed for the
+  lizard-sees-5/bro-sees-2 mismatch) - every row, viewer's own included, now
+  just reads `row.badge_count` straight from the endpoint.
+- `src/badges/BadgesScreen.js`: now fetches `earned_badge_ids`/`badge_count`
+  from `fetchMyBadges()` on mount instead of running
+  `BADGES.filter(b => b.check(userScans, user))` locally.
+- `src/badges/badges.js`: stripped down to **display metadata only**
+  (`id`/`icon`/`name`/`desc`/`category` per badge, plus `BADGE_CATEGORIES`) -
+  all `check()` predicates and `tierBadgeCount` were deleted. This was a
+  deliberate choice per the task's own guidance ("JS may retain display
+  metadata but should avoid maintaining independent eligibility logic
+  long-term"): keeping a second, unused copy of ~57 predicates around would
+  have been exactly the kind of latent drift risk this session has hit
+  repeatedly elsewhere (denomination canonicalization, issue-keyword
+  matching). `server/badges.py` is now the only place eligibility is
+  decided, in either direction.
+
+**Security properties verified by test** (`server/tests/test_app.py`):
+`/api/badges/me` derives identity only from the JWT (`test_badges_me_requires_auth`,
+`test_badges_me_ignores_a_client_supplied_user_id`); `/api/leaderboard`
+requires auth and never returns raw scan fields
+(`test_leaderboard_never_returns_raw_scan_fields` asserts the response text
+contains none of `denom_canonical`/`estimated_value`/`is_foreign`/
+`local_hour`/`local_date`); the batched (not per-user) scan fetch is
+asserted via a mock call-count check
+(`test_leaderboard_preserves_existing_fields_and_adds_badge_count`); and the
+core regression requirement - **badge_count for a given user is identical
+regardless of which authenticated user is viewing the leaderboard** - is
+directly tested by `test_leaderboard_badge_count_is_independent_of_the_viewer`
+(calls `/api/leaderboard` as two different authenticated users, asserts an
+identical JSON response). Scan RLS is untouched; service-role credentials
+remain backend-only (`supabase_admin.py`, unchanged pattern); no DB
+migration of any kind was needed or made.
+
+**Tests**: 177 Python passing (131 → 177: 37 new direct
+`server/tests/test_badges.py` unit tests across every badge category, 9 new
+`server/tests/test_app.py` endpoint tests). 28 JS passing (`__tests__/badges.test.js`
+rewritten from predicate-behavior tests to metadata-shape tests, since the
+predicates it tested no longer exist client-side).
+
+**Not changed** (confirmed): the `leaderboard()` SQL RPC itself, scan RLS
+policies, `canonicalize_denomination`/Numista/OpenAI pipeline, badge
+id/threshold/category definitions (byte-for-byte preserved, just relocated),
+`require_auth`/`require_user`, service-role credential handling.
+
+**Note - test data reset**: the user plans to delete all rows from
+`public.scans` and `public.api_usage` (keeping `auth.users`/`public.profiles`)
+to validate this end-to-end against fresh data. No code or migration in this
+section depends on or requires that reset; it's a manual validation step,
+not implemented here.
+
+---
+
+## 32. Pending external actions
 
 1. ~~Run this in the Supabase SQL editor~~ — **now believed applied**: the
    real scan in §14 ran with `MOCK_MODE` off and reached
@@ -2275,36 +2390,58 @@ Everything through §26 (code, tests, all commits through `88bd7b0`) is
     circulating-commemorative sibling for any similar title-parsing edge
     case.
 
-20. See §29a - leaderboard badge counts for other users are an
-    intentional-but-approximate placeholder (`tierBadgeCount`), not a
-    bug. Persisting an authoritative `badge_count` (Option B) is
-    recommended but **not yet implemented** - a real follow-up task,
-    needing a small DB migration plus a Python port of `badges.js`.
+20. ~~See §29a - leaderboard badge counts for other users are an
+    intentional-but-approximate placeholder~~ - **implemented, see §31**:
+    `server/badges.py` now computes an exact `badge_count` for every
+    leaderboard row live on read, with no persistence and no migration
+    (Option 3, not §29a's originally-recommended Option B). Still to
+    validate: the user's planned `scans`/`api_usage` reset, then confirm a
+    real multi-user leaderboard shows identical `badge_count` for the same
+    user regardless of viewer (the unit tests already prove this in
+    isolation; a live confirmation is the next real check).
 
 21. See §30 (supersedes §29b's plan) - `canonicalize_denomination` is now
     fixed and self-consistent in code (new scans persist correctly going
     forward), but **existing bad rows in Supabase have not been
     touched**. Run §30's export query first, recompute each row with the
     current real Python function, and only then backfill genuine
-    mismatches - do not use §29b's now-superseded SQL `CASE` mirror.
+    mismatches - do not use §29b's now-superseded SQL `CASE` mirror. The
+    user's planned `scans`/`api_usage` table reset (§31) makes this
+    backfill moot for any rows that get deleted; only relevant if some
+    old rows are kept.
 
-Everything through §29 (code, tests, all commits through `f03a54d`) is
-committed and pushed to `origin/seperate`. §15 (rate limit) + §16
-(truncated response) are confirmed fixed by real, non-mock scans; §17-§20
-(Numista matching/pricing, 429 diagnostics, retry_after_seconds, issuer
-resolution), §21 (summary/log-scan fixes), §22 (type-level variant
-disambiguation), §23 (denomination normalization + issue-level variant
-preference), §24 (diagnostic logging + accurate rejection reasons), §25
-(grade normalization), §26 (low reasoning effort + ai_incomplete), §27
-(issue-classifier keyword gap), §28 (trailing-parenthetical denomination
-titles), §29b (`canonicalize_denomination` penny-bug fix, superseded by
-§30's further correction), and §30 (digit/word denomination consistency)
-are all implemented, tested, and pushed. §29a (leaderboard badge
-architecture) is investigated and reported, with a recommended fix **not
-yet built**. `canonicalize_denomination` is now believed self-consistent
-enough to safely proceed with the existing-row backfill (§30) and the
-authoritative persisted-badges work (§29a Option B) - both still **not
-yet done**. The core Numista matching pipeline is validated by at least
-one fully successful real, live scan (Hong Kong $2) - remaining Numista
-work is cleanup on edge cases, not pipeline-blocking bugs; the
-badge/leaderboard work is a separate, still-open architectural item.
+22. See §31 - the exact-badge-count implementation is code-complete,
+    tested (177 Python / 28 JS), and committed, but not yet confirmed
+    against real post-reset data. Next real check: after the user deletes
+    all `scans`/`api_usage` rows, confirm (a) a brand-new scan still
+    computes badges correctly from a zero-scan baseline, (b) an account
+    with retained membership age still shows its membership badges with
+    zero scans, and (c) the same user's `badge_count` on `/api/leaderboard`
+    matches regardless of which signed-in user is viewing it.
+
+Everything through §30 (code, tests, all commits through `895ee7b`) was
+previously committed and pushed to `origin/seperate`; §31 (exact
+leaderboard badge counts, commit `f7ff5dd`) is implemented, tested, and
+committed - see the header for whether it has been pushed yet. §15 (rate
+limit) + §16 (truncated response) are confirmed fixed by real, non-mock
+scans; §17-§20 (Numista matching/pricing, 429 diagnostics,
+retry_after_seconds, issuer resolution), §21 (summary/log-scan fixes), §22
+(type-level variant disambiguation), §23 (denomination normalization +
+issue-level variant preference), §24 (diagnostic logging + accurate
+rejection reasons), §25 (grade normalization), §26 (low reasoning effort +
+ai_incomplete), §27 (issue-classifier keyword gap), §28
+(trailing-parenthetical denomination titles), §29b
+(`canonicalize_denomination` penny-bug fix, superseded by §30's further
+correction), §30 (digit/word denomination consistency), and §31 (exact,
+live-computed leaderboard badge counts via `server/badges.py`, no
+persistence/migration) are all implemented, tested, and committed.
+`canonicalize_denomination` is now believed self-consistent enough to
+safely proceed with the existing-row backfill (§30) once/if the user
+decides not to simply delete those rows in the planned reset. The core
+Numista matching pipeline is validated by at least one fully successful
+real, live scan (Hong Kong $2) - remaining Numista work is cleanup on edge
+cases, not pipeline-blocking bugs. The badge/leaderboard architecture
+question raised in §29a is now closed: §31 implements the audit's
+recommended "Option 3" (exact, live, unpersisted) end to end; what remains
+is real-data validation against the user's planned test reset, not further
+design or implementation work.
