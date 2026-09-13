@@ -1133,7 +1133,24 @@ def _issue_mint_text(issue):
 # "Proof". Same intent as the type-level looks_special_or_proof/
 # ai_indicates_special_variant pair above - just applied one level down,
 # to an issue's own comment/finish field instead of a type's object_type.
-ISSUE_SPECIAL_KEYWORDS = {"proof", "bu", "specimen", "pattern", "prooflike", "matte"}
+#
+# NOTE: "uncirculated"/"brilliant" were missing from the original keyword
+# set - a real 2016 Canada 5-cent scan showed a "853959 comment=
+# 'Uncirculated'" issue misclassified as ordinary (special=False) as a
+# result, causing it to tie with the genuinely ordinary issue and reject
+# the whole type as ambiguous. This is a Numista *issue-comment* concept
+# (a specific mint/collector product), unrelated to an "AU" (About
+# Uncirculated) *condition grade* the AI assigns to the physical coin -
+# the two must never be conflated (see ai_indicates_special_variant, which
+# only ever looks at the AI's own identification text, never an issue's
+# Numista comment).
+ISSUE_SPECIAL_KEYWORDS = {
+    "proof", "prooflike", "specimen", "bu", "uncirculated", "brilliant", "pattern", "matte",
+}
+# Phrases built from otherwise-generic words ("edition", "set") that are
+# only trustworthy as a special-issue signal together, checked against the
+# whole comment text rather than as individual tokens.
+ISSUE_SPECIAL_PHRASES = ("special edition", "mint set", "proof set")
 
 
 def _issue_special_text(issue):
@@ -1148,10 +1165,15 @@ def _issue_special_text(issue):
 
 def _looks_special_issue(issue):
     """True when an issue's own comment/finish text flags it as a
-    proof/BU/specimen/pattern strike rather than an ordinary one. Matches
-    whole words (not substrings) so a short keyword like "bu" can't
-    false-positive inside an unrelated word."""
-    words = set(re.findall(r"[a-z]+", _issue_special_text(issue)))
+    proof/BU/specimen/uncirculated/special-edition strike rather than an
+    ordinary one. Single keywords match whole words (not substrings), so
+    a short one like "bu" can't false-positive inside an unrelated word;
+    multi-word phrases built from generic words ("special edition") are
+    matched as phrases instead, for the same reason."""
+    text = _issue_special_text(issue)
+    if any(phrase in text for phrase in ISSUE_SPECIAL_PHRASES):
+        return True
+    words = set(re.findall(r"[a-z]+", text))
     return bool(words & ISSUE_SPECIAL_KEYWORDS)
 
 

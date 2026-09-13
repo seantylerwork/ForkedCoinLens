@@ -211,11 +211,56 @@ class IssueMatchingTests(unittest.TestCase):
         self.assertTrue(any("issue_id=520198" in line and "rejected" in line for line in eval_lines))
         self.assertTrue(any("issue_id=180337" in line and "rejected" in line for line in eval_lines))
 
+    # -- Real production case: 2016 Canada 5 cents, type 395. "Uncirculated"
+    # was missing from the special-keyword set, so issue 853959 tied with
+    # the genuinely ordinary 284842 and the whole type got rejected as
+    # ambiguous even though only one issue was actually ordinary. ---------
+
+    CANADA_5C_2016_ISSUES = [
+        {"id": 284842, "year": 2016},
+        {"id": 311832, "year": 2016, "comment": "Specimen"},
+        {"id": 853959, "year": 2016, "comment": "Uncirculated"},
+        {"id": 1104358, "year": 2016, "comment": "Proof"},
+    ]
+
+    def test_canada_2016_5c_regression_selects_ordinary_issue_284842(self):
+        """The AI's grade was AU-55 (About Uncirculated - a condition
+        grade) - this must never be confused with the Numista issue
+        comment "Uncirculated" (a mint/collector product) and must not
+        stop 284842 (the genuinely ordinary issue, blank comment) from
+        winning."""
+        ident = identification(
+            country="Canada", denomination="5 cents", year="2016",
+            estimated_grade="AU-55 (visual estimate; not professionally certified)",
+            description="standard circulation design",
+        )
+        selected, reason = coinlens_app._select_issue_for_year(ident, self.CANADA_5C_2016_ISSUES, type_id=395)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["id"], 284842)
+        self.assertIsNone(reason)
+
     def test_looks_special_issue_matches_whole_words_only(self):
         self.assertTrue(coinlens_app._looks_special_issue({"comment": "Proof"}))
         self.assertTrue(coinlens_app._looks_special_issue({"comment": "BU"}))
-        self.assertFalse(coinlens_app._looks_special_issue({"comment": "About uncirculated"}))
+        # A Numista issue *comment* of "Uncirculated" denotes a specific
+        # mint/collector product (special), not the AI's own "AU"
+        # (About Uncirculated) condition grade - those are unrelated
+        # concepts, and this comment must be treated as special whenever
+        # it appears, "About" or not.
+        self.assertTrue(coinlens_app._looks_special_issue({"comment": "About uncirculated"}))
         self.assertFalse(coinlens_app._looks_special_issue({}))
+
+    def test_looks_special_issue_required_keyword_table(self):
+        """The exact table this task requires classifiers to recognize."""
+        special_comments = [
+            "Proof", "Prooflike", "Proof-like", "Specimen",
+            "Uncirculated", "uncirculated", "Brilliant uncirculated",
+            "Brilliant Uncirculated", "BU", "Special Edition", "Mint Set", "Proof Set",
+        ]
+        for comment in special_comments:
+            with self.subTest(comment=comment):
+                self.assertTrue(coinlens_app._looks_special_issue({"comment": comment}))
+        self.assertFalse(coinlens_app._looks_special_issue({"comment": ""}))
 
 
 class ResolveTypeAndIssueTests(unittest.TestCase):
