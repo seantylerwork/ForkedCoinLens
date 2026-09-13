@@ -1024,6 +1024,56 @@ def _select_issue_for_year(identification, issues):
     return year_matches[0]
 
 
+# ---------------------------------------------------------------------------
+# Variant disambiguation: a real UK 2012 20p scan found THREE candidates all
+# with a valid 2012 issue - a standard circulation type, a non-circulating
+# 1/10oz fine-silver type, and a silver-proof variant of the standard type.
+# The year/issue gate correctly refused to guess between them. For an
+# ordinary circulating coin (the AI didn't say proof/silver/gold/etc.),
+# Numista's own object_type + title already distinguish "the everyday coin"
+# from a collector variant - no extra API calls needed.
+# ---------------------------------------------------------------------------
+
+NUMISTA_STANDARD_CIRCULATION_OBJECT_TYPE = "standard circulation coins"
+
+# Checked against a *candidate's* object_type/title - deliberately narrower
+# than the AI-side keyword list below (no bare "silver"/"gold": plenty of
+# genuinely standard circulating coins are historically silver or gold, so
+# only the more specific collector/bullion phrasing counts here).
+NUMISTA_CANDIDATE_SPECIAL_KEYWORDS = ("proof", "fine silver", "fine gold", "bullion", "specimen", "commemorative", "platinum")
+
+# Checked against the AI's own identification text - a live AI describing an
+# ordinary coin it's looking at essentially never says "silver"/"gold"
+# unless the coin actually is one, so the fuller word list is safe here.
+AI_SPECIAL_VARIANT_KEYWORDS = ("proof", "silver", "gold", "platinum", "bullion", "specimen", "commemorative")
+
+
+def looks_special_or_proof(candidate):
+    """True when a Numista candidate is a proof/precious-metal/
+    non-circulating/commemorative variant rather than an ordinary
+    circulation strike - based only on object_type/title fields Numista's
+    search already returns, no extra API calls."""
+    if not isinstance(candidate, dict):
+        return False
+    object_type = candidate.get("object_type")
+    object_type_name = _text_of(object_type.get("name")) if isinstance(object_type, dict) else ""
+    if object_type_name and object_type_name != NUMISTA_STANDARD_CIRCULATION_OBJECT_TYPE:
+        return True
+    title = _text_of(candidate.get("title"))
+    return any(keyword in title for keyword in NUMISTA_CANDIDATE_SPECIAL_KEYWORDS)
+
+
+def ai_indicates_special_variant(identification):
+    """True when the AI's own identification explicitly points at a
+    proof/precious-metal/commemorative strike, in which case we must not
+    assume "ordinary circulation coin" on its behalf."""
+    text = " ".join(
+        _text_of(identification.get(field))
+        for field in ("description", "special_notes", "coin_name", "varieties", "estimated_grade")
+    )
+    return any(keyword in text for keyword in AI_SPECIAL_VARIANT_KEYWORDS)
+
+
 def resolve_numista_type_and_issue(identification, candidates):
     """Scores every candidate type (logging the full breakdown for each -
     not just the winner - so a real search response can be diagnosed as a
@@ -1085,6 +1135,24 @@ def resolve_numista_type_and_issue(identification, candidates):
             len(to_inspect),
         )
         return None, None
+
+    # Variant disambiguation: only when there's still a tie AND the AI
+    # didn't itself flag a proof/precious-metal/commemorative coin. Never
+    # applied to break a tie the AI's own words argue against, and never
+    # applied to reject the year/issue check's own result - if it leaves
+    # zero or one standard-circulation candidate, that's the new decision;
+    # if it can't narrow anything (no standard match at all), the original
+    # matches are left untouched for the ambiguity check below.
+    if len(matches) > 1 and not ai_indicates_special_variant(identification):
+        standard_matches = [(c, i) for c, i in matches if not looks_special_or_proof(c)]
+        if standard_matches:
+            app.logger.info(
+                "[numista] variant disambiguation: preferring %d standard-circulation candidate(s), "
+                "deprioritizing special-variant match(es): %s",
+                len(standard_matches),
+                [(c.get("id"), c.get("title")) for c, i in matches if looks_special_or_proof(c)],
+            )
+            matches = standard_matches
 
     if len(matches) > 1:
         app.logger.info(

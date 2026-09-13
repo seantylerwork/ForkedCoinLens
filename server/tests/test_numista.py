@@ -189,6 +189,120 @@ class ResolveTypeAndIssueTests(unittest.TestCase):
         self.assertIsNone(issue)
 
 
+class VariantDisambiguationTests(unittest.TestCase):
+    """Real production case: a 2012 UK 20 pence scan returned three
+    candidates that all had a valid 2012 issue - a standard circulation
+    type, a non-circulating 1/10oz fine-silver type, and a silver-proof
+    variant. The year/issue gate correctly refused to guess. These cover
+    preferring the ordinary circulation type using only object_type/title
+    fields Numista already returns - never weakening the year/issue gate
+    itself, and never guessing when the AI actually flagged something
+    special or when circulation candidates themselves remain tied."""
+
+    UK_20P_CANDIDATES = [
+        {
+            "id": 29106, "title": "20 Pence - Elizabeth II (4th portrait; 1/10 oz Fine Silver)",
+            "issuer": {"name": "United Kingdom"}, "object_type": {"id": 3, "name": "Non-circulating coins"},
+        },
+        {
+            "id": 5628, "title": "20 Pence - Elizabeth II (4th portrait; Royal Shield)",
+            "issuer": {"name": "United Kingdom"}, "object_type": {"id": 1, "name": "Standard circulation coins"},
+        },
+        {
+            "id": 208022, "title": "20 Pence - Elizabeth II (4th portrait; Royal Shield, Silver Proof)",
+            "issuer": {"name": "United Kingdom"}, "object_type": {"id": 3, "name": "Non-circulating coins"},
+        },
+    ]
+
+    def _all_candidates_have_a_2012_issue(self, type_id):
+        return [{"id": f"iss-{type_id}-2012", "year": 2012}]
+
+    def test_uk_2012_20p_regression_prefers_standard_circulation_type_5628(self):
+        ident = identification(
+            country="United Kingdom", denomination="20 pence", year="2012",
+            estimated_grade="VF-30", description="An ordinary seven-sided circulating coin.",
+        )
+        with mock.patch.object(coinlens_app, "fetch_numista_issues", side_effect=self._all_candidates_have_a_2012_issue):
+            best, issue = coinlens_app.resolve_numista_type_and_issue(ident, self.UK_20P_CANDIDATES)
+
+        self.assertIsNotNone(best)
+        self.assertEqual(best["id"], 5628)
+        self.assertEqual(issue["id"], "iss-5628-2012")
+
+    def test_ai_explicitly_saying_silver_proof_does_not_auto_select_circulation(self):
+        ident = identification(
+            country="United Kingdom", denomination="20 pence", year="2012",
+            description="This looks like a silver proof striking with mirrored fields.",
+        )
+        with mock.patch.object(coinlens_app, "fetch_numista_issues", side_effect=self._all_candidates_have_a_2012_issue):
+            best, issue = coinlens_app.resolve_numista_type_and_issue(ident, self.UK_20P_CANDIDATES)
+
+        # Must NOT silently land on the standard-circulation type just
+        # because it's one of the tied candidates.
+        self.assertNotEqual((best or {}).get("id"), 5628)
+        self.assertIsNone(best)
+        self.assertIsNone(issue)
+
+    def test_two_standard_circulation_candidates_still_tied_remain_unavailable(self):
+        candidate_a = {
+            "id": 1, "title": "20 Pence - Elizabeth II (Type A)",
+            "issuer": {"name": "United Kingdom"}, "object_type": {"name": "Standard circulation coins"},
+        }
+        candidate_b = {
+            "id": 2, "title": "20 Pence - Elizabeth II (Type B)",
+            "issuer": {"name": "United Kingdom"}, "object_type": {"name": "Standard circulation coins"},
+        }
+        ident = identification(country="United Kingdom", denomination="20 pence", year="2012")
+        with mock.patch.object(coinlens_app, "fetch_numista_issues", side_effect=self._all_candidates_have_a_2012_issue):
+            best, issue = coinlens_app.resolve_numista_type_and_issue(ident, [candidate_a, candidate_b])
+
+        self.assertIsNone(best)
+        self.assertIsNone(issue)
+
+    def test_wrong_year_rejection_is_unaffected_by_variant_disambiguation(self):
+        """The standard-circulation type itself has no 2012 issue (only the
+        proof variant does) - it must still be rejected by the year check,
+        not force-selected just because it's "the ordinary one"."""
+        candidates = [
+            {
+                "id": 5628, "title": "20 Pence - Elizabeth II (4th portrait; Royal Shield)",
+                "issuer": {"name": "United Kingdom"}, "object_type": {"name": "Standard circulation coins"},
+            },
+            {
+                "id": 208022, "title": "20 Pence - Elizabeth II (4th portrait; Royal Shield, Silver Proof)",
+                "issuer": {"name": "United Kingdom"}, "object_type": {"name": "Non-circulating coins"},
+            },
+        ]
+
+        def fake_issues(type_id):
+            if type_id == 5628:
+                return [{"id": "iss-5628-2015", "year": 2015}]  # no 2012 issue
+            return [{"id": "iss-208022-2012", "year": 2012}]
+
+        ident = identification(country="United Kingdom", denomination="20 pence", year="2012")
+        with mock.patch.object(coinlens_app, "fetch_numista_issues", side_effect=fake_issues):
+            best, issue = coinlens_app.resolve_numista_type_and_issue(ident, candidates)
+
+        self.assertEqual(best["id"], 208022)
+        self.assertEqual(issue["id"], "iss-208022-2012")
+
+    def test_looks_special_or_proof_classifies_by_object_type(self):
+        self.assertTrue(coinlens_app.looks_special_or_proof({"title": "20 Pence", "object_type": {"name": "Non-circulating coins"}}))
+        self.assertFalse(coinlens_app.looks_special_or_proof({"title": "20 Pence", "object_type": {"name": "Standard circulation coins"}}))
+
+    def test_looks_special_or_proof_classifies_by_title_keywords(self):
+        self.assertTrue(coinlens_app.looks_special_or_proof({"title": "1 Dollar - Proof"}))
+        self.assertTrue(coinlens_app.looks_special_or_proof({"title": "20 Pence (1/4 oz Fine Gold)"}))
+        # A bare metal word alone (no object_type given) is not enough -
+        # plenty of ordinary historical circulation coins are gold/silver.
+        self.assertFalse(coinlens_app.looks_special_or_proof({"title": "Sixpence - George VI (Silver)"}))
+
+    def test_ai_indicates_special_variant_reads_description(self):
+        self.assertTrue(coinlens_app.ai_indicates_special_variant(identification(description="A gold commemorative issue.")))
+        self.assertTrue(coinlens_app.ai_indicates_special_variant(identification(special_notes="Appears to be a proof strike.")))
+        self.assertFalse(coinlens_app.ai_indicates_special_variant(identification(description="An ordinary circulating coin.")))
+
+
 class FetchNumistaPriceTests(unittest.TestCase):
     def test_requests_the_issue_scoped_price_endpoint(self):
         """Numista v3 prices a specific issue, not a whole type - regression
