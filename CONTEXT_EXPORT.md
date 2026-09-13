@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `1d07df6` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `41abbf9` (origin/seperate).
 
 ---
 
@@ -1132,7 +1132,80 @@ before the substring check.
 
 ---
 
-## 18. Pending external actions
+## 18. Follow-up change: diagnostics for OpenAI 429/error responses
+
+**Trigger**: explicit follow-up request to improve diagnostics for
+upstream OpenAI non-2xx responses (429 especially), without changing
+retry behavior or the user-facing API contract. Prior to this, a 429 from
+OpenAI logged nothing at all beyond the generic `CoinLensError` - the
+existing `[identify] OpenAI usage` log line only fires when a `usage`
+field is present in the response body, and a rejected/rate-limited
+request typically has no `usage` field (the request never got processed).
+
+**Fix** (`server/app.py`, commit `41abbf9`, pushed): added
+`_log_openai_error_response(upstream)`, called immediately after the
+`requests.post` call whenever `not upstream.ok` - **before** the
+`upstream.json()` parse step, so it still logs even for a non-JSON error
+body (a plain-text gateway error, for example). Logs:
+- HTTP status code.
+- Only the standard OpenAI rate-limit headers that are actually present
+  (`x-request-id`, `x-ratelimit-limit-requests`,
+  `x-ratelimit-remaining-requests`, `x-ratelimit-reset-requests`,
+  `x-ratelimit-limit-tokens`, `x-ratelimit-remaining-tokens`,
+  `x-ratelimit-reset-tokens`, `retry-after`) - never a synthesized `None`
+  entry for one that wasn't sent.
+- A sanitized/truncated response body (`OPENAI_LOG_BODY_CHARS = 1500`,
+  matching the truncation length already used for Numista logging
+  elsewhere in this file) - with a defense-in-depth regex redaction of any
+  long base64-looking run (100+ base64 characters) as `<redacted-base64>`,
+  in case an error body ever echoed request content back.
+
+**Explicitly unchanged, per the brief**: the 401/402/429 ->
+`key_invalid`/`quota`/`rate_limit` mapping logic, retry behavior (there is
+none here, same as before), and every other part of the
+`/api/identify-coin` contract. This is purely an additive diagnostic log
+statement.
+
+**Never logs**: the `Authorization` header, `OPENAI_API_KEY`, or any
+request payload (front/back image data) - the logging function only ever
+reads from the *response* object (`upstream.status_code`/`.headers`/
+`.text`), never touches the request side at all, so there's no code path
+by which a secret or an image could reach this log line.
+
+**Tests added** (`server/tests/test_app.py`):
+- `test_identify_coin_logs_openai_429_headers_and_body` - all 8 rate-limit
+  headers present on a real 429 all appear in the log line, verbatim.
+- `test_identify_coin_openai_error_logging_omits_absent_headers` - only
+  `retry-after` sent -> only `retry-after` appears in the log; none of the
+  other 7 header names appear.
+- `test_identify_coin_openai_error_logging_never_leaks_secrets_or_images` -
+  a distinctive API key value and a 500-character fake base64 blob (both
+  intentionally set up to be present in the mocked response/environment)
+  never appear in the log line verbatim; the blob shows up redacted as
+  `<redacted-base64>` instead.
+- Also **fixed** a latent gap in the pre-existing
+  `test_identify_coin_openai_rate_limit_returns_429`: its mock `Response`
+  never set `.text`/`.headers`, so accessing `.text` returned an
+  auto-generated `Mock` object instead of a string - once the new logging
+  code actually read `.text`, this crashed with a generic 500 instead of
+  the expected 429. This was a test-mock gap, not a real code bug (a real
+  `requests.Response` always has string `.text` and a real `.headers`
+  dict); fixed by setting both explicitly on the mock.
+
+**Tests**: 61/61 Python passing (58 -> 61), 25/25 JS passing (unaffected -
+no JS files touched).
+
+**Not yet done**: not verified against a real OpenAI 429 in this session
+(would need to actually trigger one against the live low-tier account
+again) - the next real rate-limit hit should now show a
+`[identify] OpenAI error response: http_status=429 headers={...}
+body=...` line in Render logs with the account's real rate-limit window
+state (remaining requests/tokens, reset timers), which is the whole point
+of this change.
+
+---
+
+## 19. Pending external actions
 
 1. ~~Run this in the Supabase SQL editor~~ — **now believed applied**: the
    real scan in §14 ran with `MOCK_MODE` off and reached
@@ -1198,8 +1271,14 @@ before the substring check.
    and fix (the "estimated value not available" question) and its "exact
    next real coin test to perform" section.
 
-Everything through §16 (code, tests, all commits through `8d104f0`) is
-committed and pushed to `origin/seperate`, and §15 (rate limit) + §16
-(truncated response) are now both confirmed fixed by real, non-mock scans
-rather than just unit tests. §17 (Numista matching/pricing fix, `1d07df6`)
-is committed locally but **not yet pushed**.
+9. Watch Render logs for the next real OpenAI 429 for the new
+   `[identify] OpenAI error response: ...` line (§18) - confirms the
+   header/body diagnostics actually surface the account's real rate-limit
+   window state (remaining requests/tokens, reset timers) rather than just
+   passing its unit tests.
+
+Everything through §18 (code, tests, all commits through `41abbf9`) is
+committed and pushed to `origin/seperate`. §15 (rate limit) + §16
+(truncated response) are confirmed fixed by real, non-mock scans; §17
+(Numista matching/pricing) and §18 (429 diagnostics) are implemented and
+pushed but not yet exercised by a real scan/rate-limit hit.
