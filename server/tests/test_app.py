@@ -1076,14 +1076,66 @@ class CanonicalizeDenominationTests(unittest.TestCase):
         self.assertNotEqual(coinlens_app.canonicalize_denomination("10 cents", ""), "penny")
         self.assertNotEqual(coinlens_app.canonicalize_denomination("25 cents", ""), "penny")
 
-    def test_spelled_out_five_cents_still_maps_to_nickel(self):
-        # Unchanged, pre-existing behavior (the nickel branch itself was
-        # never touched) - spelled-out "five cent(s)" was always an
-        # explicit nickel signal in this taxonomy, unlike the bare digit
-        # form "5 cents", which has no explicit US-coin signal at all and
-        # correctly falls through to the generic slug fallback instead.
-        self.assertEqual(coinlens_app.canonicalize_denomination("five cents", ""), "nickel")
-        self.assertEqual(coinlens_app.canonicalize_denomination("nickel", ""), "nickel")
+    # -- Real production follow-up: the previous fix left an inconsistency
+    # - "5 cents" fell through to a generic slug, but spelled-out "five
+    # cents" still matched a parallel word-based check and became
+    # "nickel". The same foreign coin must not earn a different (US-
+    # specific) badge category depending only on whether OpenAI phrased
+    # the face value as a digit or a word. Fixed by normalizing spelled-
+    # out numbers to digits before any check runs, and by only ever
+    # recognizing nickel/dime/quarter from an explicit coin-name word -
+    # never from face value, digit or spelled-out, alone.
+
+    def test_digit_and_word_face_values_are_now_equivalent(self):
+        pairs = [
+            ("5 cents", "five cents"),
+            ("10 cents", "ten cents"),
+            ("25 cents", "twenty-five cents"),
+            ("25 cents", "twenty five cents"),
+            ("1 cent", "one cent"),
+        ]
+        for digit_form, word_form in pairs:
+            with self.subTest(digit_form=digit_form, word_form=word_form):
+                self.assertEqual(
+                    coinlens_app.canonicalize_denomination(digit_form, ""),
+                    coinlens_app.canonicalize_denomination(word_form, ""),
+                )
+
+    def test_face_value_alone_never_implies_nickel_dime_or_quarter(self):
+        for denom in ("5 cents", "five cents", "10 cents", "ten cents", "25 cents", "twenty-five cents"):
+            with self.subTest(denom=denom):
+                result = coinlens_app.canonicalize_denomination(denom, "")
+                self.assertNotIn(result, ("penny", "nickel", "dime", "quarter"))
+
+    def test_foreign_context_does_not_change_the_result(self):
+        # canonicalize_denomination doesn't need country/context at all -
+        # removing face-value inference entirely made the result already
+        # country-agnostic, so a "Canada"/"foreign" coin_name changes
+        # nothing here.
+        self.assertEqual(
+            coinlens_app.canonicalize_denomination("5 cents", "Canada 5 Cents"),
+            coinlens_app.canonicalize_denomination("five cents", "Canada Five Cents"),
+        )
+        self.assertEqual(
+            coinlens_app.canonicalize_denomination("10 cents", "Canada 10 Cents"),
+            coinlens_app.canonicalize_denomination("ten cents", "Canada Ten Cents"),
+        )
+        self.assertEqual(
+            coinlens_app.canonicalize_denomination("25 cents", "Foreign 25 Cents"),
+            coinlens_app.canonicalize_denomination("twenty-five cents", "Foreign Twenty-Five Cents"),
+        )
+
+    def test_explicit_coin_name_words_still_recognized(self):
+        for denom, expected in (("nickel", "nickel"), ("dime", "dime"), ("quarter", "quarter"), ("penny", "penny")):
+            with self.subTest(denom=denom):
+                self.assertEqual(coinlens_app.canonicalize_denomination(denom, ""), expected)
+
+    def test_genuine_us_coin_still_recognized_via_explicit_coin_name(self):
+        # A real US nickel/dime is still correctly tagged - not via face
+        # value, but because a real identification names the coin
+        # explicitly (as US coin identifications naturally do).
+        self.assertEqual(coinlens_app.canonicalize_denomination("5 cents", "Jefferson Nickel"), "nickel")
+        self.assertEqual(coinlens_app.canonicalize_denomination("10 cents", "Roosevelt Dime"), "dime")
 
     def test_2_dollars_still_maps_to_dollar(self):
         self.assertEqual(coinlens_app.canonicalize_denomination("2 dollars", ""), "dollar")

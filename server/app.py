@@ -1719,34 +1719,59 @@ def build_coinlens_result(front_image, back_image=None):
 # Authoritative persistence (M3)
 # ---------------------------------------------------------------------------
 
+# Converts a spelled-out face-value number to digits before
+# canonicalize_denomination runs any check, so "five cents" and "5 cents"
+# (or "ten cents"/"10 cents", "twenty-five cents"/"25 cents") are always
+# handled identically. Previously the nickel/dime/quarter checks matched
+# spelled-out face value ("five cent", "ten cent", "twenty-five cent") as
+# if it were an explicit coin-type signal, while the digit form ("5
+# cents") fell through to the generic slug fallback - the same foreign
+# denomination could earn a different (US-specific) badge category
+# depending only on whether OpenAI phrased the number as a word or a
+# digit. Longest phrases first so "twenty-five"/"twenty five" convert
+# before the bare "five" inside them would.
+_DENOM_WORD_TO_DIGIT = {
+    "twenty-five": "25", "twenty five": "25",
+    "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10", "fifty": "50",
+}
+_DENOM_WORD_TO_DIGIT_BY_LENGTH = sorted(_DENOM_WORD_TO_DIGIT.items(), key=lambda kv: -len(kv[0]))
+
+
+def _normalize_denomination_numbers(text):
+    for word, digit in _DENOM_WORD_TO_DIGIT_BY_LENGTH:
+        text = re.sub(rf"\b{re.escape(word)}\b", digit, text)
+    return text
+
+
 def canonicalize_denomination(denomination, coin_name):
-    text = f"{denomination or ''} {coin_name or ''}".lower()
+    """Buckets a coin's denomination into the badge taxonomy's vocabulary.
+    Never infers a US-specific coin type (nickel/dime/quarter) from face
+    value alone - only from an explicit coin-name word - so a foreign 5c/
+    10c/25c coin can't earn a US-specific badge just because its value
+    happens to match a US coin's value; a genuine US nickel/dime/quarter
+    is still recognized because real US coin identifications name the
+    coin explicitly (e.g. "Jefferson Nickel", "Roosevelt Dime"). "1
+    cent"/"one cent" remains the one explicit numeric exception, since
+    that value has no separate US coin name of its own - "penny" is both
+    its face value and its name."""
+    normalized_denomination = _normalize_denomination_numbers((denomination or "").lower())
+    text = f"{normalized_denomination} {(coin_name or '').lower()}"
     if "wheat" in text:
         return "wheat-penny"
-    # "cent" alone used to match here - a substring of "cents" - so ANY
-    # "N cents" denomination (Canada/Australia 5c, 10c, 25c, ...) was
-    # misclassified as "penny" before the more specific nickel/dime/
-    # quarter checks below ever got a chance. Only the literal word
-    # "penny", or a numeric value of exactly 1 ("1 cent"/"one cent" - the
-    # US penny), should land here; "5 cents"/"10 cents"/"25 cents" etc.
-    # without an explicit "nickel"/"dime"/"quarter" (or spelled-out
-    # "five/ten/twenty-five cent") now correctly fall through to the
-    # generic slug fallback below - matching the documented intent that a
-    # non-explicit foreign denomination shouldn't match a US-specific
-    # badge at all, rather than being force-mapped into a US-coin bucket.
-    if "penny" in text or re.search(r"\b(?:1|one)\s+cents?\b", text):
+    if "penny" in text or re.search(r"\b1\s+cents?\b", text):
         return "penny"
-    if "nickel" in text or "five cent" in text:
+    if "nickel" in text:
         return "nickel"
-    if "dime" in text or "ten cent" in text:
+    if "dime" in text:
         return "dime"
-    if "quarter" in text or "twenty-five cent" in text or "twenty five cent" in text:
+    if "quarter" in text:
         return "quarter"
     if "half dollar" in text or "half-dollar" in text:
         return "half-dollar"
     if "dollar" in text:
         return "dollar"
-    slug = re.sub(r"[^a-z0-9]+", "-", (denomination or "").lower()).strip("-")
+    slug = re.sub(r"[^a-z0-9]+", "-", normalized_denomination).strip("-")
     return slug or None
 
 
