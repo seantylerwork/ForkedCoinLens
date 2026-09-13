@@ -936,11 +936,13 @@ no JS files touched).
    `issuer.name`/`min_year`/`max_year` present and used correctly to score
    candidates — see the `[numista] search response`/`top candidates` log
    lines in §14). **Still unconfirmed**: the type-detail fetch and the
-   `/types/{id}/prices` endpoint's shape (`prices[].grade`/`.price`), since
-   that scan never reached a confident match (top two candidates tied at
-   score 3, so valuation correctly reported "unavailable" and neither
-   endpoint was called). Needs a scan that gets an unambiguous top Numista
-   match to exercise those two endpoints for real.
+   `/types/{id}/prices` endpoint's shape (`prices[].grade`/`.price`). A
+   second real scan (§16 verification, a 2012 UK 20p with reverse damage)
+   again never reached a confident match (top score only 2, below the
+   ambiguity threshold of 3 - even lower confidence than §14's tie at 3),
+   so neither endpoint has been exercised for real yet across two separate
+   scans. Needs a scan of a common, undamaged coin to get an unambiguous
+   top Numista match and exercise those two endpoints for real.
 
 3. Also check whether the illegible-year case (§8) now comes back with a
    confidence that actually reads as low/uncertain rather than a high
@@ -967,17 +969,19 @@ no JS files touched).
    hit a *different* bug (§16: truncated/empty response from
    `max_output_tokens` being too low), now also fixed but unverified.
 
-7. Watch Render logs for the next `[identify] OpenAI usage: ...` line (§16)
-   for a `reasoning=` value and confirm the response completes instead of
-   truncating again at `output_tokens=2000`. If it still truncates exactly
-   at the new cap, raise `max_output_tokens` further (checking the TPM math
-   against §15) or revisit a `reasoning.effort` parameter once the
-   configured `OPENAI_MODEL` is confirmed to support it.
+7. ~~Watch Render logs for the next `[identify] OpenAI usage: ...` line
+   (§16) for a `reasoning=` value~~ — **confirmed fixed**: the very next
+   real scan (2012 UK 20 pence) completed successfully:
+   `output_tokens=947 (reasoning=720) total_tokens=5531
+   response_status=completed`. This is a direct confirmation of the §16
+   theory - reasoning spent 720 of the 947 output tokens, leaving 227 for
+   the actual JSON answer, comfortably inside the new 2000 cap (vs. the
+   old 1000 cap, which the reasoning tokens alone would have blown through
+   on their own). Identification, Numista lookup (no confident match, so
+   correctly "unavailable"), and scan persistence all completed normally
+   end-to-end with no errors.
 
-Everything through §9 (code, tests, eight commits, push), the §11
-quota-exceeded UI fix (`f8038a3`), §13 (camera focus, `fca1065`), §14
-(Supabase gateway retry, `11fc045`), and §15 (image resize + OpenAI usage
-logging, `5992a54`, plus its context-export commit `e159aaf`) are all
-committed and pushed to `origin/seperate`. §16 (raised `max_output_tokens`
-+ reasoning-token/incomplete-details logging) is implemented but **not yet
-committed or pushed**.
+Everything through §16 (code, tests, all commits through `870dae7`) is
+committed and pushed to `origin/seperate`, and §15 (rate limit) + §16
+(truncated response) are now both confirmed fixed by real, non-mock scans
+rather than just unit tests.
