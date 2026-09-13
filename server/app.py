@@ -1129,7 +1129,7 @@ def _looks_special_issue(issue):
     return bool(words & ISSUE_SPECIAL_KEYWORDS)
 
 
-def _select_issue_for_year(identification, issues):
+def _select_issue_for_year(identification, issues, type_id=None):
     """Among a type's issues, finds one matching the identified year. Mint
     mark (when the AI reported one) disambiguates first, never as a hard
     requirement. If several same-year issues remain and the AI didn't
@@ -1137,35 +1137,68 @@ def _select_issue_for_year(identification, issues):
     flagged special in their own comment/finish text - but only when
     exactly one ordinary issue remains; if issues are still tied (multiple
     ordinary ones, or the AI *did* flag something special and more than
-    one candidate remains), returns None rather than guessing, exactly
-    like the type-level ambiguity guard."""
+    one candidate remains), returns (None, reason) rather than guessing,
+    exactly like the type-level ambiguity guard.
+
+    Returns (selected_issue_or_None, reason). `reason` is None on success,
+    or a short string naming the actual predicate that failed - a caller
+    logging a single generic "no issue matches year" for every failure
+    mode (year, mint, or variant ambiguity) was shown by a real scan to be
+    actively misleading when the year *did* match. `type_id` is optional,
+    used only to tag the per-issue diagnostic log lines below.
+
+    Diagnostic logging (kept, not just temporary - concise and has proven
+    useful for diagnosing a live mismatch unit tests didn't catch): logs
+    one line per year-matching issue with every predicate this function
+    actually evaluates, plus whether that issue was the one accepted."""
     year_text = _text_of(identification.get("year"))
     year_matches = [issue for issue in (issues or []) if _issue_matches_year(issue, year_text)]
     if not year_matches:
-        return None
-    if len(year_matches) == 1:
-        return year_matches[0]
+        return None, "no issue matches year"
 
     mint_mark = _text_of(identification.get("mint_mark"))
-    if mint_mark:
-        mint_matches = [issue for issue in year_matches if mint_mark in _issue_mint_text(issue)]
+    ai_special = ai_indicates_special_variant(identification)
+
+    candidates = year_matches
+    selected = None
+    reason = None
+
+    if len(candidates) > 1 and mint_mark:
+        mint_matches = [issue for issue in candidates if mint_mark in _issue_mint_text(issue)]
         if len(mint_matches) == 1:
-            return mint_matches[0]
-        if mint_matches:
-            year_matches = mint_matches
+            selected = mint_matches[0]
+        elif mint_matches:
+            candidates = mint_matches
 
-    if len(year_matches) == 1:
-        return year_matches[0]
+    if selected is None:
+        if len(candidates) == 1:
+            selected = candidates[0]
+        elif ai_special:
+            # The AI itself flagged proof/BU/special - never force-pick
+            # "the ordinary one" on its behalf; still ambiguous.
+            reason = "year matched but AI indicated a special issue and multiple candidates remain ambiguous"
+        else:
+            ordinary_matches = [issue for issue in candidates if not _looks_special_issue(issue)]
+            if len(ordinary_matches) == 1:
+                selected = ordinary_matches[0]
+            elif len(ordinary_matches) > 1:
+                reason = "year matched but multiple ordinary issues remain indistinguishable"
+            else:
+                reason = "year matched but no compatible ordinary/mint variant remained"
 
-    if ai_indicates_special_variant(identification):
-        # The AI itself flagged proof/BU/special - never force-pick "the
-        # ordinary one" on its behalf; still ambiguous among these issues.
-        return None
+    for issue in year_matches:
+        is_selected = selected is not None and issue.get("id") == selected.get("id")
+        app.logger.info(
+            "[numista] issue evaluation: type_id=%s issue_id=%s year_match=true mint_match=%s special=%s "
+            "comment=%r decision=%s",
+            type_id, issue.get("id"),
+            bool(mint_mark) and mint_mark in _issue_mint_text(issue),
+            _looks_special_issue(issue),
+            _issue_special_text(issue),
+            "accepted" if is_selected else f"rejected ({reason or 'not the selected issue'})",
+        )
 
-    ordinary_matches = [issue for issue in year_matches if not _looks_special_issue(issue)]
-    if len(ordinary_matches) == 1:
-        return ordinary_matches[0]
-    return None
+    return selected, reason
 
 
 # ---------------------------------------------------------------------------
@@ -1264,11 +1297,16 @@ def resolve_numista_type_and_issue(identification, candidates):
         if issues is None:
             app.logger.warning("[numista] skipping candidate id=%s: issues lookup failed", type_id)
             continue
-        selected_issue = _select_issue_for_year(identification, issues)
+        selected_issue, rejection_reason = _select_issue_for_year(identification, issues, type_id=type_id)
         if selected_issue is None:
+            # rejection_reason distinguishes "no issue matches year" from
+            # "year matched but mint/variant filtering left it ambiguous" -
+            # a real scan showed the old single generic message here was
+            # misleading once year matches existed but were filtered out
+            # for an unrelated reason.
             app.logger.info(
-                "[numista] rejected candidate id=%s title=%r score=%s: no issue matches year=%r",
-                type_id, candidate.get("title"), total, identification.get("year"),
+                "[numista] rejected candidate id=%s title=%r score=%s: %s",
+                type_id, candidate.get("title"), total, rejection_reason or "no compatible issue found",
             )
             continue
         matches.append((candidate, selected_issue))

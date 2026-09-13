@@ -120,59 +120,74 @@ class IssueMatchingTests(unittest.TestCase):
 
     def test_select_issue_for_year_picks_the_matching_one(self):
         issues = [{"id": "i1", "year": 2011}, {"id": "i2", "year": 2012}, {"id": "i3", "year": 2013}]
-        selected = coinlens_app._select_issue_for_year(identification(year="2012"), issues)
+        selected, reason = coinlens_app._select_issue_for_year(identification(year="2012"), issues)
         self.assertEqual(selected["id"], "i2")
+        self.assertIsNone(reason)
 
     def test_select_issue_for_year_returns_none_when_no_year_matches(self):
         issues = [{"id": "i1", "year": 2011}, {"id": "i3", "year": 2013}]
-        selected = coinlens_app._select_issue_for_year(identification(year="2012"), issues)
+        selected, reason = coinlens_app._select_issue_for_year(identification(year="2012"), issues)
         self.assertIsNone(selected)
+        self.assertEqual(reason, "no issue matches year")
 
     def test_select_issue_disambiguates_by_mint_mark_when_tied_on_year(self):
         issues = [
             {"id": "philly", "year": 2012, "mint_letter": "P"},
             {"id": "denver", "year": 2012, "mint_letter": "D"},
         ]
-        selected = coinlens_app._select_issue_for_year(identification(year="2012", mint_mark="D"), issues)
+        selected, reason = coinlens_app._select_issue_for_year(identification(year="2012", mint_mark="D"), issues)
         self.assertEqual(selected["id"], "denver")
+        self.assertIsNone(reason)
 
     def test_select_issue_with_unresolvable_mint_tie_and_no_special_marker_is_ambiguous(self):
         """Previously this blindly picked the first year-match when no
         mint mark was available - exactly the kind of silent guess this
         matching pipeline is meant to avoid. Two indistinguishable ordinary
-        issues (no special comment on either) must now return None."""
+        issues (no special comment on either) must now return None, with a
+        reason distinct from "no issue matches year" (the year DID match)."""
         issues = [
             {"id": "philly", "year": 2012, "mint_letter": "P"},
             {"id": "denver", "year": 2012, "mint_letter": "D"},
         ]
-        selected = coinlens_app._select_issue_for_year(identification(year="2012", mint_mark=None), issues)
+        selected, reason = coinlens_app._select_issue_for_year(identification(year="2012", mint_mark=None), issues)
         self.assertIsNone(selected)
+        self.assertEqual(reason, "year matched but multiple ordinary issues remain indistinguishable")
 
     # -- Real production case: type 5628 (UK 20p) had three 2012 issues -
-    # ordinary circulation, "BU", and "Proof". ----------------------------
+    # ordinary circulation, "BU", and "Proof". Exact live response shape,
+    # including fields (is_dated/gregorian_year) not exercised by the
+    # simplified issue dicts used elsewhere in this file. -----------------
 
     UK_20P_2012_ISSUES = [
-        {"id": 144284, "year": 2012},
-        {"id": 520198, "year": 2012, "comment": "BU"},
-        {"id": 180337, "year": 2012, "comment": "Proof"},
+        {"id": 144284, "is_dated": True, "year": 2012, "gregorian_year": 2012, "mintage": 69650030},
+        {"id": 520198, "is_dated": True, "year": 2012, "gregorian_year": 2012, "mintage": 77725, "comment": "BU"},
+        {"id": 180337, "is_dated": True, "year": 2012, "gregorian_year": 2012, "mintage": 26552, "comment": "Proof"},
     ]
 
     def test_ordinary_grade_prefers_the_plain_circulation_issue_over_bu_and_proof(self):
-        ident = identification(country="United Kingdom", denomination="Twenty pence", year="2012", estimated_grade="VF-25")
-        selected = coinlens_app._select_issue_for_year(ident, self.UK_20P_2012_ISSUES)
+        """The exact live regression: AI says VF-20/ordinary circulating
+        coin: issue 144284 (no comment) must win over 520198 (BU) and
+        180337 (Proof), using the real response shape verbatim."""
+        ident = identification(
+            country="United Kingdom", denomination="20 pence", year="2012", estimated_grade="VF-20",
+            description="ordinary circulating coin, normal wear/scratches",
+        )
+        selected, reason = coinlens_app._select_issue_for_year(ident, self.UK_20P_2012_ISSUES, type_id=5628)
         self.assertIsNotNone(selected)
         self.assertEqual(selected["id"], 144284)
+        self.assertIsNone(reason)
 
     def test_explicit_proof_identification_does_not_blindly_select_ordinary_issue(self):
         ident = identification(
             country="United Kingdom", denomination="Twenty pence", year="2012",
             description="This appears to be a proof strike with mirrored fields.",
         )
-        selected = coinlens_app._select_issue_for_year(ident, self.UK_20P_2012_ISSUES)
+        selected, reason = coinlens_app._select_issue_for_year(ident, self.UK_20P_2012_ISSUES)
         # Must not silently land on the ordinary circulation issue just
         # because it's one of the tied candidates.
         self.assertNotEqual((selected or {}).get("id"), 144284)
         self.assertIsNone(selected)
+        self.assertEqual(reason, "year matched but AI indicated a special issue and multiple candidates remain ambiguous")
 
     def test_multiple_indistinguishable_ordinary_issues_return_none(self):
         issues = [
@@ -180,8 +195,21 @@ class IssueMatchingTests(unittest.TestCase):
             {"id": "issue-b", "year": 2012},
         ]
         ident = identification(country="United Kingdom", denomination="Twenty pence", year="2012")
-        selected = coinlens_app._select_issue_for_year(ident, issues)
+        selected, reason = coinlens_app._select_issue_for_year(ident, issues)
         self.assertIsNone(selected)
+        self.assertEqual(reason, "year matched but multiple ordinary issues remain indistinguishable")
+
+    def test_issue_evaluation_is_logged_for_every_year_matching_issue(self):
+        with self.assertLogs(coinlens_app.app.logger, level="INFO") as logs:
+            coinlens_app._select_issue_for_year(
+                identification(country="United Kingdom", denomination="20 pence", year="2012", estimated_grade="VF-20"),
+                self.UK_20P_2012_ISSUES, type_id=5628,
+            )
+        eval_lines = [line for line in logs.output if "issue evaluation" in line]
+        self.assertEqual(len(eval_lines), 3)
+        self.assertTrue(any("issue_id=144284" in line and "decision=accepted" in line for line in eval_lines))
+        self.assertTrue(any("issue_id=520198" in line and "rejected" in line for line in eval_lines))
+        self.assertTrue(any("issue_id=180337" in line and "rejected" in line for line in eval_lines))
 
     def test_looks_special_issue_matches_whole_words_only(self):
         self.assertTrue(coinlens_app._looks_special_issue({"comment": "Proof"}))
