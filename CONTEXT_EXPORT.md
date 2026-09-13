@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `5992a54` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `e159aaf` (origin/seperate).
 
 ---
 
@@ -838,7 +838,84 @@ native Expo module and can't load under plain `node --test`).
 
 ---
 
-## 16. Pending external actions
+## 16. Follow-up change: raised max_output_tokens after a truncated-response bug
+
+**Trigger**: the very next real scan after §15's image-resize fix. Render
+logs showed the rate-limit problem was solved (`input_tokens=4584`, well
+under the account's TPM caps, no 429), but a *new* failure appeared:
+```
+[identify] OpenAI usage: input_tokens=4584 output_tokens=1000 total_tokens=5584 status=200
+```
+...followed by `Coin Not Recognized` / "AI provider returned an empty
+response." (HTTP 422, `identification_failure`) in the app.
+
+**Diagnosis**: `output_tokens=1000` exactly equals the `max_output_tokens`
+hard cap that was already set in `identify_coin_with_ai`'s payload — the
+response was truncated at the token limit before any visible answer was
+produced. This is a known behavior with reasoning-capable models: part of
+`usage.output_tokens` can be silent "reasoning tokens" spent *before* the
+final JSON, and if the cap is too low, the entire budget can be consumed
+by reasoning with zero visible output text — which matches the symptom
+exactly (not malformed JSON, which would mean *some* text came back;
+*empty*, which means none did). `extract_responses_output_text` correctly
+returned `None` and the existing `identification_failure` path handled it
+without crashing - this was a real product gap (every real, non-mock scan
+would likely hit this), not a code bug in the error handling itself.
+
+**Fix** (`server/app.py`, `identify_coin_with_ai`, **not yet committed**):
+- `max_output_tokens` 1000 → 2000 — doubles the budget so there's room for
+  hidden reasoning *and* the final structured JSON. Chosen to stay
+  comfortably under the account's TPM ceiling even combined with the
+  §15-resized ~4-5K input tokens (4584 + 2000 = 6584, still well under the
+  10,000 TPM floor tier from §15's diagnosis) - deliberately not raised
+  further than needed, since more output-token headroom trades directly
+  against the same rate-limit budget §15 just fixed.
+- Extended the `[identify] OpenAI usage` log line to also report
+  `usage.output_tokens_details.reasoning_tokens` (when present) and the
+  Responses API's own `status` field, so a future truncation shows the
+  reasoning/final-answer split directly instead of just a total.
+- Added a new `app.logger.warning` right where `identification_failure` is
+  raised for empty output, logging the response's `status` and
+  `incomplete_details` (e.g. `{"reason": "max_output_tokens"}`) - this is
+  the single most direct diagnostic for "was it truncation, and why."
+
+**Not changed**: the 401/402/429 upstream-error mapping, the
+`identification_failure`/422 contract itself (still the correct response
+shape for "no usable answer"), and nothing about which model is used or
+its reasoning settings (a `reasoning: {"effort": ...}` parameter was
+considered to reduce reasoning-token spend directly, but not added -
+unclear whether the currently configured `OPENAI_MODEL` accepts that
+parameter at all, and guessing wrong could turn a working non-reasoning
+model call into a hard 400).
+
+**Tests added** (`server/tests/test_app.py`):
+- `test_identify_coin_sends_headroom_for_reasoning_tokens` — asserts the
+  outgoing payload's `max_output_tokens` is at least 2000 (a regression
+  guard so this can't silently drop back to a too-low value).
+- `test_identify_coin_truncated_by_max_output_tokens_logs_incomplete_details`
+  — reproduces the exact production shape (`output_tokens` at the cap,
+  `output_tokens_details.reasoning_tokens` equal to it, `status:
+  "incomplete"`, empty `output`) and asserts it still surfaces as
+  `identification_failure`/422 (not a crash), logs the incomplete-details
+  warning, and marks the quota attempt `"error"`.
+
+**Tests**: 41/41 Python passing (39 → 41), 25/25 JS passing (unaffected -
+no JS files touched).
+
+**Not yet done**:
+- Not verified against a real device/OpenAI call in this session. The next
+  real scan's Render logs should show a `reasoning=` value in the usage
+  line (confirming or ruling out the reasoning-token theory) and, ideally,
+  a completed identification instead of another 422.
+- If 2000 still isn't enough (e.g. `output_tokens` again lands exactly at
+  the cap), the reasoning-token figure logged here will make that obvious,
+  and the next lever would be either raising the cap further (watch the
+  TPM math from §15) or revisiting the `reasoning.effort` idea once the
+  configured model is confirmed to support it.
+
+---
+
+## 17. Pending external actions
 
 1. ~~Run this in the Supabase SQL editor~~ — **now believed applied**: the
    real scan in §14 ran with `MOCK_MODE` off and reached
@@ -875,8 +952,7 @@ native Expo module and can't load under plain `node --test`).
    the user reported "the zoom change worked" before reporting the §14
    scan-save bug, so `zoom={0.3}` fixed the blur. `BOX_SIZE` 260→230 wasn't
    separately called out, so treat it as fine unless the user says
-   otherwise. Still needs to be committed and pushed (currently
-   uncommitted in the working tree, along with §14).
+   otherwise.
 
 5. Watch Render logs for the next `scan_insert_failed` (or a
    `WARNING:supabase_admin:supabase request got a transient ..., retrying`
@@ -884,14 +960,24 @@ native Expo module and can't load under plain `node --test`).
    resolves real-world Supabase gateway blips rather than just passing its
    unit tests.
 
-6. Watch Render logs for the next `[identify] OpenAI usage: ...` line (§15)
-   to see the real `input_tokens` count after the image-resize change, and
-   confirm no more `Rate Limit Hit` errors occur on this OpenAI tier. If one
-   still does, the logged token count settles whether 1280px needs to go
-   lower or whether something else is driving cost.
+6. ~~Watch Render logs for the next `[identify] OpenAI usage: ...` line~~ —
+   **partially confirmed**: the very next real scan showed
+   `input_tokens=4584` (down from ~17.4K) and no `Rate Limit Hit` - §15's
+   fix worked for the rate-limit problem specifically. That same scan then
+   hit a *different* bug (§16: truncated/empty response from
+   `max_output_tokens` being too low), now also fixed but unverified.
+
+7. Watch Render logs for the next `[identify] OpenAI usage: ...` line (§16)
+   for a `reasoning=` value and confirm the response completes instead of
+   truncating again at `output_tokens=2000`. If it still truncates exactly
+   at the new cap, raise `max_output_tokens` further (checking the TPM math
+   against §15) or revisit a `reasoning.effort` parameter once the
+   configured `OPENAI_MODEL` is confirmed to support it.
 
 Everything through §9 (code, tests, eight commits, push), the §11
-quota-exceeded UI fix (`f8038a3`), §13 (camera focus, `fca1065`), and §14
-(Supabase gateway retry, `11fc045`) is committed and pushed to
-`origin/seperate`. §15 (image resize + OpenAI usage logging, `5992a54`) is
-committed locally but **not yet pushed**.
+quota-exceeded UI fix (`f8038a3`), §13 (camera focus, `fca1065`), §14
+(Supabase gateway retry, `11fc045`), and §15 (image resize + OpenAI usage
+logging, `5992a54`, plus its context-export commit `e159aaf`) are all
+committed and pushed to `origin/seperate`. §16 (raised `max_output_tokens`
++ reasoning-token/incomplete-details logging) is implemented but **not yet
+committed or pushed**.
