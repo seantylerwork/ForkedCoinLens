@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `a89a258` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `f8038a3` (origin/seperate).
 
 ---
 
@@ -592,28 +592,201 @@ method) returns 405; `GET /api/health` still works normally.
 
 ---
 
-## 10. Pending external actions
+## 11. Follow-up change: quota_exceeded now shows "Back to Home" instead of "Try Again"
 
-1. Run this in the Supabase SQL editor (unchanged from §3/§5 in the earlier
-   version of this doc — code is committed, but nothing has executed it
-   against the live database yet):
+**Trigger**: after hitting the daily scan limit, the error screen still
+offered a "Try Again" button that just replayed the same identify-coin
+request the server would immediately 429 again — a useless retry for the
+one error code where retrying can never succeed until the quota resets.
+
+**Fix** (4 files, commit `f8038a3`):
+- `scanErrorLogic.js` (new) — extracted `ScanError`, `ERROR_DISPLAY`, and
+  `makeErrorDetail` out of `src/api/client.js` into a plain CommonJS module
+  with no React Native imports, so it can be unit-tested directly under
+  `node --test` (`client.js` pulls in `react-native` transitively via
+  `src/api/supabase.js`, which can't load under plain Node — same reasoning
+  as why `scanFlowLogic.js`/`aiLogic.js` already live outside `src/`). Added
+  `isRetryableErrorCode(code)`, which returns `false` only for
+  `quota_exceeded`; `makeErrorDetail` now also returns `code` and
+  `retryable` on the detail object. Title/tip/body text is unchanged — the
+  daily-limit body already comes dynamically from the server's
+  `DAILY_SCAN_LIMIT`-based message (`f"Daily scan limit of {DAILY_SCAN_LIMIT}
+  reached..."`), so no client-side hardcoded number was needed or added.
+- `src/api/client.js` — now imports and re-exports `ScanError`/
+  `makeErrorDetail` from `scanErrorLogic.js` instead of defining them
+  inline; no behavior change.
+- `src/screens/scan/ScanScreen.js` — in the `error` phase only, the button
+  is now conditional on `ed.retryable`: `quota_exceeded` renders "Back to
+  Home", whose handler calls `startNewScan()` (clears `errorDetail`/
+  `frontImage`/`backImage`/phase, etc. — the same reset already used
+  elsewhere) and then `navigate("home")` (the same home-navigation path the
+  screen's own header back button and guest-mode exit already use). No API
+  call is made and the camera is never reopened. Every other error code,
+  and the separate `unidentifiable` phase (a distinct outcome, not an
+  error), keep their existing "Try Again" → `startNewScan()` behavior
+  unchanged.
+- `__tests__/scanErrorLogic.test.js` (new) — 3 tests: `quota_exceeded` is
+  non-retryable and keeps its title/dynamic-limit body; a sample of other
+  codes remain retryable; a plain (non-`ScanError`) error falls back to
+  retryable `unknown`.
+
+**Not committed alongside this**: an unrelated, already-modified
+`server/app.py` (pre-existing 1-line change in the working tree before this
+task started) was deliberately left unstaged/uncommitted rather than swept
+in with `git add -A`.
+
+**Tests**: 25/25 JS passing (22 → 25). No Python files touched, no backend
+quota logic (`DAILY_SCAN_LIMIT`, `check_and_reserve_quota`, etc.) changed.
+
+---
+
+## 13. Follow-up change: camera scan box shrunk + fixed zoom to fix out-of-focus captures
+
+**Trigger**: the user reported that the square capture guide box in the
+scan camera view was a bit too big — positioning a coin to fill it meant
+holding the phone closer to the coin than the lens can actually focus at,
+so the coin came out blurry.
+
+**Diagnosis discussed before changing anything**: the blur is the phone's
+autofocus failing at too-close a distance, not a bug in the guide box
+itself. Two candidate fixes were weighed: (a) shrink the guide box, which
+encourages standing farther back but also means the coin fills less of the
+captured frame (a real tradeoff for AI identification, which wants
+mint-mark/wear detail); (b) apply camera zoom so the phone can stay at a
+safer focus distance while the coin still visually fills the frame, at the
+cost of a digital-zoom crop. Decided to do both, but lean on zoom as the
+main lever and only shrink the box slightly, rather than shrinking it a lot
+and asking users to move even closer to compensate.
+
+**Fix** (2 files, **not yet committed**):
+- `src/theme/colors.js` — `BOX_SIZE` (used by both `ScanScreen.js` and
+  `theme/styles.js` for the guide box and the scan-line animation range)
+  260 → 230. All box-size usages already derive from this one constant, so
+  no other file needed a change.
+- `src/screens/scan/ScanScreen.js` — added `zoom={0.3}` (expo-camera's
+  `CameraView` zoom prop, range 0–1) to the capture `CameraView`, so the
+  preview/capture is digitally zoomed in a fixed, fairly conservative
+  amount rather than relying on the user standing unnaturally close.
+
+**Not done / explicitly deferred**:
+- Rounding the guide box corners (raised as a "make it round-ish if easy"
+  option) was **not** applied — decided the zoom+size change was the
+  substantive fix for the blur complaint, and roundness is purely cosmetic
+  with no effect on focus.
+- `zoom={0.3}` is a starting guess, not measured against a real device in
+  this session (no physical device/camera available here) — flagged as
+  needing a real on-device check, see §14.
+
+**Tests**: 25/25 JS passing, unaffected (no test exercises `CameraView`
+props or pixel-level box size). No Python files touched.
+
+---
+
+## 14. Follow-up change: retry on transient Supabase gateway errors
+
+**Trigger**: a real (non-mock) scan against the live Render deployment
+identified a Canadian 2016 1-dollar coin correctly, then failed with
+`Couldn't Save Scan` in the app. Render logs showed the true cause:
+```
+ERROR:supabase_admin:supabase insert_scan failed: status=504 body={"message":"Gateway Timeout"}
+ERROR:app:scan insert failed for user_id=...: scans insert failed: status=504 body={"message":"Gateway Timeout"}
+```
+Not a schema, grant, or auth problem (unlike §3) — Supabase's own REST
+gateway returned a 504 before our 10s client-side timeout was even reached.
+The concerning part: the identification (and the quota attempt it
+consumed) had already succeeded, so a single transient gateway blip cost
+the user one of their daily scans for nothing.
+
+**Fix** (`server/supabase_admin.py` only, **not yet committed**): added a
+small `_request_with_gateway_retry(method, *args, **kwargs)` helper that
+retries a `requests` call up to `MAX_GATEWAY_RETRIES` (2) times, with a
+short linear backoff (`RETRY_BACKOFF_SECONDS = 0.5`, so 0.5s then 1s),
+*only* when the response status is 502/503/504 — a real 4xx (bad data,
+auth) or any 2xx returns immediately without retrying, so this can't mask
+an actual bug as a "transient" one. Applied to the three admin calls that
+hit Supabase's REST gateway and currently raise on failure: `insert_scan`,
+`insert_api_usage`, `count_api_usage_since`. Deliberately **not** applied
+to `update_api_usage` — that's already a best-effort, never-raises
+bookkeeping call (out of the scope the user confirmed).
+
+**Not changed**: `REQUEST_TIMEOUT` (10s, the client-side timeout — the
+504 in the log was returned *by* Supabase, not a local timeout, so raising
+this wouldn't have helped), and none of the quota/persistence decision
+logic in `server/app.py` — this is purely a transport-layer retry around
+the existing calls.
+
+**Tests added** (`server/tests/test_supabase_admin.py`, new file, 5 tests,
+mocks `requests.post`/`requests.get` and `time.sleep` so no real delay or
+network call happens):
+- `insert_scan` retries once on a transient 504 then succeeds.
+- `insert_scan` gives up after 2 retries (3 total attempts) on a
+  persistent 503, still raising `SupabaseAdminError`.
+- `insert_scan` does **not** retry a real 400 (confirms retries are scoped
+  to gateway statuses only).
+- `insert_api_usage` retries on a transient 502 then succeeds.
+- `count_api_usage_since` retries on a transient 503 then succeeds (and
+  still parses the `Content-Range` header correctly on the retry).
+
+**Tests**: 37/37 Python passing (32 → 37, all in 0.06s — confirms the
+backoff sleep is properly mocked, not actually slowing the suite down).
+25/25 JS passing, unaffected.
+
+**Not yet done**: this has not been verified against a real Supabase
+gateway timeout in production — the original 504 was intermittent, so
+there's no guaranteed way to reproduce it on demand; the next time it
+happens, the Render logs should show a `WARNING:supabase_admin:supabase
+request got a transient 504, retrying...` line followed by a success
+instead of the scan failing outright.
+
+---
+
+## 15. Pending external actions
+
+1. ~~Run this in the Supabase SQL editor~~ — **now believed applied**: the
+   real scan in §14 ran with `MOCK_MODE` off and reached
+   `check_and_reserve_quota`/`insert_api_usage` without a
+   `quota_check_failed` error, which only succeeds if the `service_role`
+   grant on `public.api_usage` is in place. Still worth a positive
+   confirmation (e.g. re-check via the Supabase SQL editor) rather than
+   relying solely on one successful request, but this is no longer an
+   open question mark the way it was:
    ```sql
    grant select, insert, update on public.api_usage to service_role;
    ```
-   (Equivalently: run `supabase/migrations/0002_grant_api_usage_service_role.sql`.)
+   (Equivalently: `supabase/migrations/0002_grant_api_usage_service_role.sql`.)
 
-2. Once that grant is applied, run a real scan with `MOCK_MODE`/mock coin
-   response off (needs `OPENAI_API_KEY` and `NUMISTA_API_KEY` set on Render)
-   and read the `[identify]`/`[numista]`/`[pcgs]`/`[valuation]` lines in
-   Render's logs in order (§6) to confirm the real Numista response shape
-   matches what the code assumes. If a field name doesn't match, the raw
-   `body=...` in the log line shows exactly what to fix in
-   `search_numista_types` / `fetch_numista_price` / `score_numista_candidate`.
+2. The §14 real scan also answered part of the original Numista-contract
+   question from §2/§6: the search endpoint's real response shape matched
+   the code's assumption (`{"count": ..., "types": [...]}`, with
+   `issuer.name`/`min_year`/`max_year` present and used correctly to score
+   candidates — see the `[numista] search response`/`top candidates` log
+   lines in §14). **Still unconfirmed**: the type-detail fetch and the
+   `/types/{id}/prices` endpoint's shape (`prices[].grade`/`.price`), since
+   that scan never reached a confident match (top two candidates tied at
+   score 3, so valuation correctly reported "unavailable" and neither
+   endpoint was called). Needs a scan that gets an unambiguous top Numista
+   match to exercise those two endpoints for real.
 
-3. While doing that real scan, also check whether the illegible-year case
-   (§8) now comes back with a confidence that actually reads as low/uncertain
-   rather than a high number next to "uncertain" - the prompt fix is
-   unverified against a live model.
+3. Also check whether the illegible-year case (§8) now comes back with a
+   confidence that actually reads as low/uncertain rather than a high
+   number next to "uncertain" - the prompt fix is unverified against a
+   live model. (The §14 scan was a fully-legible coin, confidence 96, so
+   it didn't exercise this case either.)
 
-Everything from today (code, tests, eight commits so far, push) is already
-done and live on `origin/seperate` at `a89a258`.
+4. ~~Test the §13 camera focus change on a real device~~ — **confirmed**:
+   the user reported "the zoom change worked" before reporting the §14
+   scan-save bug, so `zoom={0.3}` fixed the blur. `BOX_SIZE` 260→230 wasn't
+   separately called out, so treat it as fine unless the user says
+   otherwise. Still needs to be committed and pushed (currently
+   uncommitted in the working tree, along with §14).
+
+5. Watch Render logs for the next `scan_insert_failed` (or a
+   `WARNING:supabase_admin:supabase request got a transient ..., retrying`
+   line that *doesn't* end in success) to confirm the §14 retry actually
+   resolves real-world Supabase gateway blips rather than just passing its
+   unit tests.
+
+Everything through §9 (code, tests, eight commits, push) plus the §11
+quota-exceeded UI fix (commit `f8038a3`) is done and live on
+`origin/seperate`. §13 (camera focus) and §14 (Supabase gateway retry) are
+both implemented but **not yet committed or pushed**.

@@ -8,6 +8,7 @@ go through Expo with the user's own JWT.
 
 import logging
 import os
+import time
 
 import requests
 from dotenv import load_dotenv
@@ -18,6 +19,14 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL", "").rstrip("/")
 SUPABASE_SERVICE_ROLE_KEY = os.environ.get("SUPABASE_SERVICE_ROLE_KEY", "")
 
 REQUEST_TIMEOUT = 10
+
+# Supabase's own REST gateway occasionally returns one of these on a transient
+# infrastructure blip (e.g. a cold project waking up), not because the
+# request itself was bad - safe to retry a couple of times with a short
+# backoff rather than fail a whole scan over it.
+RETRYABLE_GATEWAY_STATUSES = (502, 503, 504)
+MAX_GATEWAY_RETRIES = 2
+RETRY_BACKOFF_SECONDS = 0.5
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +51,24 @@ def _require_config():
         raise SupabaseAdminError("SUPABASE_SERVICE_ROLE_KEY environment variable is missing.")
 
 
+def _request_with_gateway_retry(method, *args, **kwargs):
+    """Calls ``method(*args, **kwargs)`` (a ``requests`` verb function),
+    retrying up to ``MAX_GATEWAY_RETRIES`` times if Supabase's gateway
+    responds with a transient 502/503/504. Any other status (including a
+    real 4xx/2xx) is returned immediately without retrying."""
+    attempt = 0
+    while True:
+        response = method(*args, **kwargs)
+        if response.status_code not in RETRYABLE_GATEWAY_STATUSES or attempt >= MAX_GATEWAY_RETRIES:
+            return response
+        attempt += 1
+        logger.warning(
+            "supabase request got a transient %s, retrying (attempt %s/%s): %s",
+            response.status_code, attempt, MAX_GATEWAY_RETRIES, args[0] if args else kwargs.get("url"),
+        )
+        time.sleep(RETRY_BACKOFF_SECONDS * attempt)
+
+
 def insert_scan(payload: dict) -> dict:
     """Insert a row into the ``scans`` table and return the created row.
 
@@ -53,7 +80,8 @@ def insert_scan(payload: dict) -> dict:
     url = f"{SUPABASE_URL}/rest/v1/scans"
 
     try:
-        response = requests.post(
+        response = _request_with_gateway_retry(
+            requests.post,
             url,
             json=payload,
             headers=_headers(),
@@ -109,7 +137,8 @@ def count_api_usage_since(user_id: str, since_iso: str) -> int:
     headers["Prefer"] = "count=exact"
 
     try:
-        response = requests.get(
+        response = _request_with_gateway_retry(
+            requests.get,
             url,
             params={
                 "user_id": f"eq.{user_id}",
@@ -152,7 +181,9 @@ def insert_api_usage(payload: dict) -> dict:
 
     url = f"{SUPABASE_URL}/rest/v1/api_usage"
     try:
-        response = requests.post(url, json=payload, headers=_headers(), timeout=REQUEST_TIMEOUT)
+        response = _request_with_gateway_retry(
+            requests.post, url, json=payload, headers=_headers(), timeout=REQUEST_TIMEOUT
+        )
     except requests.RequestException as error:
         logger.error("supabase insert_api_usage request failed: %s", error)
         raise SupabaseAdminError(f"api_usage insert request failed: {error}") from error
