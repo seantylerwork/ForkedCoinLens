@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `f8038a3` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `5992a54` (origin/seperate).
 
 ---
 
@@ -740,7 +740,105 @@ instead of the scan failing outright.
 
 ---
 
-## 15. Pending external actions
+## 15. Follow-up change: resize images before identification + log OpenAI token usage
+
+**Trigger**: the user hit `Rate Limit Hit` ("AI provider rate or quota limit
+reached") twice, many minutes apart — not a burst pattern, which pointed
+away from a per-minute request-count limit. They shared their OpenAI
+usage-tier page: on the free/lowest tier, the models available are capped
+at **10,000 TPM / 3 RPM** (one row, "gpt-5.6-luna", got 60,000 TPM / 10
+RPM), and their usage dashboard showed **104,337 input tokens across just
+6 requests** (~17.4K tokens/request average) — nowhere near the 50
+requests/day cap, but plausibly already over a 10K-tokens-*per-minute* cap
+on a single request, independent of timing between requests.
+
+**Diagnosis**: `identify_coin_with_ai` (`server/app.py`) sends one Responses
+API call per scan with one or two full-resolution photos as
+`input_image`/`data_url` content. Vision models bill images by tiling them
+into fixed-size chunks, so an uncompressed/undownscaled phone photo (often
+3000-4000px on the long edge) can cost far more tokens than a resized one
+without a proportional accuracy benefit — plausibly enough, on its own, to
+exceed a low-tier account's per-minute token budget regardless of how far
+apart requests are spaced. This was reasoned from the account's own
+dashboard numbers, not confirmed with an exact per-request token count
+(OpenAI's Responses API does return a `usage` object we weren't logging —
+see the second half of the fix below, added specifically to close that gap
+for next time).
+
+**Fix** (6 files, commit `5992a54`, **user confirmed "both now" before this
+was implemented** — chose to do the accuracy-affecting resize *and* the
+safe logging-only addition together rather than logging first and waiting
+for another failure):
+
+- `src/api/imagePrep.js` (new) — `prepareImageForIdentification(photo)`
+  takes an expo-camera capture result or an expo-image-picker asset
+  (`{ uri, base64, width, height }`), and if the long edge exceeds 1280px,
+  uses `expo-image-manipulator`'s `manipulateAsync` to resize (preserving
+  aspect ratio) and re-encode as JPEG at `compress: 0.9`, returning the new
+  base64. Images already at or under 1280px are returned untouched (no
+  pointless re-compression). Added `expo-image-manipulator` as a new
+  dependency via `npx expo install` (SDK-57-compatible version resolved
+  automatically: `~57.0.17`).
+- `src/screens/scan/ScanScreen.js` — both capture paths now call
+  `prepareImageForIdentification` before storing/sending a photo: the
+  front/back camera captures in `capture()`, and the gallery photo in
+  `startUploadedPhotoScan()`. `identifyCoin()` itself, its signature, and
+  the persisted-scan/valuation logic are all unchanged — only the bytes
+  going *into* the OpenAI call are smaller.
+- `server/app.py` (`identify_coin_with_ai`) — logs OpenAI's real
+  `usage.input_tokens`/`output_tokens`/`total_tokens` (tagged `[identify]`)
+  right after parsing the response body, *before* checking `upstream.ok`,
+  so the real per-request cost is captured whether the call succeeds or
+  gets rejected (a rejected/429 response may or may not include `usage`;
+  the code only logs it when present, no assumption either way). Purely
+  additive — no change to the 401/402/429/`quota`/`rate_limit` mapping
+  logic itself.
+
+**1280px chosen, not a smaller/"low detail" option, deliberately**: an
+alternative considered (and explicitly *not* chosen) was setting OpenAI's
+per-image `"detail": "low"` parameter, which gives a small, fixed token
+cost regardless of resolution — but low-detail vision inputs are coarse
+enough that reading mint marks, dates, and wear (the whole point of this
+app) would likely suffer. Resizing to 1280px keeps "auto"/high-fidelity
+tiling behavior, just on a smaller source image, trading some token
+headroom for not touching identification-quality behavior.
+
+**Not changed**: `REQUEST_TIMEOUT`/`OPENAI_TIMEOUT_SECONDS`, the
+401/402/429 → `key_invalid`/`quota`/`rate_limit`/`quota` code mapping in
+`identify_coin_with_ai`, `MAX_IMAGE_BYTES` (the byte-size cap, a different
+axis from pixel dimensions), and nothing server-side about *when* to call
+OpenAI (no retry loop was added here, unlike §14's Supabase gateway retry
+— a 429 that's genuinely over a TPM/RPM cap wouldn't be fixed by an
+immediate retry the way a one-off Supabase gateway blip is).
+
+**Tests added** (`server/tests/test_app.py`):
+- `test_identify_coin_openai_rate_limit_returns_429` — a real upstream 429
+  from OpenAI itself (message without "quota"/"billing") maps to our
+  `rate_limit` code and still marks the reserved quota attempt as
+  `"error"` — this exact path (as opposed to our own `quota_exceeded`) had
+  no prior test coverage.
+- `test_identify_coin_logs_openai_token_usage_on_success` — a mocked
+  Responses API reply carrying a `usage` object produces the
+  `[identify] OpenAI usage: input_tokens=...` log line, asserted via
+  `assertLogs`.
+
+**Tests**: 39/39 Python passing (37 → 39), 25/25 JS passing (unaffected —
+`imagePrep.js` isn't unit-tested; like `src/api/client.js`, it imports a
+native Expo module and can't load under plain `node --test`).
+
+**Not yet done**:
+- Not verified against a real device/OpenAI call in this session (no
+  camera or `OPENAI_API_KEY` available here) — the next real scan's Render
+  logs should show a much lower `input_tokens` number, and ideally no more
+  `Rate Limit Hit` errors on this tier.
+- 1280px and `compress: 0.9` are reasoned defaults, not tuned against a
+  real photo → real OpenAI token count. If a rate limit still occurs after
+  this, the new usage logging will show whether it's still image-token-
+  dominated (tune the constant down further) or something else entirely.
+
+---
+
+## 16. Pending external actions
 
 1. ~~Run this in the Supabase SQL editor~~ — **now believed applied**: the
    real scan in §14 ran with `MOCK_MODE` off and reached
@@ -786,7 +884,14 @@ instead of the scan failing outright.
    resolves real-world Supabase gateway blips rather than just passing its
    unit tests.
 
-Everything through §9 (code, tests, eight commits, push) plus the §11
-quota-exceeded UI fix (commit `f8038a3`) is done and live on
-`origin/seperate`. §13 (camera focus) and §14 (Supabase gateway retry) are
-both implemented but **not yet committed or pushed**.
+6. Watch Render logs for the next `[identify] OpenAI usage: ...` line (§15)
+   to see the real `input_tokens` count after the image-resize change, and
+   confirm no more `Rate Limit Hit` errors occur on this OpenAI tier. If one
+   still does, the logged token count settles whether 1280px needs to go
+   lower or whether something else is driving cost.
+
+Everything through §9 (code, tests, eight commits, push), the §11
+quota-exceeded UI fix (`f8038a3`), §13 (camera focus, `fca1065`), and §14
+(Supabase gateway retry, `11fc045`) is committed and pushed to
+`origin/seperate`. §15 (image resize + OpenAI usage logging, `5992a54`) is
+committed locally but **not yet pushed**.
