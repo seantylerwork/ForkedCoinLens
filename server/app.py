@@ -607,9 +607,11 @@ def identify_coin_with_ai(front_image, back_image=None):
 # ---------------------------------------------------------------------------
 
 def _numista_result_list(payload):
+    if isinstance(payload, list):
+        return payload
     if not isinstance(payload, dict):
         return []
-    for key in ("types", "items", "results"):
+    for key in ("types", "items", "results", "issues"):
         value = payload.get(key)
         if isinstance(value, list):
             return value
@@ -627,33 +629,42 @@ def _candidate_country_text(candidate):
     return _text_of(issuer or candidate.get("country"))
 
 
-def score_numista_candidate(identification, candidate):
+def _score_numista_candidate_breakdown(identification, candidate):
+    """Same scoring as before, but returns (total, breakdown) so callers can
+    log *why* a candidate gained or lost points instead of just a number -
+    this is what actually lets a real search-response log line be diagnosed
+    as a search problem vs. a scoring problem."""
     if not isinstance(candidate, dict):
-        return 0
+        return 0, {}
     country = _text_of(identification.get("country"))
     denomination = _text_of(identification.get("denomination"))
     year = _text_of(identification.get("year"))
     title = _text_of(candidate.get("title"))
     cand_country = _candidate_country_text(candidate)
 
-    score = 0
+    breakdown = {}
     if country and country in cand_country:
-        score += 3
+        breakdown["country_issuer_match"] = 3
     if country and country in title:
-        score += 1
+        breakdown["country_in_title"] = 1
     if denomination and denomination in title:
-        score += 2
+        breakdown["denomination_in_title"] = 2
     if year and year in title:
-        score += 1
+        breakdown["year_in_title"] = 1
     min_year = candidate.get("min_year") or candidate.get("min_date")
     max_year = candidate.get("max_year") or candidate.get("max_date")
     try:
         if year.isdigit() and min_year is not None and max_year is not None:
             if int(min_year) <= int(year) <= int(max_year):
-                score += 2
+                breakdown["year_in_type_range"] = 2
     except (TypeError, ValueError):
         pass
-    return score
+    return sum(breakdown.values()), breakdown
+
+
+def score_numista_candidate(identification, candidate):
+    total, _ = _score_numista_candidate_breakdown(identification, candidate)
+    return total
 
 
 # Numista raw response bodies are logged truncated to this length - long
@@ -672,7 +683,14 @@ def search_numista_types(identification):
     try:
         upstream = requests.get(
             NUMISTA_TYPES_URL,
-            params={"q": query, "category": "coin", "count": 8},
+            # count=12, not 8: real search responses show Numista's own
+            # free-text relevance ranking can put same-denomination coins
+            # from an unrelated country ahead of the correct country's
+            # match (e.g. "Canada 1 dollar" surfacing Australian "1 Dollar"
+            # types first) - a slightly wider net gives the type+issue
+            # resolution step below more real candidates to work with,
+            # still a single search call either way.
+            params={"q": query, "category": "coin", "count": 12},
             headers={"Numista-API-Key": NUMISTA_API_KEY},
             timeout=NUMISTA_TIMEOUT,
         )
@@ -716,32 +734,158 @@ def fetch_numista_type_detail(type_id):
     return data if isinstance(data, dict) else None
 
 
-def select_best_numista_match(identification, candidates):
-    """Picks the strongest candidate, but only when it is unambiguously best -
-    a weak or tied top score means we don't have a confident match."""
+# Numista v3 separates a *type* (e.g. "1 Dollar - Elizabeth II") from its
+# *issues* (the specific year/mint-mark variants struck under that type).
+# A type's own min_year/max_year is only the overall production range, and
+# pricing is per-issue, not per-type - so a title/country score, however
+# good, is not enough to call a match "confident": we require a real issue
+# record for the identified year before selecting a type at all.
+NUMISTA_MATCH_CANDIDATES_TO_INSPECT = 3  # how many top-scored types get an /issues lookup - keeps API usage bounded
+NUMISTA_MATCH_MIN_SCORE = 2  # below this, a candidate isn't worth spending an extra HTTP call on at all
+
+
+def fetch_numista_issues(type_id):
+    """Returns a type's issue records (its specific year/mint-mark variants),
+    or None if the request itself failed."""
+    try:
+        upstream = requests.get(
+            f"{NUMISTA_TYPES_URL}/{type_id}/issues",
+            headers={"Numista-API-Key": NUMISTA_API_KEY},
+            timeout=NUMISTA_TIMEOUT,
+        )
+        upstream.raise_for_status()
+        data = upstream.json()
+    except (requests.RequestException, ValueError) as error:
+        app.logger.warning("[numista] issues fetch failed: type_id=%s error=%s", type_id, error)
+        return None
+
+    app.logger.info(
+        "[numista] issues response: type_id=%s status=%s body=%s",
+        type_id, upstream.status_code, upstream.text[:NUMISTA_LOG_BODY_CHARS],
+    )
+    issues = _numista_result_list(data)
+    app.logger.info(
+        "[numista] issues inspected: type_id=%s count=%d years=%s",
+        type_id, len(issues),
+        [issue.get("year", (issue.get("min_year"), issue.get("max_year"))) for issue in issues if isinstance(issue, dict)],
+    )
+    return issues
+
+
+def _issue_matches_year(issue, year_text):
+    if not isinstance(issue, dict) or not year_text.isdigit():
+        return False
+    target = int(year_text)
+    try:
+        issue_year = issue.get("year")
+        if issue_year is not None and int(issue_year) == target:
+            return True
+    except (TypeError, ValueError):
+        pass
+    try:
+        min_year, max_year = issue.get("min_year"), issue.get("max_year")
+        if min_year is not None and max_year is not None and int(min_year) <= target <= int(max_year):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False
+
+
+def _issue_mint_text(issue):
+    if not isinstance(issue, dict):
+        return ""
+    mint = issue.get("mint")
+    if isinstance(mint, dict):
+        return _text_of(mint.get("name") or mint.get("code"))
+    mints = issue.get("mints")
+    if isinstance(mints, list):
+        return " ".join(_text_of(m.get("name") or m.get("code")) for m in mints if isinstance(m, dict))
+    return _text_of(issue.get("mint_letter") or issue.get("mintmark"))
+
+
+def _select_issue_for_year(identification, issues):
+    """Among a type's issues, finds one matching the identified year. Mint
+    mark (when the AI reported one) is used only to disambiguate between
+    multiple same-year issues, never as a hard requirement - not every
+    denomination/country carries one."""
+    year_text = _text_of(identification.get("year"))
+    year_matches = [issue for issue in (issues or []) if _issue_matches_year(issue, year_text)]
+    if not year_matches:
+        return None
+    if len(year_matches) == 1:
+        return year_matches[0]
+
+    mint_mark = _text_of(identification.get("mint_mark"))
+    if mint_mark:
+        mint_matches = [issue for issue in year_matches if mint_mark in _issue_mint_text(issue)]
+        if mint_matches:
+            return mint_matches[0]
+    return year_matches[0]
+
+
+def resolve_numista_type_and_issue(identification, candidates):
+    """Scores every candidate type (logging the full breakdown for each -
+    not just the winner - so a real search response can be diagnosed as a
+    search problem vs. a scoring problem), then inspects the top few
+    candidates' real issue records and requires one to actually match the
+    identified year. A well-scored title is only a hint about which
+    candidates are worth an /issues lookup - it is never enough on its own
+    to select a match. Returns (type_candidate, issue) or (None, None)."""
     if not candidates:
-        return None
-    scored = sorted(candidates, key=lambda c: score_numista_candidate(identification, c), reverse=True)
-    ranked = [(score_numista_candidate(identification, c), c.get("id"), c.get("title")) for c in scored[:3]]
-    app.logger.info("[numista] top candidates (score, id, title): %s", ranked)
+        return None, None
 
-    best = scored[0]
-    best_score = score_numista_candidate(identification, best)
-    if best_score < 3:
-        app.logger.info("[numista] no confident match: top score %s below threshold 3", best_score)
-        return None
-    if len(scored) > 1 and score_numista_candidate(identification, scored[1]) == best_score:
-        app.logger.info("[numista] no confident match: top score %s tied with runner-up", best_score)
-        return None
+    scored = sorted(
+        (( *_score_numista_candidate_breakdown(identification, c), c) for c in candidates),
+        key=lambda entry: entry[0], reverse=True,
+    )
+    app.logger.info(
+        "[numista] all candidates scored: %s",
+        [
+            (total, candidate.get("id"), candidate.get("title"), _candidate_country_text(candidate), breakdown)
+            for total, breakdown, candidate in scored
+        ],
+    )
 
-    app.logger.info("[numista] selected match: id=%s title=%r score=%s", best.get("id"), best.get("title"), best_score)
-    return best
+    to_inspect = [entry for entry in scored if entry[0] >= NUMISTA_MATCH_MIN_SCORE][:NUMISTA_MATCH_CANDIDATES_TO_INSPECT]
+    if not to_inspect:
+        app.logger.info(
+            "[numista] no confident match: no candidate reached the minimum score of %s to justify an issues lookup",
+            NUMISTA_MATCH_MIN_SCORE,
+        )
+        return None, None
+
+    for total, _breakdown, candidate in to_inspect:
+        type_id = candidate.get("id")
+        if type_id is None:
+            continue
+        issues = fetch_numista_issues(type_id)
+        if issues is None:
+            app.logger.warning("[numista] skipping candidate id=%s: issues lookup failed", type_id)
+            continue
+        selected_issue = _select_issue_for_year(identification, issues)
+        if selected_issue is None:
+            app.logger.info(
+                "[numista] rejected candidate id=%s title=%r score=%s: no issue matches year=%r",
+                type_id, candidate.get("title"), total, identification.get("year"),
+            )
+            continue
+        app.logger.info(
+            "[numista] selected type+issue: type_id=%s title=%r score=%s issue_id=%s issue_year=%s",
+            type_id, candidate.get("title"), total, selected_issue.get("id"), selected_issue.get("year"),
+        )
+        return candidate, selected_issue
+
+    app.logger.info(
+        "[numista] no confident match: none of the top %d inspected candidate(s) had a matching issue",
+        len(to_inspect),
+    )
+    return None, None
 
 
 def lookup_numista(identification):
-    """Finds the strongest practical Numista type match for the identified
-    coin. Returns None when no confident match exists - callers must not
-    treat that as an error, only as "no catalog match"."""
+    """Finds the strongest practical Numista type+issue match for the
+    identified coin. Returns None when no confident match exists - callers
+    must not treat that as an error, only as "no catalog match"."""
     if should_use_mock_coin_response():
         log_mock_response("lookup_numista")
         return dict(MOCK_NUMISTA)
@@ -760,63 +904,66 @@ def lookup_numista(identification):
     candidates = search_numista_types(identification)
     if candidates is None:
         return {"error": "Numista lookup unavailable."}
-    best = select_best_numista_match(identification, candidates)
-    if not best:
+
+    best, issue = resolve_numista_type_and_issue(identification, candidates)
+    if not best or not issue:
         return None
 
     type_id = best.get("id")
     detail = fetch_numista_type_detail(type_id) if type_id is not None else None
     merged = {**best, **(detail or {})}
     merged["numista_type_id"] = type_id
+    merged["numista_issue_id"] = issue.get("id")
+    merged["numista_issue"] = issue
     return merged
 
 
-def fetch_numista_price(type_id, grade):
+def fetch_numista_price(type_id, issue_id, grade):
     try:
         upstream = requests.get(
-            f"{NUMISTA_TYPES_URL}/{type_id}/prices",
+            f"{NUMISTA_TYPES_URL}/{type_id}/issues/{issue_id}/prices",
             params={"currency": "USD"},
             headers={"Numista-API-Key": NUMISTA_API_KEY},
             timeout=NUMISTA_TIMEOUT,
         )
     except requests.RequestException as error:
-        app.logger.error("[numista] price request failed: type_id=%s error=%s", type_id, error)
+        app.logger.error("[numista] price request failed: type_id=%s issue_id=%s error=%s", type_id, issue_id, error)
         return None
 
     app.logger.info(
-        "[numista] price response: type_id=%s grade=%r status=%s body=%s",
-        type_id, grade, upstream.status_code, upstream.text[:NUMISTA_LOG_BODY_CHARS],
+        "[numista] price response: type_id=%s issue_id=%s grade=%r status=%s body=%s",
+        type_id, issue_id, grade, upstream.status_code, upstream.text[:NUMISTA_LOG_BODY_CHARS],
     )
 
     if upstream.status_code in (401, 402, 403, 404):
-        app.logger.info("[numista] price unavailable for type_id=%s (status=%s)", type_id, upstream.status_code)
+        app.logger.info("[numista] price unavailable for type_id=%s issue_id=%s (status=%s)", type_id, issue_id, upstream.status_code)
         return None
     try:
         upstream.raise_for_status()
         data = upstream.json()
     except (requests.RequestException, ValueError) as error:
-        app.logger.error("[numista] price response unusable: type_id=%s error=%s", type_id, error)
+        app.logger.error("[numista] price response unusable: type_id=%s issue_id=%s error=%s", type_id, issue_id, error)
         return None
 
     prices = data.get("prices") if isinstance(data, dict) else None
     if not isinstance(prices, list) or not prices:
-        app.logger.info("[numista] price response had no usable 'prices' list: type_id=%s", type_id)
+        app.logger.info("[numista] price response had no usable 'prices' list: type_id=%s issue_id=%s", type_id, issue_id)
         return None
 
     grade_text = _text_of(grade)
     for entry in prices:
         if isinstance(entry, dict) and _text_of(entry.get("grade")) == grade_text and entry.get("price") is not None:
-            app.logger.info("[numista] exact grade price match: type_id=%s grade=%r price=%s", type_id, grade, entry["price"])
+            app.logger.info("[numista] exact grade price match: type_id=%s issue_id=%s grade=%r price=%s", type_id, issue_id, grade, entry["price"])
             return {"value": entry["price"], "grade": entry.get("grade"), "exact_grade_match": True}
 
     priced = [entry for entry in prices if isinstance(entry, dict) and entry.get("price") is not None]
     if not priced:
-        app.logger.info("[numista] no priced grade entries found: type_id=%s", type_id)
+        app.logger.info("[numista] no priced grade entries found: type_id=%s issue_id=%s", type_id, issue_id)
         return None
     middle = priced[len(priced) // 2]
     app.logger.info(
-        "[numista] no exact grade match, using nearest available: type_id=%s requested_grade=%r used_grade=%r price=%s",
-        type_id, grade, middle.get("grade"), middle["price"],
+        "[numista] no exact grade match, using nearest available: type_id=%s issue_id=%s requested_grade=%r used_grade=%r price=%s",
+        type_id, issue_id, grade, middle.get("grade"), middle["price"],
     )
     return {"value": middle["price"], "grade": middle.get("grade"), "exact_grade_match": False}
 
@@ -865,16 +1012,17 @@ def estimate_value(identification, numista_data):
         return {"status": "unavailable", "currency": "USD", "source": "CoinLens", "reason": "No confident Numista catalog match."}
 
     type_id = numista_data.get("numista_type_id") or numista_data.get("id")
-    if type_id is None:
-        app.logger.info("[valuation] unavailable: Numista match had no usable type id")
+    issue_id = numista_data.get("numista_issue_id")
+    if type_id is None or issue_id is None:
+        app.logger.info("[valuation] unavailable: Numista match had no usable type/issue id")
         return {"status": "unavailable", "currency": "USD", "source": "CoinLens", "reason": "No confident Numista catalog match."}
 
-    price = fetch_numista_price(type_id, identification.get("estimated_grade"))
+    price = fetch_numista_price(type_id, issue_id, identification.get("estimated_grade"))
     if not price:
-        app.logger.info("[valuation] unavailable: Numista match found (type_id=%s) but no usable price", type_id)
+        app.logger.info("[valuation] unavailable: Numista match found (type_id=%s issue_id=%s) but no usable price", type_id, issue_id)
         return {"status": "unavailable", "currency": "USD", "source": "Numista", "reason": "Numista match found but no usable price for this grade."}
 
-    app.logger.info("[valuation] available from Numista: type_id=%s value=%s", type_id, price["value"])
+    app.logger.info("[valuation] available from Numista: type_id=%s issue_id=%s value=%s", type_id, issue_id, price["value"])
     return {
         "status": "available",
         "estimated_value": round(float(price["value"]), 2),
