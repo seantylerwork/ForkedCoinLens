@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `88bd7b0` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `a36d38a` (origin/seperate).
 
 ---
 
@@ -1824,7 +1824,92 @@ Not Recognized" message.
 
 ---
 
-## 27. Pending external actions
+## 27. Follow-up fix: issue-classifier keyword gap ("uncirculated" missing)
+
+**Trigger**: §26's low-reasoning-effort fix worked live -
+`reasoning_tokens=135/241`, `response_status=completed` on two real scans
+(a 2016 Canada 5 cents and, per the earlier §26 confirmation report, a
+successful UK 20p scan) - OpenAI is healthy, not touched here. But the
+2016 Canada 5-cent scan then hit the *exact same failure shape* as the
+UK 20p bug (§24/§25): the correct type (395, "5 Cents - Elizabeth II
+(4th portrait; magnetic with RCM logo)", `Standard circulation coins`)
+was rejected with `"year matched but multiple ordinary issues remain
+indistinguishable"`, even though only **one** of its four 2016 issues
+(284842, blank comment) was genuinely ordinary - issue 853959 (`comment:
+"Uncirculated"`) was incorrectly classified `special=False` and tied
+with it.
+
+**Whether the intended fix was missing, undeployed, or logically
+broken**: none of the first two - confirmed **logically broken**. Per
+explicit instruction, verified deployment state first: `git log`/`git
+status` showed local HEAD == `origin/seperate` HEAD (`17bf7de`) with a
+clean working tree - nothing uncommitted, nothing undeployed. The Render
+log itself was further proof: it showed *every* prior fix firing
+correctly in sequence (`issuer resolution`, `structured search response`,
+`denomination disambiguation`, the `issue evaluation` diagnostic lines
+from §24) - this was live, current code running exactly as committed.
+The bug was a straightforward gap in the §23 issue-level keyword set
+itself.
+
+**Exact predicate causing `"uncirculated" -> special=False`**:
+`ISSUE_SPECIAL_KEYWORDS` (added in §23) was
+`{"proof", "bu", "specimen", "pattern", "prooflike", "matte"}` - it never
+included `"uncirculated"` or `"brilliant"` at all. `_looks_special_issue`
+tokenizes an issue's comment into whole words and checks set
+intersection; `"uncirculated"` tokenized to `{"uncirculated"}` has no
+overlap with that set, so it fell through to `special=False` every time,
+regardless of casing.
+
+**Exact fix** (`server/app.py`, commit `a36d38a`): added `"uncirculated"`,
+`"brilliant"`, and a literal `"prooflike"` (previously only reachable
+incidentally via the "proof" token inside "proof-like") to
+`ISSUE_SPECIAL_KEYWORDS`; added a new `ISSUE_SPECIAL_PHRASES =
+("special edition", "mint set", "proof set")` checked as whole-string
+substrings (not individual tokens, since "edition"/"set" alone are too
+generic to trust as single-word signals) for the two-word markers the
+task required. Documented explicitly in-code: a Numista issue's own
+`"Uncirculated"` **comment** is a distinct mint/collector-product concept
+from the AI's own `"AU"` (About Uncirculated) **condition grade** -
+`ai_indicates_special_variant` (type-level, §22) only ever reads the AI's
+identification text and was never at risk of conflating the two; this was
+purely a keyword-coverage gap in the issue-level classifier, not a
+design/architecture problem.
+
+**One outdated test fixed in the process**:
+`test_looks_special_issue_matches_whole_words_only` asserted
+`{"comment": "About uncirculated"}` -> `special=False` - that assertion
+was itself encoding the same misunderstanding this bug came from (treating
+an issue-level "Uncirculated" comment as if it were an AU-grade phrase);
+updated to expect `special=True`, since a Numista issue comment saying
+"Uncirculated" is always the special-product marker, "About" or not.
+
+**Deployed/current commit**: `a36d38a` (pushed to `origin/seperate`,
+confirmed via `git log`/`git status` before making any change, per the
+task's explicit "verify first" instruction).
+
+**Tests**: 113/113 Python passing (111 → 113: the exact live 2016 Canada
+5-cent issue set with an AU-55/"standard circulation design" AI result
+now selects issue 284842 via `_select_issue_for_year`; the full required
+keyword table - Proof, Prooflike, Proof-like, Specimen, Uncirculated,
+Brilliant Uncirculated, BU, Special Edition, Mint Set, Proof Set, blank ->
+ordinary - directly unit-tested). 34/34 JS passing (unaffected, no JS
+touched).
+
+**Confirmed untouched** (re-ran both full suites unmodified): structured
+Numista search, issuer resolution, denomination normalization, type
+scoring, type-level variant filtering (§22), grade normalization (§25),
+price endpoint/parsing, OpenAI reasoning settings (§26), auth,
+quota/rate-limit, persistence, frontend.
+
+**Confirmed expected live path**: type 395 -> issue 284842 -> Numista
+prices - the same 2016 Canada 5-cent coin (or any similar coin whose
+correct issue has a blank comment while a same-year sibling issue is
+marked "Uncirculated"/"BU"/"Proof"/etc.) should now resolve to the
+ordinary issue and reach a real price lookup instead of "unavailable."
+
+---
+
+## 28. Pending external actions
 
 1. ~~Run this in the Supabase SQL editor~~ — **now believed applied**: the
    real scan in §14 ran with `MOCK_MODE` off and reached
@@ -1950,15 +2035,23 @@ Not Recognized" message.
     Recognized".
 
 Everything through §26 (code, tests, all commits through `88bd7b0`) is
+18. See §27 - watch the next live scan (2016 Canada 5 cents, or the UK
+    20p from §24/§25) for type 395 -> issue 284842 -> an actual Numista
+    price, which would be the *first* real scan this entire session to
+    show a confident `estimated_value` end-to-end rather than
+    "unavailable" for one reason or another.
+
+Everything through §27 (code, tests, all commits through `a36d38a`) is
 committed and pushed to `origin/seperate`. §15 (rate limit) + §16
 (truncated response) are confirmed fixed by real, non-mock scans; §17-§20
 (Numista matching/pricing, 429 diagnostics, retry_after_seconds, issuer
 resolution), §21 (summary/log-scan fixes), §22 (type-level variant
 disambiguation), §23 (denomination normalization + issue-level variant
 preference), §24 (diagnostic logging + accurate rejection reasons), §25
-(grade normalization), and §26 (low reasoning effort + ai_incomplete) are
-all implemented, tested, and pushed - but no real scan has yet shown a
-confident `estimated_value` end-to-end. The next live scan (type 5628 ->
-issue 144284 -> grade "f" -> price $0.28, now hopefully without an
-intermittent reasoning-exhaustion failure along the way) is the one most
-likely to finally do so.
+(grade normalization), §26 (low reasoning effort + ai_incomplete), and §27
+(issue-classifier keyword gap) are all implemented, tested, and pushed -
+but no real scan has yet shown a confident `estimated_value` end-to-end.
+Two independent real scans (UK 20p, Canada 5c) have now made it all the
+way to the type+issue-resolution finish line only to be caught by two
+separate, now-fixed bugs in a row - the next live scan is the one most
+likely to finally clear the whole pipeline.
