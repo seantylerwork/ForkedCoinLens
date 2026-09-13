@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import unittest
@@ -162,6 +163,31 @@ class ResolveTypeAndIssueTests(unittest.TestCase):
         mock_issues.assert_not_called()
         self.assertIsNone(best)
 
+    def test_multiple_candidates_with_matching_issues_return_unavailable_not_a_guess(self):
+        """Real production scenario: several plausible UK 20p-family types
+        could each turn out to have an issue for the identified year. Since
+        we can't safely tell them apart, this must report unavailable
+        rather than silently picking one (e.g. by score)."""
+        candidate_a = {
+            "id": 1, "title": "20 Pence - Elizabeth II (Type A)",
+            "issuer": {"name": "United Kingdom"}, "min_year": 2008, "max_year": 2015,
+        }
+        candidate_b = {
+            "id": 2, "title": "20 Pence - Elizabeth II (Type B)",
+            "issuer": {"name": "United Kingdom"}, "min_year": 2008, "max_year": 2015,
+        }
+
+        def fake_issues(type_id):
+            return [{"id": f"iss-{type_id}-2012", "year": 2012}]
+
+        with mock.patch.object(coinlens_app, "fetch_numista_issues", side_effect=fake_issues):
+            best, issue = coinlens_app.resolve_numista_type_and_issue(
+                identification(country="United Kingdom", denomination="20 pence", year="2012"),
+                [candidate_a, candidate_b],
+            )
+        self.assertIsNone(best)
+        self.assertIsNone(issue)
+
 
 class FetchNumistaPriceTests(unittest.TestCase):
     def test_requests_the_issue_scoped_price_endpoint(self):
@@ -216,6 +242,162 @@ class LookupNumistaIntegrationTests(unittest.TestCase):
              mock.patch.object(coinlens_app, "fetch_numista_issues", return_value=[{"id": "iss-1990", "year": 1990}]):
             result = coinlens_app.lookup_numista(identification())
         self.assertIsNone(result)
+
+
+class IssuerResolutionTests(unittest.TestCase):
+    """Numista's /types `issuer` param expects a real issuer code, not an
+    arbitrary country string - these cover resolving one from Numista's own
+    /issuers list (never a hardcoded guess), the small alias map for
+    obvious AI phrasing, the in-process cache, and safe failure modes."""
+
+    def setUp(self):
+        self._orig_key = coinlens_app.NUMISTA_API_KEY
+        self._orig_cache = dict(coinlens_app._numista_issuer_cache)
+        coinlens_app.NUMISTA_API_KEY = "test-key"
+        coinlens_app._numista_issuer_cache["by_name"] = None
+        coinlens_app._numista_issuer_cache["fetched_at"] = 0.0
+        self.addCleanup(lambda: setattr(coinlens_app, "NUMISTA_API_KEY", self._orig_key))
+        self.addCleanup(lambda: coinlens_app._numista_issuer_cache.update(self._orig_cache))
+
+    def _issuers_response(self, issuers):
+        resp = mock.Mock(status_code=200)
+        resp.text = json.dumps({"issuers": issuers})
+        resp.json.return_value = {"issuers": issuers}
+        return resp
+
+    def test_resolves_a_real_issuer_name_to_its_code(self):
+        issuers = [{"code": "royaume-uni", "name": "United Kingdom"}, {"code": "france", "name": "France"}]
+        with mock.patch.object(coinlens_app.requests, "get", return_value=self._issuers_response(issuers)):
+            code = coinlens_app.resolve_numista_issuer_code("United Kingdom")
+        self.assertEqual(code, "royaume-uni")
+
+    def test_handles_uk_alias(self):
+        issuers = [{"code": "royaume-uni", "name": "United Kingdom"}]
+        with mock.patch.object(coinlens_app.requests, "get", return_value=self._issuers_response(issuers)):
+            code = coinlens_app.resolve_numista_issuer_code("UK")
+        self.assertEqual(code, "royaume-uni")
+
+    def test_handles_usa_and_us_aliases(self):
+        issuers = [{"code": "etats-unis", "name": "United States"}]
+        with mock.patch.object(coinlens_app.requests, "get", return_value=self._issuers_response(issuers)):
+            code_usa = coinlens_app.resolve_numista_issuer_code("USA")
+            code_us = coinlens_app.resolve_numista_issuer_code("US")
+        self.assertEqual(code_usa, "etats-unis")
+        self.assertEqual(code_us, "etats-unis")
+
+    def test_matches_case_insensitively(self):
+        issuers = [{"code": "canada", "name": "Canada"}]
+        with mock.patch.object(coinlens_app.requests, "get", return_value=self._issuers_response(issuers)):
+            code = coinlens_app.resolve_numista_issuer_code("cAnAdA")
+        self.assertEqual(code, "canada")
+
+    def test_caches_issuer_list_and_does_not_refetch_on_every_call(self):
+        issuers = [{"code": "canada", "name": "Canada"}]
+        with mock.patch.object(coinlens_app.requests, "get", return_value=self._issuers_response(issuers)) as mock_get:
+            coinlens_app.resolve_numista_issuer_code("Canada")
+            coinlens_app.resolve_numista_issuer_code("Canada")
+            coinlens_app.resolve_numista_issuer_code("Canada")
+        self.assertEqual(mock_get.call_count, 1)
+
+    def test_unresolvable_country_returns_none_without_raising(self):
+        issuers = [{"code": "canada", "name": "Canada"}]
+        with mock.patch.object(coinlens_app.requests, "get", return_value=self._issuers_response(issuers)):
+            code = coinlens_app.resolve_numista_issuer_code("Atlantis")
+        self.assertIsNone(code)
+
+    def test_issuer_fetch_failure_returns_none_without_raising(self):
+        with mock.patch.object(coinlens_app.requests, "get", side_effect=coinlens_app.requests.RequestException("boom")):
+            code = coinlens_app.resolve_numista_issuer_code("Canada")
+        self.assertIsNone(code)
+
+
+class StructuredSearchTests(unittest.TestCase):
+    """Reproduces the real 2012 UK 20 pence case: free-text search for
+    "United Kingdom 20 pence" returned mostly Isle of Man candidates, and
+    every one correctly failed issue validation (1982/1983 issues only) -
+    the search step itself needs to give the pipeline a fair shot via a
+    structured, issuer-scoped query instead of free text."""
+
+    def setUp(self):
+        self._orig_key = coinlens_app.NUMISTA_API_KEY
+        coinlens_app.NUMISTA_API_KEY = "test-key"
+        self.addCleanup(lambda: setattr(coinlens_app, "NUMISTA_API_KEY", self._orig_key))
+
+    def _search_response(self, results):
+        resp = mock.Mock(status_code=200)
+        resp.text = json.dumps({"types": results})
+        resp.json.return_value = {"types": results}
+        return resp
+
+    def test_uk_20_pence_2012_structured_search_includes_denomination_issuer_year_category(self):
+        candidates = [{"id": 10799, "title": "20 Pence - Elizabeth II", "issuer": {"name": "United Kingdom"}}]
+        with mock.patch.object(coinlens_app, "resolve_numista_issuer_code", return_value="royaume-uni"), \
+             mock.patch.object(coinlens_app.requests, "get", return_value=self._search_response(candidates)) as mock_get:
+            results = coinlens_app.search_numista_types(
+                identification(country="United Kingdom", denomination="20 pence", year="2012")
+            )
+
+        self.assertEqual(results, candidates)
+        params = mock_get.call_args.kwargs["params"]
+        self.assertEqual(params["q"], "20 pence")
+        self.assertEqual(params["issuer"], "royaume-uni")
+        self.assertEqual(params["year"], 2012)
+        self.assertEqual(params["category"], "coin")
+
+    def test_country_is_not_stuffed_into_q_when_issuer_is_available(self):
+        with mock.patch.object(coinlens_app, "resolve_numista_issuer_code", return_value="royaume-uni"), \
+             mock.patch.object(coinlens_app.requests, "get", return_value=self._search_response([])) as mock_get:
+            coinlens_app.search_numista_types(
+                identification(country="United Kingdom", denomination="20 pence", year="2012")
+            )
+        params = mock_get.call_args.kwargs["params"]
+        self.assertNotIn("united kingdom", params["q"].lower())
+
+    def test_issuer_resolution_failure_falls_back_to_denomination_and_year_search(self):
+        fallback_candidates = [{"id": 1, "title": "20 Pence"}]
+        with mock.patch.object(coinlens_app, "resolve_numista_issuer_code", return_value=None), \
+             mock.patch.object(coinlens_app.requests, "get", return_value=self._search_response(fallback_candidates)) as mock_get:
+            results = coinlens_app.search_numista_types(
+                identification(country="United Kingdom", denomination="20 pence", year="2012")
+            )
+
+        self.assertEqual(results, fallback_candidates)
+        self.assertEqual(mock_get.call_count, 1)  # no wasted structured attempt when issuer resolution already failed
+        params = mock_get.call_args.kwargs["params"]
+        self.assertNotIn("issuer", params)
+        self.assertEqual(params["q"], "20 pence")
+        self.assertEqual(params["year"], 2012)
+        self.assertEqual(params["category"], "coin")
+
+    def test_structured_search_with_no_candidates_falls_back_to_denomination_only(self):
+        empty = self._search_response([])
+        fallback_candidates = [{"id": 2, "title": "20 Pence"}]
+        filled = self._search_response(fallback_candidates)
+        with mock.patch.object(coinlens_app, "resolve_numista_issuer_code", return_value="royaume-uni"), \
+             mock.patch.object(coinlens_app.requests, "get", side_effect=[empty, filled]) as mock_get:
+            results = coinlens_app.search_numista_types(
+                identification(country="United Kingdom", denomination="20 pence", year="2012")
+            )
+
+        self.assertEqual(results, fallback_candidates)
+        self.assertEqual(mock_get.call_count, 2)
+        fallback_params = mock_get.call_args_list[1].kwargs["params"]
+        self.assertNotIn("issuer", fallback_params)
+
+
+class MockModeUnaffectedTests(unittest.TestCase):
+    def setUp(self):
+        self._orig_mock_mode = coinlens_app.MOCK_MODE
+        coinlens_app.MOCK_MODE = True
+        self.addCleanup(lambda: setattr(coinlens_app, "MOCK_MODE", self._orig_mock_mode))
+
+    def test_lookup_numista_mock_mode_is_unaffected_by_issuer_resolution(self):
+        with mock.patch.object(coinlens_app, "search_numista_types") as mock_search, \
+             mock.patch.object(coinlens_app, "resolve_numista_issuer_code") as mock_resolve:
+            result = coinlens_app.lookup_numista(identification())
+        mock_search.assert_not_called()
+        mock_resolve.assert_not_called()
+        self.assertEqual(result, dict(coinlens_app.MOCK_NUMISTA))
 
 
 if __name__ == "__main__":

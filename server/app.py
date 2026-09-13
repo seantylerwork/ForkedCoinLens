@@ -4,6 +4,7 @@ import base64
 import binascii
 import json
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 
 import requests
@@ -64,6 +65,7 @@ OPENAI_CHAT_URL = "https://api.openai.com/v1/chat/completions"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 NUMISTA_TYPES_URL = "https://api.numista.com/api/v3/types"
 NUMISTA_COINS_URL = "https://api.numista.com/api/v3/coins"
+NUMISTA_ISSUERS_URL = "https://api.numista.com/api/v3/issuers"
 PCGS_PRICE_URL = "https://api.pcgs.com/publicapi/priceguide/getpricedata/{pcgs_number}"
 
 REQUEST_TIMEOUT = 60
@@ -679,7 +681,7 @@ def _numista_result_list(payload):
         return payload
     if not isinstance(payload, dict):
         return []
-    for key in ("types", "items", "results", "issues"):
+    for key in ("types", "items", "results", "issues", "issuers"):
         value = payload.get(key)
         if isinstance(value, list):
             return value
@@ -740,46 +742,177 @@ def score_numista_candidate(identification, candidate):
 # enough not to flood Render logs on every scan.
 NUMISTA_LOG_BODY_CHARS = 1500
 
+# ---------------------------------------------------------------------------
+# Issuer resolution: a real scan (UK 20 pence, 2012) showed free-text search
+# ("United Kingdom 20 pence") ranking same-denomination coins from unrelated
+# issuers (mostly Isle of Man) ahead of the real match, and the issue-year
+# check correctly rejected all of them - the search step itself wasn't
+# giving the matching pipeline a fair shot. Numista's /types search accepts
+# a structured `issuer` code (not an arbitrary country string), resolved
+# here from Numista's own /issuers list - never a hardcoded/guessed code.
+# ---------------------------------------------------------------------------
 
-def search_numista_types(identification):
-    """Returns a list of candidate Numista types, or None if the lookup
-    itself failed (as opposed to succeeding with zero results)."""
-    query = " ".join(filter(None, [identification.get("country"), identification.get("denomination")])).strip()
-    if not query:
-        app.logger.info("[numista] search skipped: no country/denomination to build a query from")
-        return []
+NUMISTA_ISSUER_CACHE_TTL_SECONDS = 24 * 60 * 60  # the issuer list barely changes; avoid refetching it every scan
+_numista_issuer_cache = {"by_name": None, "fetched_at": 0.0}
+
+# A handful of obvious AI-phrasing aliases for country names that don't
+# literally match Numista's own issuer display name. Resolved before the
+# real /issuers lookup, never as a substitute for it.
+NUMISTA_ISSUER_NAME_ALIASES = {
+    "uk": "united kingdom",
+    "u.k.": "united kingdom",
+    "usa": "united states",
+    "u.s.a.": "united states",
+    "us": "united states",
+    "u.s.": "united states",
+}
+
+
+def fetch_numista_issuers():
+    """Returns the raw list of Numista issuer records ({"code", "name", ...}),
+    or None if the request itself failed."""
+    try:
+        upstream = requests.get(
+            NUMISTA_ISSUERS_URL,
+            headers={"Numista-API-Key": NUMISTA_API_KEY},
+            timeout=NUMISTA_TIMEOUT,
+        )
+        upstream.raise_for_status()
+        data = upstream.json()
+    except (requests.RequestException, ValueError) as error:
+        app.logger.warning("[numista] issuers fetch failed: error=%s", error)
+        return None
+
+    app.logger.info(
+        "[numista] issuers response: status=%s body=%s",
+        upstream.status_code, upstream.text[:NUMISTA_LOG_BODY_CHARS],
+    )
+    return _numista_result_list(data)
+
+
+def _numista_issuer_name_index(force_refresh=False):
+    """Returns {normalized_issuer_name: code}, refetched at most once per
+    NUMISTA_ISSUER_CACHE_TTL_SECONDS (a simple in-process cache - no DB
+    table, no extra service; fine for this prototype's single-process
+    scale). Never raises: a fetch failure just serves whatever's already
+    cached (possibly empty), which callers treat as "resolution failed,
+    use the fallback search" rather than an error."""
+    now = time.time()
+    if not force_refresh and _numista_issuer_cache["by_name"] is not None \
+            and (now - _numista_issuer_cache["fetched_at"]) < NUMISTA_ISSUER_CACHE_TTL_SECONDS:
+        return _numista_issuer_cache["by_name"]
+
+    issuers = fetch_numista_issuers()
+    if issuers is None:
+        return _numista_issuer_cache["by_name"] or {}
+
+    by_name = {
+        _text_of(issuer.get("name")): issuer.get("code")
+        for issuer in issuers
+        if isinstance(issuer, dict) and issuer.get("name") and issuer.get("code")
+    }
+    _numista_issuer_cache["by_name"] = by_name
+    _numista_issuer_cache["fetched_at"] = now
+    app.logger.info("[numista] issuer cache refreshed: %d issuer(s)", len(by_name))
+    return by_name
+
+
+def resolve_numista_issuer_code(country_text):
+    """Maps an AI-identified country string to a real Numista issuer code
+    via Numista's own (cached) /issuers list - never a hardcoded guess.
+    Returns None - never raises - when the country is blank, the issuer
+    list can't be fetched, or nothing matches; callers must fall back to a
+    non-issuer-scoped search rather than failing the whole scan."""
+    normalized = _text_of(country_text)
+    if not normalized:
+        return None
+    normalized = NUMISTA_ISSUER_NAME_ALIASES.get(normalized, normalized)
+    try:
+        by_name = _numista_issuer_name_index()
+    except Exception as error:  # belt-and-suspenders: must never fail a scan
+        app.logger.warning("[numista] issuer resolution failed unexpectedly: %s", error)
+        return None
+    return by_name.get(normalized)
+
+
+def _numista_year_param(identification):
+    year_text = _text_of(identification.get("year"))
+    return int(year_text) if year_text.isdigit() else None
+
+
+def _numista_search_request(params, label):
+    """Runs one /types search with the given params, logging under `label`
+    (e.g. "structured"/"fallback"). Returns a list (possibly empty) of
+    candidates, or None if the request itself failed."""
     try:
         upstream = requests.get(
             NUMISTA_TYPES_URL,
-            # count=12, not 8: real search responses show Numista's own
-            # free-text relevance ranking can put same-denomination coins
-            # from an unrelated country ahead of the correct country's
-            # match (e.g. "Canada 1 dollar" surfacing Australian "1 Dollar"
-            # types first) - a slightly wider net gives the type+issue
-            # resolution step below more real candidates to work with,
-            # still a single search call either way.
-            params={"q": query, "category": "coin", "count": 12},
+            params=params,
             headers={"Numista-API-Key": NUMISTA_API_KEY},
             timeout=NUMISTA_TIMEOUT,
         )
     except requests.RequestException as error:
-        app.logger.error("[numista] search request failed: query=%r error=%s", query, error)
+        app.logger.error("[numista] %s search request failed: params=%s error=%s", label, params, error)
         return None
 
     app.logger.info(
-        "[numista] search response: query=%r status=%s body=%s",
-        query, upstream.status_code, upstream.text[:NUMISTA_LOG_BODY_CHARS],
+        "[numista] %s search response: params=%s status=%s body=%s",
+        label, params, upstream.status_code, upstream.text[:NUMISTA_LOG_BODY_CHARS],
     )
-
     try:
         upstream.raise_for_status()
         results = _numista_result_list(upstream.json())
     except (requests.RequestException, ValueError) as error:
-        app.logger.error("[numista] search response unusable: query=%r error=%s", query, error)
+        app.logger.error("[numista] %s search response unusable: params=%s error=%s", label, params, error)
         return None
 
-    app.logger.info("[numista] search found %d candidate(s) for query=%r", len(results), query)
+    app.logger.info("[numista] candidate count=%d (%s search)", len(results), label)
     return results
+
+
+def search_numista_types(identification):
+    """Returns a list of candidate Numista types, or None if the lookup
+    itself failed (as opposed to succeeding with zero results).
+
+    Prefers a structured search scoped to the AI-identified country's real
+    Numista issuer code (see resolve_numista_issuer_code) plus denomination
+    and year, instead of stuffing the country name into free-text `q` -
+    real scans showed free text ranking same-denomination coins from
+    unrelated issuers ahead of the correct one. Falls back to a
+    denomination(+year)-only search, still feeding the existing
+    scoring/issue-validation pipeline, when issuer resolution fails or the
+    structured search itself returns nothing usable - never falls back to
+    blindly picking a free-text result."""
+    denomination = (identification.get("denomination") or "").strip()
+    if not denomination:
+        app.logger.info("[numista] search skipped: no denomination to build a query from")
+        return []
+
+    country = (identification.get("country") or "").strip()
+    year = _numista_year_param(identification)
+    issuer_code = resolve_numista_issuer_code(country) if country else None
+    app.logger.info("[numista] issuer resolution: AI country=%r resolved issuer code=%r", country, issuer_code)
+
+    if issuer_code:
+        structured_params = {"q": denomination, "issuer": issuer_code, "category": "coin", "count": 12}
+        if year is not None:
+            structured_params["year"] = year
+        app.logger.info("[numista] search params: %s", structured_params)
+        results = _numista_search_request(structured_params, "structured")
+        if results:
+            return results
+        app.logger.info(
+            "[numista] falling back to denomination-only search: structured search %s",
+            "failed" if results is None else "returned no candidates",
+        )
+    else:
+        app.logger.info("[numista] falling back to denomination-only search: issuer resolution failed")
+
+    fallback_params = {"q": denomination, "category": "coin", "count": 12}
+    if year is not None:
+        fallback_params["year"] = year
+    app.logger.info("[numista] search params (fallback): %s", fallback_params)
+    return _numista_search_request(fallback_params, "fallback")
 
 
 def fetch_numista_type_detail(type_id):
@@ -922,6 +1055,13 @@ def resolve_numista_type_and_issue(identification, candidates):
         )
         return None, None
 
+    # Checks every inspected candidate (not just the first hit) so that
+    # multiple types with a real matching issue can be detected as
+    # ambiguous, rather than silently trusting whichever scored highest -
+    # the score already proved unreliable for ranking (see the module
+    # comment above search_numista_types); it must not also be trusted for
+    # tie-breaking a factual match.
+    matches = []
     for total, _breakdown, candidate in to_inspect:
         type_id = candidate.get("id")
         if type_id is None:
@@ -937,17 +1077,29 @@ def resolve_numista_type_and_issue(identification, candidates):
                 type_id, candidate.get("title"), total, identification.get("year"),
             )
             continue
-        app.logger.info(
-            "[numista] selected type+issue: type_id=%s title=%r score=%s issue_id=%s issue_year=%s",
-            type_id, candidate.get("title"), total, selected_issue.get("id"), selected_issue.get("year"),
-        )
-        return candidate, selected_issue
+        matches.append((candidate, selected_issue))
 
+    if not matches:
+        app.logger.info(
+            "[numista] no confident match: none of the top %d inspected candidate(s) had a matching issue",
+            len(to_inspect),
+        )
+        return None, None
+
+    if len(matches) > 1:
+        app.logger.info(
+            "[numista] no confident match: %d candidates all had an issue matching year=%r - ambiguous, not guessing: %s",
+            len(matches), identification.get("year"),
+            [(c.get("id"), c.get("title"), issue.get("id")) for c, issue in matches],
+        )
+        return None, None
+
+    candidate, selected_issue = matches[0]
     app.logger.info(
-        "[numista] no confident match: none of the top %d inspected candidate(s) had a matching issue",
-        len(to_inspect),
+        "[numista] selected type+issue: type_id=%s title=%r issue_id=%s issue_year=%s",
+        candidate.get("id"), candidate.get("title"), selected_issue.get("id"), selected_issue.get("year"),
     )
-    return None, None
+    return candidate, selected_issue
 
 
 def lookup_numista(identification):
