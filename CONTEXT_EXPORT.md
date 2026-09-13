@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `a36d38a` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `e8feda0` (origin/seperate).
 
 ---
 
@@ -1909,7 +1909,82 @@ ordinary issue and reach a real price lookup instead of "unavailable."
 
 ---
 
-## 28. Pending external actions
+## 28. Follow-up fix: trailing-parenthetical denomination titles (Hong Kong $2)
+
+**Trigger**: a live Hong Kong $2 scan (`country=Hong Kong,
+denomination="2 dollars", year=1997`) - the *first* real scan this
+session to actually reach a confident selection - exposed one more small
+denomination-matching gap. Structured search correctly returned three
+candidates (5276 "20 Cents (Special Administration Region)", 1582 "2
+Dollars", 5280 "2 Dollars (Special Administration Region)"); denomination
+disambiguation correctly kept 1582 but **also incorrectly dropped 5280**,
+even though 5280 is genuinely a "2 dollars" coin (a circulating
+commemorative variant of the same denomination).
+
+**Exact reason the parenthetical title previously failed**:
+`_numista_title_denomination` only ever stripped text after a `" - "`
+series separator. Candidate 5280's title has **no dash at all** - just a
+denomination followed directly by a parenthetical qualifier. With
+nothing to strip, the *whole* title (including the qualifier's own words
+"special"/"administration"/"region") was fed into
+`normalize_numista_denomination`, whose tokenizer folded all of those
+words into the "unit" portion of the canonical string - producing `"2
+dollar special administration region"` instead of `"2 dollar"`, which
+then never equaled the AI's plain `"2 dollar"`.
+
+**Exact normalization/parsing change** (`server/app.py`,
+`_numista_title_denomination`, commit `e8feda0`): after the existing `"
+- "` split, added one line stripping a **trailing** parenthetical (only
+when it ends the string) via `re.sub(r"\s*\([^()]*\)\s*$", "", prefix)`,
+before handing the result to the unchanged `normalize_numista_denomination`.
+Nothing about denomination *equality* itself (the number+unit comparison
+logic) was touched - only what text reaches it.
+
+**Result for `"2 Dollars (Special Administration Region)"`**: now
+normalizes to `"2 dollar"`, matching the AI's `"2 dollars"` -> `"2
+dollar"`. **Confirmed**: `"20 Cents (Special Administration Region)"`
+still normalizes to `"20 cent"` and does **not** match `"2 dollar"` -
+verified directly, plus `"20 Dollars"` still correctly does not match `"2
+dollar"` (a wrong digit is never normalized away, exactly as before).
+
+**Confirmed the existing Hong Kong $2 regression still selects the
+correct standard-circulation type**: a new end-to-end test feeds the
+exact three real candidates into `resolve_numista_type_and_issue` - both
+1582 ("Standard circulation coins") and 5280 ("Circulating commemorative
+coins") now correctly survive the denomination check together (as
+required - denomination matching must not itself judge
+circulation-vs-commemorative), and the **already-existing, untouched**
+type-level variant step then correctly prefers 1582 over the
+commemorative 5280 for an ordinary AI description, landing on type_id
+1582 exactly as it should.
+
+**Tests**: 119/119 Python passing (113 → 119: the exact task-specified
+match/no-match table, plus the full three-candidate end-to-end regression
+using the real Hong Kong candidates). 34/34 JS passing (unaffected - no
+JS touched).
+
+**Not changed** (confirmed by re-running both full suites unmodified):
+OpenAI, issuer resolution, structured Numista search, issue/year
+validation, type-level variant classification (§22), issue-level variant
+classification (§27), grade normalization (§25), price lookup, auth,
+quota/rate-limit handling, persistence, frontend, database schema.
+
+**Significance**: per the user's own framing, this Hong Kong $2 scan was
+already a *successful* live scan end to end - the core matching pipeline
+(search -> scoring -> denomination -> issue/year -> variant
+disambiguation -> price) is validated. This bug happened not to change
+the final outcome for this particular scan (1582 was correctly selected
+either way, since narrowing to "1 candidate" trivially wins regardless of
+whether 5280 was wrongly dropped along the way) - it's exactly the kind
+of latent correctness bug that could silently misfire on a *future* scan
+where the wrongly-dropped candidate would have mattered (e.g., a
+different coin where the commemorative variant, not the standard one,
+was actually the correct answer). Fixed as pure cleanup, not a pipeline
+redesign, per explicit instruction.
+
+---
+
+## 29. Pending external actions
 
 1. ~~Run this in the Supabase SQL editor~~ — **now believed applied**: the
    real scan in §14 ran with `MOCK_MODE` off and reached
@@ -2041,17 +2116,23 @@ Everything through §26 (code, tests, all commits through `88bd7b0`) is
     show a confident `estimated_value` end-to-end rather than
     "unavailable" for one reason or another.
 
-Everything through §27 (code, tests, all commits through `a36d38a`) is
+19. See §28 - a real Hong Kong $2 scan already succeeded end-to-end
+    (per the user's own report) despite this latent bug, since the final
+    winning type happened to be unaffected. Nothing further to verify
+    live for this specific fix; watch future scans of coins with a
+    circulating-commemorative sibling for any similar title-parsing edge
+    case.
+
+Everything through §28 (code, tests, all commits through `e8feda0`) is
 committed and pushed to `origin/seperate`. §15 (rate limit) + §16
 (truncated response) are confirmed fixed by real, non-mock scans; §17-§20
 (Numista matching/pricing, 429 diagnostics, retry_after_seconds, issuer
 resolution), §21 (summary/log-scan fixes), §22 (type-level variant
 disambiguation), §23 (denomination normalization + issue-level variant
 preference), §24 (diagnostic logging + accurate rejection reasons), §25
-(grade normalization), §26 (low reasoning effort + ai_incomplete), and §27
-(issue-classifier keyword gap) are all implemented, tested, and pushed -
-but no real scan has yet shown a confident `estimated_value` end-to-end.
-Two independent real scans (UK 20p, Canada 5c) have now made it all the
-way to the type+issue-resolution finish line only to be caught by two
-separate, now-fixed bugs in a row - the next live scan is the one most
-likely to finally clear the whole pipeline.
+(grade normalization), §26 (low reasoning effort + ai_incomplete), §27
+(issue-classifier keyword gap), and §28 (trailing-parenthetical
+denomination titles) are all implemented, tested, and pushed. The core
+Numista matching pipeline is now validated by at least one fully
+successful real, live scan (Hong Kong $2) - remaining work is cleanup on
+edge cases like this one, not pipeline-blocking bugs.
