@@ -817,8 +817,21 @@ def normalize_numista_denomination(text):
 def _numista_title_denomination(title):
     """Numista titles conventionally start "<denomination> - <series...>"
     (e.g. "20 Pence - Elizabeth II (...)") - takes the part before the
-    first " - " as the candidate's own denomination phrase."""
+    first " - " as the candidate's own denomination phrase.
+
+    Some titles have no " - " series separator at all and instead put a
+    descriptive qualifier directly after the denomination in parentheses
+    (e.g. "2 Dollars (Special Administration Region)") - a real Hong Kong
+    $2 scan showed this trailing qualifier's words ("special",
+    "administration", "region") getting folded into the normalized
+    denomination by normalize_numista_denomination, which never matched
+    the AI's plain "2 dollars" as a result. Stripping a trailing
+    parenthetical here (only when it trails the whole title, i.e. there
+    was no " - " to already remove it) fixes that without touching
+    denomination equality itself - "20 Cents (Special Administration
+    Region)" still normalizes to "20 cent", never "2 dollar"."""
     prefix = (title or "").split(" - ", 1)[0]
+    prefix = re.sub(r"\s*\([^()]*\)\s*$", "", prefix).strip()
     return normalize_numista_denomination(prefix)
 
 

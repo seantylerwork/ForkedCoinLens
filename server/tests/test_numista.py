@@ -104,6 +104,46 @@ class DenominationNormalizationTests(unittest.TestCase):
             coinlens_app.normalize_numista_denomination("Twenty pence"),
         )
 
+    # -- Real production case: a Hong Kong $2 scan showed a title with no
+    # " - " series separator at all - just a trailing parenthetical
+    # qualifier directly after the denomination ("2 Dollars (Special
+    # Administration Region)") - whose words leaked into the normalized
+    # denomination and broke the match against the AI's plain "2 dollars".
+
+    def test_plain_title_matches_ai_denomination(self):
+        self.assertEqual(
+            coinlens_app._numista_title_denomination("2 Dollars"),
+            coinlens_app.normalize_numista_denomination("2 dollars"),
+        )
+
+    def test_trailing_parenthetical_qualifier_does_not_break_the_match(self):
+        self.assertEqual(
+            coinlens_app._numista_title_denomination("2 Dollars (Special Administration Region)"),
+            coinlens_app.normalize_numista_denomination("2 dollars"),
+        )
+
+    def test_trailing_parenthetical_qualifier_does_not_cause_a_false_match(self):
+        self.assertNotEqual(
+            coinlens_app._numista_title_denomination("20 Cents (Special Administration Region)"),
+            coinlens_app.normalize_numista_denomination("2 dollars"),
+        )
+
+    def test_trailing_parenthetical_qualifier_with_pence(self):
+        self.assertEqual(
+            coinlens_app._numista_title_denomination("20 Pence (Royal Shield)"),
+            coinlens_app.normalize_numista_denomination("20 pence"),
+        )
+        self.assertEqual(
+            coinlens_app._numista_title_denomination("20 Pence (Royal Shield)"),
+            coinlens_app.normalize_numista_denomination("Twenty pence"),
+        )
+
+    def test_20_dollars_still_does_not_match_2_dollars(self):
+        self.assertNotEqual(
+            coinlens_app._numista_title_denomination("20 Dollars"),
+            coinlens_app.normalize_numista_denomination("2 dollars"),
+        )
+
 
 class IssueMatchingTests(unittest.TestCase):
     def test_issue_matches_exact_year(self):
@@ -508,6 +548,51 @@ class VariantDisambiguationTests(unittest.TestCase):
         self.assertTrue(coinlens_app.ai_indicates_special_variant(identification(description="A gold commemorative issue.")))
         self.assertTrue(coinlens_app.ai_indicates_special_variant(identification(special_notes="Appears to be a proof strike.")))
         self.assertFalse(coinlens_app.ai_indicates_special_variant(identification(description="An ordinary circulating coin.")))
+
+    def test_hong_kong_2_dollar_regression_both_survive_denomination_then_circulation_wins(self):
+        """Real production case: candidate 5280's title has no " - "
+        series separator, just a trailing "(Special Administration
+        Region)" qualifier directly after the denomination - previously
+        this broke denomination matching and dropped 5280 outright. Both
+        1582 and 5280 are genuinely "2 dollars" and must both survive the
+        denomination check; only then does the (unrelated,
+        already-existing) type-level variant step prefer the standard
+        circulation type over the commemorative one."""
+        wrong_denomination = {
+            "id": 5276, "title": "20 Cents (Special Administration Region)",
+            "issuer": {"name": "Hong Kong"}, "object_type": {"name": "Standard circulation coins"},
+        }
+        standard_circulation = {
+            "id": 1582, "title": "2 Dollars",
+            "issuer": {"name": "Hong Kong"}, "object_type": {"name": "Standard circulation coins"},
+        }
+        commemorative = {
+            "id": 5280, "title": "2 Dollars (Special Administration Region)",
+            "issuer": {"name": "Hong Kong"}, "object_type": {"name": "Circulating commemorative coins"},
+        }
+
+        # Denomination check alone (before any issue lookup): 5276 must be
+        # excluded, 1582 and 5280 must both survive.
+        ai_denomination = coinlens_app.normalize_numista_denomination("2 dollars")
+        self.assertNotEqual(coinlens_app._numista_title_denomination(wrong_denomination["title"]), ai_denomination)
+        self.assertEqual(coinlens_app._numista_title_denomination(standard_circulation["title"]), ai_denomination)
+        self.assertEqual(coinlens_app._numista_title_denomination(commemorative["title"]), ai_denomination)
+
+        def fake_issues(type_id):
+            return [{"id": f"iss-{type_id}-1997", "year": 1997}]
+
+        ident = identification(
+            country="Hong Kong", denomination="2 dollars", year="1997",
+            description="An ordinary circulating coin.",
+        )
+        with mock.patch.object(coinlens_app, "fetch_numista_issues", side_effect=fake_issues):
+            best, issue = coinlens_app.resolve_numista_type_and_issue(
+                ident, [wrong_denomination, standard_circulation, commemorative],
+            )
+
+        self.assertIsNotNone(best)
+        self.assertEqual(best["id"], 1582)
+        self.assertEqual(issue["id"], "iss-1582-1997")
 
 
 class GradeNormalizationTests(unittest.TestCase):
