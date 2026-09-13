@@ -109,8 +109,8 @@ export default function App() {
 
   if (screen === "home") return <HomeScreen navigate={navigate} />;
   if (screen === "scan") return <ScanScreen navigate={navigate} user={user} onScanSaved={refreshScans} />;
-  if (screen === "badges") return <BadgesScreen navigate={navigate} user={user} userScans={userScans} />;
-  if (screen === "leaderboard") return <LeaderboardScreen navigate={navigate} user={user} userScans={userScans} />;
+  if (screen === "badges") return <BadgesScreen navigate={navigate} />;
+  if (screen === "leaderboard") return <LeaderboardScreen navigate={navigate} user={user} />;
   if (screen === "account") return <AccountScreen navigate={navigate} user={user} userScans={userScans} onSignOut={signOut} />;
   if (screen === "admin" && isAdminUser(user)) return <AdminScreen navigate={navigate} />;
   if (screen === "stats") return <StatsScreen navigate={navigate} userScans={userScans} />;

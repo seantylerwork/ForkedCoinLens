@@ -206,6 +206,135 @@ def insert_api_usage(payload: dict) -> dict:
     return _first_row_or_dict(data, "api_usage insert")
 
 
+def fetch_scans_for_user(user_id: str, columns: str) -> list:
+    """Reads one user's own scans (service-role, server-only) - used to
+    compute that same authenticated user's own badge eligibility. Never
+    used to read a different user's scans for direct display."""
+    _require_config()
+    url = f"{SUPABASE_URL}/rest/v1/scans"
+    try:
+        response = _request_with_gateway_retry(
+            requests.get, url,
+            params={"user_id": f"eq.{user_id}", "select": columns, "order": "scanned_at.asc"},
+            headers=_headers(), timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as error:
+        logger.error("supabase fetch_scans_for_user request failed: %s", error)
+        raise SupabaseAdminError(f"scans fetch request failed: {error}") from error
+
+    if not response.ok:
+        logger.error(
+            "supabase fetch_scans_for_user failed: status=%s body=%s",
+            response.status_code, response.text[:500],
+        )
+        raise SupabaseAdminError(
+            f"scans fetch failed: status={response.status_code} body={response.text[:500]}"
+        )
+    try:
+        return response.json() or []
+    except ValueError as error:
+        raise SupabaseAdminError("scans fetch returned an unreadable body.") from error
+
+
+def fetch_scans_for_users(user_ids: list, columns: str) -> list:
+    """Batched read of scans for MULTIPLE users at once (service-role,
+    server-only) - lets the leaderboard compute every user's badge count
+    with one query instead of one per user. Ordered by scanned_at
+    ascending (streak-based badge checks depend on this); grouping the
+    single ordered result by user_id afterward preserves each user's own
+    ascending order. The raw rows this returns must never be sent to any
+    client - only badge counts derived from them may leave the server."""
+    if not user_ids:
+        return []
+    _require_config()
+    url = f"{SUPABASE_URL}/rest/v1/scans"
+    try:
+        response = _request_with_gateway_retry(
+            requests.get, url,
+            params={"user_id": f"in.({','.join(user_ids)})", "select": columns, "order": "scanned_at.asc"},
+            headers=_headers(), timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as error:
+        logger.error("supabase fetch_scans_for_users request failed: %s", error)
+        raise SupabaseAdminError(f"scans batch fetch request failed: {error}") from error
+
+    if not response.ok:
+        logger.error(
+            "supabase fetch_scans_for_users failed: status=%s body=%s",
+            response.status_code, response.text[:500],
+        )
+        raise SupabaseAdminError(
+            f"scans batch fetch failed: status={response.status_code} body={response.text[:500]}"
+        )
+    try:
+        return response.json() or []
+    except ValueError as error:
+        raise SupabaseAdminError("scans batch fetch returned an unreadable body.") from error
+
+
+def fetch_profile_created_at(user_id: str):
+    """Reads one user's own profiles.created_at (service-role) - the
+    trusted membership-date source for badge evaluation. Always derived
+    from the authenticated user's own JWT-verified id, never a
+    client-supplied one."""
+    _require_config()
+    url = f"{SUPABASE_URL}/rest/v1/profiles"
+    try:
+        response = _request_with_gateway_retry(
+            requests.get, url,
+            params={"id": f"eq.{user_id}", "select": "created_at"},
+            headers=_headers(), timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as error:
+        logger.error("supabase fetch_profile_created_at request failed: %s", error)
+        raise SupabaseAdminError(f"profile fetch request failed: {error}") from error
+
+    if not response.ok:
+        logger.error(
+            "supabase fetch_profile_created_at failed: status=%s body=%s",
+            response.status_code, response.text[:500],
+        )
+        raise SupabaseAdminError(
+            f"profile fetch failed: status={response.status_code} body={response.text[:500]}"
+        )
+    try:
+        rows = response.json() or []
+    except ValueError as error:
+        raise SupabaseAdminError("profile fetch returned an unreadable body.") from error
+    return rows[0].get("created_at") if rows else None
+
+
+def fetch_leaderboard_rows() -> list:
+    """Calls the existing leaderboard() RPC with the service-role client -
+    the same safe aggregate rows the client already reads directly
+    (user_id/display_name/scan_count/total_value/avg_value/member_since),
+    just also readable server-side so /api/leaderboard can attach an
+    authoritative badge_count to each row without weakening what the RPC
+    itself exposes."""
+    _require_config()
+    url = f"{SUPABASE_URL}/rest/v1/rpc/leaderboard"
+    try:
+        response = _request_with_gateway_retry(
+            requests.post, url, json={}, headers=_headers(), timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as error:
+        logger.error("supabase fetch_leaderboard_rows request failed: %s", error)
+        raise SupabaseAdminError(f"leaderboard RPC request failed: {error}") from error
+
+    if not response.ok:
+        logger.error(
+            "supabase fetch_leaderboard_rows failed: status=%s body=%s",
+            response.status_code, response.text[:500],
+        )
+        raise SupabaseAdminError(
+            f"leaderboard RPC failed: status={response.status_code} body={response.text[:500]}"
+        )
+    try:
+        return response.json() or []
+    except ValueError as error:
+        raise SupabaseAdminError("leaderboard RPC returned an unreadable body.") from error
+
+
 def update_api_usage(usage_id: str, payload: dict) -> None:
     """Best-effort update of an api_usage row's outcome. Never raises: this is
     bookkeeping for the daily quota count, not something a request should fail

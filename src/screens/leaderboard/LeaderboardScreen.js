@@ -2,7 +2,6 @@ import { useEffect, useRef, useState } from "react";
 import { SafeAreaView, ScrollView, Text, TouchableOpacity, View } from "react-native";
 import Header from "../../components/Header";
 import styles from "../../theme/styles";
-import { BADGES, tierBadgeCount } from "../../badges/badges";
 import { fetchLeaderboard } from "../../api/scans";
 
 const REFRESH_INTERVAL_MS = 15000;
@@ -23,10 +22,13 @@ function memberDaysFrom(memberSince) {
   return Math.max(1, Math.floor((Date.now() - new Date(memberSince).getTime()) / 86400000));
 }
 
-// Safe aggregate rows from the leaderboard() RPC - scan_count/total_value/
-// member_since only, never another user's raw scan history. Matches "is this
-// me" on user_id when the RPC returns it; falls back to display_name so the
-// screen still degrades gracefully against an older function signature.
+// Safe aggregate rows from GET /api/leaderboard - scan_count/total_value/
+// member_since/badge_count only, never another user's raw scan history.
+// badge_count is computed authoritatively server-side (server/badges.py),
+// identically regardless of which signed-in user is viewing. Matches "is
+// this me" on user_id when the endpoint returns it; falls back to
+// display_name so the screen still degrades gracefully against an older
+// response shape.
 function mapRpcRow(row, myUserId, myName) {
   const memberDays = memberDaysFrom(row.member_since);
   const isMe = row.user_id ? row.user_id === myUserId : row.display_name === myName;
@@ -36,13 +38,12 @@ function mapRpcRow(row, myUserId, myName) {
     scanned: row.scan_count ?? 0,
     netWorth: Number(row.total_value ?? 0),
     memberDays,
+    badges: row.badge_count ?? 0,
     isMe,
-    // Filled in below: my own row gets the real badge count from my own
-    // scans; every other row gets the safe tier-only approximation.
   };
 }
 
-export default function LeaderboardScreen({ navigate, user, userScans }) {
+export default function LeaderboardScreen({ navigate, user }) {
   const [cat, setCat] = useState("scanned");
   const [rows, setRows] = useState([]);
   const [lastUpdated, setLastUpdated] = useState(null);
@@ -91,13 +92,7 @@ export default function LeaderboardScreen({ navigate, user, userScans }) {
     return () => { mounted = false; clearInterval(id); };
   }, [user.id]);
 
-  const myBadgeCount = BADGES.filter(b => b.check(userScans || [], user)).length;
-
   const all = rows
-    .map(row => ({
-      ...row,
-      badges: row.isMe ? myBadgeCount : tierBadgeCount(row),
-    }))
     .map(withAvgValue)
     .sort((a, b) => b[category.field] - a[category.field])
     .map((u, i) => ({ ...u, rank: i + 1 }));

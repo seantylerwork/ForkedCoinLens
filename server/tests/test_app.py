@@ -1048,6 +1048,141 @@ class CoinLensApiTests(unittest.TestCase):
         summary = coinlens_app.build_coin_summary(identification, {"status": "unavailable"})
         self.assertIn("Estimated grade: MS-63.", summary)
 
+    # -- /api/badges/me: authoritative badge eligibility, identity only
+    # from the verified JWT (g.user_id), never a client-supplied id. -----
+
+    def test_badges_me_requires_auth(self):
+        original_supabase_url = coinlens_auth.SUPABASE_URL
+        coinlens_auth.SUPABASE_URL = TEST_SUPABASE_URL
+        self.addCleanup(lambda: setattr(coinlens_auth, "SUPABASE_URL", original_supabase_url))
+
+        response = self.client.get("/api/badges/me")
+        self.assertEqual(response.status_code, 401)
+
+    def test_badges_me_returns_the_expected_contract(self):
+        self._authenticate()
+        scans = [{"estimated_value": 5}] * 12
+        with mock.patch.object(coinlens_app, "fetch_scans_for_user", return_value=scans) as mock_scans, \
+             mock.patch.object(coinlens_app, "fetch_profile_created_at", return_value=None) as mock_profile:
+            response = self.client.get("/api/badges/me", headers=self.auth_headers)
+        body = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("badge_count", body)
+        self.assertIn("earned_badge_ids", body)
+        self.assertIn("scan_10", body["earned_badge_ids"])
+        self.assertIn("worth_50", body["earned_badge_ids"])
+        self.assertEqual(body["badge_count"], len(body["earned_badge_ids"]))
+        # Only the two trusted calls - never fetching anything about a
+        # different user, never reading a client-supplied id.
+        mock_scans.assert_called_once_with("user-123", coinlens_app.BADGE_SCAN_COLUMNS)
+        mock_profile.assert_called_once_with("user-123")
+
+    def test_badges_me_ignores_a_client_supplied_user_id(self):
+        """Identity comes only from the verified JWT - a client can never
+        request another user's badges by passing a different id."""
+        self._authenticate()
+        with mock.patch.object(coinlens_app, "fetch_scans_for_user", return_value=[]) as mock_scans, \
+             mock.patch.object(coinlens_app, "fetch_profile_created_at", return_value=None):
+            self.client.get("/api/badges/me?user_id=someone-elses-id", headers=self.auth_headers)
+        mock_scans.assert_called_once_with("user-123", coinlens_app.BADGE_SCAN_COLUMNS)
+
+    def test_badges_me_fetch_failure_returns_503(self):
+        self._authenticate()
+        with mock.patch.object(coinlens_app, "fetch_scans_for_user", side_effect=coinlens_app.SupabaseAdminError("boom")):
+            response = self.client.get("/api/badges/me", headers=self.auth_headers)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()["error"]["code"], "badges_fetch_failed")
+
+    # -- /api/leaderboard: existing aggregate fields + an authoritative,
+    # server-computed badge_count per row - batched scan fetch, no raw
+    # scan data ever returned, same result regardless of viewer. --------
+
+    LEADERBOARD_ROWS = [
+        {
+            "user_id": "lizard-id", "display_name": "lizard", "scan_count": 9,
+            "total_value": 12.5, "avg_value": 1.39, "member_since": "2020-01-01T00:00:00+00:00",
+        },
+        {
+            "user_id": "bro-id", "display_name": "bro", "scan_count": 1,
+            "total_value": 0, "avg_value": 0, "member_since": "2026-09-01T00:00:00+00:00",
+        },
+    ]
+    LEADERBOARD_SCANS = [
+        {"user_id": "lizard-id", "denom_canonical": "dollar", "is_foreign": True, "estimated_value": 2.0},
+        {"user_id": "lizard-id", "denom_canonical": "5-cents", "is_foreign": True, "estimated_value": 0.1},
+        {"user_id": "bro-id", "denom_canonical": "penny", "is_foreign": False, "estimated_value": 0.01},
+    ]
+
+    def test_leaderboard_requires_auth(self):
+        original_supabase_url = coinlens_auth.SUPABASE_URL
+        coinlens_auth.SUPABASE_URL = TEST_SUPABASE_URL
+        self.addCleanup(lambda: setattr(coinlens_auth, "SUPABASE_URL", original_supabase_url))
+
+        response = self.client.get("/api/leaderboard")
+        self.assertEqual(response.status_code, 401)
+
+    def test_leaderboard_preserves_existing_fields_and_adds_badge_count(self):
+        self._authenticate()
+        with mock.patch.object(coinlens_app, "fetch_leaderboard_rows", return_value=self.LEADERBOARD_ROWS), \
+             mock.patch.object(coinlens_app, "fetch_scans_for_users", return_value=self.LEADERBOARD_SCANS) as mock_batch:
+            response = self.client.get("/api/leaderboard", headers=self.auth_headers)
+        body = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(body), 2)
+        for row in body:
+            for field in ("user_id", "display_name", "scan_count", "total_value", "avg_value", "member_since", "badge_count"):
+                self.assertIn(field, row)
+
+        # Exactly the expected authoritative counts for this fixture data.
+        lizard_row = next(r for r in body if r["user_id"] == "lizard-id")
+        bro_row = next(r for r in body if r["user_id"] == "bro-id")
+        expected_lizard_count, _ = coinlens_app.evaluate_badges(
+            [s for s in self.LEADERBOARD_SCANS if s["user_id"] == "lizard-id"], "2020-01-01T00:00:00+00:00",
+        )
+        expected_bro_count, _ = coinlens_app.evaluate_badges(
+            [s for s in self.LEADERBOARD_SCANS if s["user_id"] == "bro-id"], "2026-09-01T00:00:00+00:00",
+        )
+        self.assertEqual(lizard_row["badge_count"], expected_lizard_count)
+        self.assertEqual(bro_row["badge_count"], expected_bro_count)
+
+        # One batched call for every user's scans, not one call per user.
+        mock_batch.assert_called_once()
+        requested_ids = mock_batch.call_args[0][0]
+        self.assertCountEqual(requested_ids, ["lizard-id", "bro-id"])
+
+    def test_leaderboard_never_returns_raw_scan_fields(self):
+        self._authenticate()
+        with mock.patch.object(coinlens_app, "fetch_leaderboard_rows", return_value=self.LEADERBOARD_ROWS), \
+             mock.patch.object(coinlens_app, "fetch_scans_for_users", return_value=self.LEADERBOARD_SCANS):
+            response = self.client.get("/api/leaderboard", headers=self.auth_headers)
+        response_text = response.get_data(as_text=True)
+        for leaked in ("denom_canonical", "estimated_value", "is_foreign", "local_hour", "local_date"):
+            self.assertNotIn(leaked, response_text)
+
+    def test_leaderboard_badge_count_is_independent_of_the_viewer(self):
+        """The core regression requirement: badge_count(user X) must be
+        identical no matter which authenticated user is looking."""
+        with mock.patch.object(coinlens_app, "fetch_leaderboard_rows", return_value=self.LEADERBOARD_ROWS), \
+             mock.patch.object(coinlens_app, "fetch_scans_for_users", return_value=self.LEADERBOARD_SCANS):
+            self._authenticate()
+            as_lizard = self.client.get("/api/leaderboard", headers=self.auth_headers).get_json()
+
+            token, public_key = make_test_token(sub="bro-id")
+            bro_headers = {"Authorization": f"Bearer {token}"}
+            with mock.patch.object(coinlens_auth, "_get_signing_key", return_value=public_key):
+                as_bro = self.client.get("/api/leaderboard", headers=bro_headers).get_json()
+
+        self.assertEqual(as_lizard, as_bro)
+
+    def test_leaderboard_fetch_failure_returns_503(self):
+        self._authenticate()
+        with mock.patch.object(coinlens_app, "fetch_leaderboard_rows", side_effect=coinlens_app.SupabaseAdminError("boom")):
+            response = self.client.get("/api/leaderboard", headers=self.auth_headers)
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.get_json()["error"]["code"], "leaderboard_fetch_failed")
+
 
 class CanonicalizeDenominationTests(unittest.TestCase):
     """Real production bug: "cent" is a substring of "cents", so any

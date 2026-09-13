@@ -15,11 +15,16 @@ from werkzeug.exceptions import HTTPException
 
 from auth import require_auth
 from require_user import require_user
+from badges import evaluate_badges
 from supabase_admin import (
     insert_scan,
     insert_api_usage,
     update_api_usage,
     count_api_usage_since,
+    fetch_scans_for_user,
+    fetch_scans_for_users,
+    fetch_profile_created_at,
+    fetch_leaderboard_rows,
     SupabaseAdminError,
 )
 from mock_openai import (
@@ -171,6 +176,77 @@ def health():
 @require_user
 def me():
     return jsonify({"id": g.user_id, "email": g.user_email})
+
+
+# ---------------------------------------------------------------------------
+# Authoritative badges (backend is now the single source of truth - see
+# server/badges.py; src/badges/badges.js keeps only display metadata).
+# Only the scan fields badge rules actually use are ever read/returned.
+# ---------------------------------------------------------------------------
+
+BADGE_SCAN_COLUMNS = "user_id,estimated_value,denom_canonical,is_foreign,local_date,local_hour,year,scanned_at"
+
+
+@app.route("/api/badges/me", methods=["GET"])
+@require_auth
+def badges_me():
+    """Identity comes only from the verified JWT (g.user_id via
+    @require_auth) - a client can never request another user's badges."""
+    try:
+        scans = fetch_scans_for_user(g.user_id, BADGE_SCAN_COLUMNS)
+        member_created_at = fetch_profile_created_at(g.user_id)
+    except SupabaseAdminError as error:
+        app.logger.error("badges_me fetch failed for user_id=%s: %s", g.user_id, error)
+        return error_response(CoinLensError("badges_fetch_failed", "Could not load your badges right now.", 503))
+
+    badge_count, earned_badge_ids = evaluate_badges(scans, member_created_at)
+    return jsonify({"badge_count": badge_count, "earned_badge_ids": earned_badge_ids})
+
+
+@app.route("/api/leaderboard", methods=["GET"])
+@require_auth
+def leaderboard_with_badges():
+    """Authenticated (any signed-in user may see the public leaderboard),
+    but every row's badge_count is computed server-side from that row's
+    own scans - fetched here with the service-role client, in one batched
+    query, and never returned to the client. Only the existing safe
+    aggregate fields plus badge_count leave this function."""
+    try:
+        rows = fetch_leaderboard_rows()
+    except SupabaseAdminError as error:
+        app.logger.error("leaderboard fetch failed: %s", error)
+        return error_response(CoinLensError("leaderboard_fetch_failed", "Could not load the leaderboard right now.", 503))
+
+    user_ids = [row["user_id"] for row in rows if row.get("user_id")]
+    try:
+        scans = fetch_scans_for_users(user_ids, BADGE_SCAN_COLUMNS) if user_ids else []
+    except SupabaseAdminError as error:
+        app.logger.error("leaderboard badge-scan fetch failed: %s", error)
+        return error_response(CoinLensError("leaderboard_fetch_failed", "Could not load the leaderboard right now.", 503))
+
+    scans_by_user = {}
+    for scan in scans:
+        scans_by_user.setdefault(scan.get("user_id"), []).append(scan)
+
+    result = []
+    for row in rows:
+        user_id = row.get("user_id")
+        badge_count, _ = evaluate_badges(scans_by_user.get(user_id, []), row.get("member_since"))
+        result.append({
+            "user_id": user_id,
+            "display_name": row.get("display_name"),
+            "scan_count": row.get("scan_count"),
+            "total_value": row.get("total_value"),
+            "avg_value": row.get("avg_value"),
+            "member_since": row.get("member_since"),
+            "badge_count": badge_count,
+        })
+
+    app.logger.info(
+        "[leaderboard] computed badge_count for %d user(s) from %d scan row(s)",
+        len(rows), len(scans),
+    )
+    return jsonify(result)
 
 
 def get_model_candidates(primary_model):

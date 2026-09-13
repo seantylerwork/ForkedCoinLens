@@ -160,6 +160,22 @@ export async function getMe() {
   return data;
 }
 
+// Authoritative badges for the signed-in user: identity comes from the JWT
+// server-side (never a client-supplied id), and eligibility is decided once
+// in server/badges.py - see src/badges/badges.js for why the client no
+// longer evaluates badge predicates itself.
+export async function fetchMyBadges() {
+  let res;
+  try {
+    res = await apiFetch(`/api/badges/me`);
+  } catch {
+    throw new ScanError("network", "No internet connection. Could not reach CoinLens.");
+  }
+  const data = await readJsonResponse(res);
+  throwForErrorResponse(res, data);
+  return data;
+}
+
 // TEMP: debug-only call to the backend's Supabase-protected /api/test-scan.
 // Sends no request body; the server derives user_id from the JWT and inserts
 // a fixed test row. Returns the inserted row ({ id, user_id, ... }).
