@@ -53,6 +53,58 @@ class ScoreBreakdownTests(unittest.TestCase):
         self.assertEqual(score, 2)
 
 
+class DenominationNormalizationTests(unittest.TestCase):
+    """Real production case: the AI said "Twenty pence" while Numista
+    titles say "20 Pence" - a plain substring check never matched, so
+    2/20/50 Pence candidates all scored identically on denomination."""
+
+    def test_twenty_pence_matches_20_pence(self):
+        self.assertEqual(
+            coinlens_app.normalize_numista_denomination("Twenty pence"),
+            coinlens_app.normalize_numista_denomination("20 Pence"),
+        )
+
+    def test_twenty_pence_does_not_match_2_pence(self):
+        self.assertNotEqual(
+            coinlens_app.normalize_numista_denomination("Twenty pence"),
+            coinlens_app.normalize_numista_denomination("2 Pence"),
+        )
+
+    def test_twenty_pence_does_not_match_50_pence(self):
+        self.assertNotEqual(
+            coinlens_app.normalize_numista_denomination("Twenty pence"),
+            coinlens_app.normalize_numista_denomination("50 Pence"),
+        )
+
+    def test_five_cents_matches_5_cents(self):
+        self.assertEqual(
+            coinlens_app.normalize_numista_denomination("Five cents"),
+            coinlens_app.normalize_numista_denomination("5 Cents"),
+        )
+
+    def test_two_dollars_matches_2_dollars(self):
+        self.assertEqual(
+            coinlens_app.normalize_numista_denomination("Two dollars"),
+            coinlens_app.normalize_numista_denomination("2 dollars"),
+        )
+
+    def test_case_and_whitespace_insensitive(self):
+        self.assertEqual(
+            coinlens_app.normalize_numista_denomination("  TWENTY   Pence  "),
+            coinlens_app.normalize_numista_denomination("20 pence"),
+        )
+
+    def test_extracts_denomination_from_a_full_numista_title(self):
+        self.assertEqual(
+            coinlens_app._numista_title_denomination("20 Pence - Elizabeth II (4th portrait; Royal Shield)"),
+            coinlens_app.normalize_numista_denomination("Twenty pence"),
+        )
+        self.assertNotEqual(
+            coinlens_app._numista_title_denomination("2 Pence - Elizabeth II"),
+            coinlens_app.normalize_numista_denomination("Twenty pence"),
+        )
+
+
 class IssueMatchingTests(unittest.TestCase):
     def test_issue_matches_exact_year(self):
         self.assertTrue(coinlens_app._issue_matches_year({"year": 2012}, "2012"))
@@ -84,13 +136,58 @@ class IssueMatchingTests(unittest.TestCase):
         selected = coinlens_app._select_issue_for_year(identification(year="2012", mint_mark="D"), issues)
         self.assertEqual(selected["id"], "denver")
 
-    def test_select_issue_falls_back_to_first_year_match_when_mint_unspecified(self):
+    def test_select_issue_with_unresolvable_mint_tie_and_no_special_marker_is_ambiguous(self):
+        """Previously this blindly picked the first year-match when no
+        mint mark was available - exactly the kind of silent guess this
+        matching pipeline is meant to avoid. Two indistinguishable ordinary
+        issues (no special comment on either) must now return None."""
         issues = [
             {"id": "philly", "year": 2012, "mint_letter": "P"},
             {"id": "denver", "year": 2012, "mint_letter": "D"},
         ]
         selected = coinlens_app._select_issue_for_year(identification(year="2012", mint_mark=None), issues)
-        self.assertEqual(selected["id"], "philly")
+        self.assertIsNone(selected)
+
+    # -- Real production case: type 5628 (UK 20p) had three 2012 issues -
+    # ordinary circulation, "BU", and "Proof". ----------------------------
+
+    UK_20P_2012_ISSUES = [
+        {"id": 144284, "year": 2012},
+        {"id": 520198, "year": 2012, "comment": "BU"},
+        {"id": 180337, "year": 2012, "comment": "Proof"},
+    ]
+
+    def test_ordinary_grade_prefers_the_plain_circulation_issue_over_bu_and_proof(self):
+        ident = identification(country="United Kingdom", denomination="Twenty pence", year="2012", estimated_grade="VF-25")
+        selected = coinlens_app._select_issue_for_year(ident, self.UK_20P_2012_ISSUES)
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["id"], 144284)
+
+    def test_explicit_proof_identification_does_not_blindly_select_ordinary_issue(self):
+        ident = identification(
+            country="United Kingdom", denomination="Twenty pence", year="2012",
+            description="This appears to be a proof strike with mirrored fields.",
+        )
+        selected = coinlens_app._select_issue_for_year(ident, self.UK_20P_2012_ISSUES)
+        # Must not silently land on the ordinary circulation issue just
+        # because it's one of the tied candidates.
+        self.assertNotEqual((selected or {}).get("id"), 144284)
+        self.assertIsNone(selected)
+
+    def test_multiple_indistinguishable_ordinary_issues_return_none(self):
+        issues = [
+            {"id": "issue-a", "year": 2012},
+            {"id": "issue-b", "year": 2012},
+        ]
+        ident = identification(country="United Kingdom", denomination="Twenty pence", year="2012")
+        selected = coinlens_app._select_issue_for_year(ident, issues)
+        self.assertIsNone(selected)
+
+    def test_looks_special_issue_matches_whole_words_only(self):
+        self.assertTrue(coinlens_app._looks_special_issue({"comment": "Proof"}))
+        self.assertTrue(coinlens_app._looks_special_issue({"comment": "BU"}))
+        self.assertFalse(coinlens_app._looks_special_issue({"comment": "About uncirculated"}))
+        self.assertFalse(coinlens_app._looks_special_issue({}))
 
 
 class ResolveTypeAndIssueTests(unittest.TestCase):
@@ -216,6 +313,43 @@ class VariantDisambiguationTests(unittest.TestCase):
 
     def _all_candidates_have_a_2012_issue(self, type_id):
         return [{"id": f"iss-{type_id}-2012", "year": 2012}]
+
+    def test_uk_2012_20p_regression_with_ai_wording_twenty_pence_outranks_2_pence(self):
+        """The real bug: the AI said "Twenty pence" (not "20 pence"), so
+        the old substring-based scorer never matched any candidate's
+        denomination, leaving 2p/20p/50p tied on country+year alone. Type
+        5628 (20 Pence) must now clearly outscore a 2 Pence type (4039)
+        before variant resolution even runs."""
+        two_pence = {
+            "id": 4039, "title": "2 Pence - Elizabeth II (2nd portrait)",
+            "issuer": {"name": "United Kingdom"}, "object_type": {"name": "Standard circulation coins"},
+        }
+        twenty_pence = {
+            "id": 5628, "title": "20 Pence - Elizabeth II (4th portrait; Royal Shield)",
+            "issuer": {"name": "United Kingdom"}, "object_type": {"name": "Standard circulation coins"},
+        }
+        fifty_pence = {
+            "id": 9001, "title": "50 Pence - Elizabeth II (3rd portrait)",
+            "issuer": {"name": "United Kingdom"}, "object_type": {"name": "Standard circulation coins"},
+        }
+
+        two_pence_score, _ = coinlens_app._score_numista_candidate_breakdown(
+            identification(country="United Kingdom", denomination="Twenty pence", year="2012"), two_pence)
+        twenty_pence_score, _ = coinlens_app._score_numista_candidate_breakdown(
+            identification(country="United Kingdom", denomination="Twenty pence", year="2012"), twenty_pence)
+        fifty_pence_score, _ = coinlens_app._score_numista_candidate_breakdown(
+            identification(country="United Kingdom", denomination="Twenty pence", year="2012"), fifty_pence)
+
+        self.assertGreater(twenty_pence_score, two_pence_score)
+        self.assertGreater(twenty_pence_score, fifty_pence_score)
+
+        ident = identification(country="United Kingdom", denomination="Twenty pence", year="2012", estimated_grade="VF-25")
+        with mock.patch.object(coinlens_app, "fetch_numista_issues", side_effect=self._all_candidates_have_a_2012_issue):
+            best, issue = coinlens_app.resolve_numista_type_and_issue(ident, [two_pence, twenty_pence, fifty_pence])
+
+        self.assertIsNotNone(best)
+        self.assertEqual(best["id"], 5628)
+        self.assertEqual(issue["id"], "iss-5628-2012")
 
     def test_uk_2012_20p_regression_prefers_standard_circulation_type_5628(self):
         ident = identification(

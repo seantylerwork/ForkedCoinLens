@@ -699,6 +699,103 @@ def _candidate_country_text(candidate):
     return _text_of(issuer or candidate.get("country"))
 
 
+# ---------------------------------------------------------------------------
+# Denomination normalization: a real UK 2012 20p scan showed the AI say
+# "Twenty pence" while Numista titles say "20 Pence" - a plain substring
+# check never matches, so "2 Pence"/"20 Pence"/"50 Pence" candidates all
+# scored identically (country+year only), leaving the correct type
+# ambiguous with an unrelated denomination. This is intentionally narrow -
+# just enough number words and unit aliases for coin denominations, not a
+# general NLP normalizer - and deliberately exact-match, not fuzzy: "2
+# pence" must never canonicalize the same as "20 pence" or "50 pence".
+# ---------------------------------------------------------------------------
+
+_DENOMINATION_ONES = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+    "six": 6, "seven": 7, "eight": 8, "nine": 9,
+}
+_DENOMINATION_TEENS = {
+    "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+    "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18, "nineteen": 19,
+}
+_DENOMINATION_TENS = {
+    "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+    "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+}
+_DENOMINATION_HUNDRED = {"hundred": 100}
+
+# Currency-unit aliases: only collapsed where singular/plural (or the
+# penny/pence irregular pair) is semantically unambiguous - never a blind
+# "strip trailing s", since that would mangle "pence" itself.
+NUMISTA_DENOMINATION_UNIT_ALIASES = {
+    "penny": "pence", "pence": "pence",
+    "cent": "cent", "cents": "cent",
+    "dollar": "dollar", "dollars": "dollar",
+    "pound": "pound", "pounds": "pound",
+    "euro": "euro", "euros": "euro",
+    "franc": "franc", "francs": "franc",
+    "peso": "peso", "pesos": "peso",
+    "rupee": "rupee", "rupees": "rupee",
+    "shilling": "shilling", "shillings": "shilling",
+    "krona": "krona", "kronor": "krona",
+}
+
+
+def _denomination_number_prefix(tokens):
+    """Consumes a leading number word (including simple compounds like
+    "twenty five") from `tokens`, returning (digit_string, remaining) or
+    (None, tokens) if the first token isn't a recognized number word."""
+    if not tokens:
+        return None, tokens
+    first = tokens[0]
+    if first.isdigit():
+        return first, tokens[1:]
+    if first in _DENOMINATION_ONES:
+        return str(_DENOMINATION_ONES[first]), tokens[1:]
+    if first in _DENOMINATION_TEENS:
+        return str(_DENOMINATION_TEENS[first]), tokens[1:]
+    if first in _DENOMINATION_TENS:
+        value = _DENOMINATION_TENS[first]
+        rest = tokens[1:]
+        if rest and rest[0] in _DENOMINATION_ONES:
+            value += _DENOMINATION_ONES[rest[0]]
+            rest = rest[1:]
+        return str(value), rest
+    if first in _DENOMINATION_HUNDRED:
+        return str(_DENOMINATION_HUNDRED[first]), tokens[1:]
+    return None, tokens
+
+
+def normalize_numista_denomination(text):
+    """Canonicalizes a denomination phrase to "<digits> <unit>" (e.g.
+    "Twenty pence"/"twenty pence"/"20 Pence" -> "20 pence") so equal
+    denominations compare equal regardless of AI wording vs. Numista's own
+    title style - while "2 pence"/"20 pence"/"50 pence" always stay
+    distinct, since a wrong digit is never normalized away."""
+    if not text:
+        return ""
+    tokens = re.findall(r"[a-z0-9]+", text.lower())
+    if not tokens:
+        return ""
+
+    number, rest = _denomination_number_prefix(tokens)
+    unit_tokens = [NUMISTA_DENOMINATION_UNIT_ALIASES.get(tok, tok) for tok in rest]
+    if number is None:
+        # No recognizable leading number - still useful as an exact-text
+        # fallback (e.g. matching "Souvenir Token" against itself), just
+        # never matches a real "<number> <unit>" denomination by accident.
+        return " ".join([NUMISTA_DENOMINATION_UNIT_ALIASES.get(tok, tok) for tok in tokens])
+    return " ".join([number] + unit_tokens)
+
+
+def _numista_title_denomination(title):
+    """Numista titles conventionally start "<denomination> - <series...>"
+    (e.g. "20 Pence - Elizabeth II (...)") - takes the part before the
+    first " - " as the candidate's own denomination phrase."""
+    prefix = (title or "").split(" - ", 1)[0]
+    return normalize_numista_denomination(prefix)
+
+
 def _score_numista_candidate_breakdown(identification, candidate):
     """Same scoring as before, but returns (total, breakdown) so callers can
     log *why* a candidate gained or lost points instead of just a number -
@@ -717,7 +814,8 @@ def _score_numista_candidate_breakdown(identification, candidate):
         breakdown["country_issuer_match"] = 3
     if country and country in title:
         breakdown["country_in_title"] = 1
-    if denomination and denomination in title:
+    canonical_denomination = normalize_numista_denomination(denomination)
+    if canonical_denomination and canonical_denomination == _numista_title_denomination(candidate.get("title")):
         breakdown["denomination_in_title"] = 2
     if year and year in title:
         breakdown["year_in_title"] = 1
@@ -1004,11 +1102,43 @@ def _issue_mint_text(issue):
     return _text_of(issue.get("mint_letter") or issue.get("mintmark"))
 
 
+# A real UK 2012 20 pence type had three issues for that year alone: an
+# ordinary circulation strike, a "BU" (brilliant uncirculated), and a
+# "Proof". Same intent as the type-level looks_special_or_proof/
+# ai_indicates_special_variant pair above - just applied one level down,
+# to an issue's own comment/finish field instead of a type's object_type.
+ISSUE_SPECIAL_KEYWORDS = {"proof", "bu", "specimen", "pattern", "prooflike", "matte"}
+
+
+def _issue_special_text(issue):
+    if not isinstance(issue, dict):
+        return ""
+    return " ".join(
+        _text_of(issue.get(field))
+        for field in ("comment", "comments", "finish", "description")
+        if issue.get(field)
+    )
+
+
+def _looks_special_issue(issue):
+    """True when an issue's own comment/finish text flags it as a
+    proof/BU/specimen/pattern strike rather than an ordinary one. Matches
+    whole words (not substrings) so a short keyword like "bu" can't
+    false-positive inside an unrelated word."""
+    words = set(re.findall(r"[a-z]+", _issue_special_text(issue)))
+    return bool(words & ISSUE_SPECIAL_KEYWORDS)
+
+
 def _select_issue_for_year(identification, issues):
     """Among a type's issues, finds one matching the identified year. Mint
-    mark (when the AI reported one) is used only to disambiguate between
-    multiple same-year issues, never as a hard requirement - not every
-    denomination/country carries one."""
+    mark (when the AI reported one) disambiguates first, never as a hard
+    requirement. If several same-year issues remain and the AI didn't
+    itself flag a proof/BU/special strike, prefers whichever aren't
+    flagged special in their own comment/finish text - but only when
+    exactly one ordinary issue remains; if issues are still tied (multiple
+    ordinary ones, or the AI *did* flag something special and more than
+    one candidate remains), returns None rather than guessing, exactly
+    like the type-level ambiguity guard."""
     year_text = _text_of(identification.get("year"))
     year_matches = [issue for issue in (issues or []) if _issue_matches_year(issue, year_text)]
     if not year_matches:
@@ -1019,9 +1149,23 @@ def _select_issue_for_year(identification, issues):
     mint_mark = _text_of(identification.get("mint_mark"))
     if mint_mark:
         mint_matches = [issue for issue in year_matches if mint_mark in _issue_mint_text(issue)]
-        if mint_matches:
+        if len(mint_matches) == 1:
             return mint_matches[0]
-    return year_matches[0]
+        if mint_matches:
+            year_matches = mint_matches
+
+    if len(year_matches) == 1:
+        return year_matches[0]
+
+    if ai_indicates_special_variant(identification):
+        # The AI itself flagged proof/BU/special - never force-pick "the
+        # ordinary one" on its behalf; still ambiguous among these issues.
+        return None
+
+    ordinary_matches = [issue for issue in year_matches if not _looks_special_issue(issue)]
+    if len(ordinary_matches) == 1:
+        return ordinary_matches[0]
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -1135,6 +1279,28 @@ def resolve_numista_type_and_issue(identification, candidates):
             len(to_inspect),
         )
         return None, None
+
+    # Denomination disambiguation: a real UK 2012 20p scan showed "2
+    # Pence"/"20 Pence"/"50 Pence" all tie on country+year alone once the
+    # AI's wording ("Twenty pence") didn't literally appear in any title -
+    # canonical denomination equality (exact, never fuzzy - "20 pence"
+    # must never match "2 pence") narrows to whichever tied matches are
+    # actually the identified denomination, before variant resolution.
+    if len(matches) > 1:
+        ai_denomination = normalize_numista_denomination(identification.get("denomination"))
+        if ai_denomination:
+            denomination_matches = [
+                (c, i) for c, i in matches if _numista_title_denomination(c.get("title")) == ai_denomination
+            ]
+            if denomination_matches:
+                app.logger.info(
+                    "[numista] denomination disambiguation: narrowing to %d candidate(s) matching denomination=%r, "
+                    "dropping: %s",
+                    len(denomination_matches), ai_denomination,
+                    [(c.get("id"), c.get("title")) for c, i in matches
+                     if _numista_title_denomination(c.get("title")) != ai_denomination],
+                )
+                matches = denomination_matches
 
     # Variant disambiguation: only when there's still a tie AND the AI
     # didn't itself flag a proof/precious-metal/commemorative coin. Never
