@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `e8feda0` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `f03a54d` (origin/seperate).
 
 ---
 
@@ -1984,7 +1984,79 @@ redesign, per explicit instruction.
 
 ---
 
-## 29. Pending external actions
+## 29. Investigation: leaderboard badge mismatch + fix: `canonicalize_denomination` "penny" bug
+
+### 29a. Investigation (no code changed for this part): why lizard shows 5 badges as herself but 2 as viewed by bro
+
+**Exact cause** - `src/screens/leaderboard/LeaderboardScreen.js:94,99`:
+```js
+const myBadgeCount = BADGES.filter(b => b.check(userScans || [], user)).length;
+...
+badges: row.isMe ? myBadgeCount : tierBadgeCount(row),
+```
+The **viewer's own row** runs the real `BADGES[].check()` predicates (`src/badges/badges.js`) against their real scans (`fetchMyScans()`, RLS-safe) -> exact. **Every other row** uses `tierBadgeCount(row)` (`src/badges/badges.js`), a deliberate approximation from only `scan_count`/`total_value`/`member_since` (the only fields the `leaderboard()` RPC returns per `supabase/migrations/0001_...sql`) - the same fields used regardless of who's asking. So lizard-viewed-by-bro and lizard-viewed-by-herself differ *only* in which code path runs, not in any data corruption.
+
+**Why the approximation lands on 2, not 5**: `tierBadgeCount` only sums Scanning/Net Worth/Member tier thresholds - it is structurally blind to the Seasonal, Variety, and Coin Types categories entirely (no aggregate field exists to reconstruct them). Lizard's real 5 almost certainly includes real Coin Types badges (`type_foreign`, `type_dollar` from the HK $2, possibly `type_penny` from the Canada 5c - see 29b) that no aggregate-only formula can ever see.
+
+**Is the leaderboard badge count approximate today?** Yes, for every user except the viewer, by design (the function's own comment says so) - not a data bug.
+
+**Recommended V1 architecture**: **Option B** - persist an authoritative `badge_count` (or unlocked-badges record) computed server-side (a Python port of `badges.js`, reusing the same ~57 rules unchanged) whenever a scan is persisted, using `supabase_admin`'s already-trusted server-to-server access (RLS never touched, no client-supplied count ever trusted) - then have `leaderboard()` expose only the count. Option A (reimplement all rules in SQL) was rejected as excessive/fragile for streak and seasonal-date logic; Option C (more aggregates) was rejected as structurally incapable of exactness for Coin Types/Variety/Seasonal badges. Requires one small DB migration (a `badge_count` column or small table) and updating `leaderboard()` to expose it; badge *definitions* themselves stay unchanged. **Not implemented yet** - reported per explicit "before changing anything" instruction; a separate task should build this.
+
+### 29b. Fixed: `canonicalize_denomination` "penny" bug (commit `f03a54d`, pushed)
+
+**Root cause**: `"cent" in text` is a substring check - `"cent"` is literally contained in `"cents"` - so *any* "N cents" denomination (Canada/Australia 5c/10c/25c, etc.) matched this check and returned `"penny"` before the more specific `nickel`/`dime`/`quarter` checks below it ever ran. A real "Canada 5 cents" scan persisted `denom_canonical="penny"`, which could falsely award `type_penny`/`var_penny_streak`.
+
+**Fix**: the penny branch now only matches the literal word `"penny"`, or an explicit numeric value of 1 (`\b(?:1|one)\s+cents?\b` - "1 cent"/"one cent", the actual US penny). Bare "N cents" (N != 1) with no explicit `"nickel"`/`"dime"`/`"quarter"` (or the pre-existing, untouched spelled-out `"five cent"`/`"ten cent"`/`"twenty-five cent"` signals) now falls through to the generic slug fallback - matching the architecture's own documented intent (§1a: a foreign denomination that doesn't explicitly match a US coin term should slug-fallback, not get force-mapped). Deliberately did **not** add bare "5 cents" to the nickel branch - the existing taxonomy only ever recognized nickel via the literal word or the spelled-out number, and the task explicitly said not to introduce a new global mapping unless that was already the documented intent (it isn't). `"2 dollars"` -> `"dollar"` (Hong Kong) is the untouched `dollar` branch and remains correct/expected, confirmed unchanged.
+
+**Tests**: 8 new (`server/tests/test_app.py`, `CanonicalizeDenominationTests` - no direct tests existed for this function before). 127/127 Python passing (119 -> 127), 34/34 JS passing (unaffected, no JS touched).
+
+**Not changed** (confirmed): Numista denomination matching, OpenAI identification, valuation, auth, scan persistence structure, leaderboard, badge definitions themselves.
+
+**Existing bad data - not touched, per explicit instruction**. Recommended (not executed):
+
+Identify affected rows (safe, read-only):
+```sql
+select id, user_id, country, denomination, coin_name, denom_canonical, scanned_at
+from public.scans
+where denom_canonical = 'penny'
+  and lower(coalesce(denomination, '') || ' ' || coalesce(coin_name, '')) not like '%penny%'
+  and lower(coalesce(denomination, '') || ' ' || coalesce(coin_name, ''))
+      !~ '\y(1|one)\s+cents?\y'
+order by scanned_at desc;
+```
+(Any row `denom_canonical='penny'` this query still returns has neither the literal word "penny" nor an explicit "1 cent"/"one cent" in its source text - i.e. it can only be a bug victim, since those were the only two ways to land in "penny" pre-fix.)
+
+Recommended backfill (review the SELECT above first; take a snapshot; run inside a transaction and inspect before committing - do **not** run unreviewed):
+```sql
+begin;
+with affected as (
+  select id, lower(coalesce(denomination, '') || ' ' || coalesce(coin_name, '')) as text
+  from public.scans
+  where denom_canonical = 'penny'
+    and lower(coalesce(denomination, '') || ' ' || coalesce(coin_name, '')) not like '%penny%'
+    and lower(coalesce(denomination, '') || ' ' || coalesce(coin_name, ''))
+        !~ '\y(1|one)\s+cents?\y'
+)
+update public.scans s
+set denom_canonical = case
+  when a.text like '%nickel%' or a.text like '%five cent%' then 'nickel'
+  when a.text like '%dime%' or a.text like '%ten cent%' then 'dime'
+  when a.text like '%quarter%' or a.text like '%twenty-five cent%' or a.text like '%twenty five cent%' then 'quarter'
+  when a.text like '%half dollar%' or a.text like '%half-dollar%' then 'half-dollar'
+  when a.text like '%dollar%' then 'dollar'
+  else nullif(regexp_replace(lower(s.denomination), '[^a-z0-9]+', '-', 'g'), '')
+end
+from affected a
+where s.id = a.id;
+-- review before committing:
+-- select s.id, s.denomination, s.coin_name, s.denom_canonical from public.scans s join affected a on a.id = s.id;
+commit; -- or rollback;
+```
+Caveat: this `CASE` is a second, hand-written mirror of the Python branches and could drift from it over time. The more drift-proof alternative is a one-off script that imports the real `canonicalize_denomination()` and recomputes each affected row's value in Python before issuing per-row updates via `supabase_admin` - worth considering instead of/alongside the SQL above, especially if this needs to be re-run after any future change to the function.
+
+---
+
+## 30. Pending external actions
 
 1. ~~Run this in the Supabase SQL editor~~ — **now believed applied**: the
    real scan in §14 ran with `MOCK_MODE` off and reached
@@ -2123,7 +2195,20 @@ Everything through §26 (code, tests, all commits through `88bd7b0`) is
     circulating-commemorative sibling for any similar title-parsing edge
     case.
 
-Everything through §28 (code, tests, all commits through `e8feda0`) is
+20. See §29a - leaderboard badge counts for other users are an
+    intentional-but-approximate placeholder (`tierBadgeCount`), not a
+    bug. Persisting an authoritative `badge_count` (Option B) is
+    recommended but **not yet implemented** - a real follow-up task,
+    needing a small DB migration plus a Python port of `badges.js`.
+
+21. See §29b - the `canonicalize_denomination` "penny" bug is fixed in
+    code (new scans persist correctly going forward), but **existing bad
+    rows in Supabase have not been touched**. Run the identification
+    SELECT in §29b first to see the real scope, then decide on the
+    backfill (SQL provided, or the safer real-function-based script
+    alternative) before applying anything to production data.
+
+Everything through §29 (code, tests, all commits through `f03a54d`) is
 committed and pushed to `origin/seperate`. §15 (rate limit) + §16
 (truncated response) are confirmed fixed by real, non-mock scans; §17-§20
 (Numista matching/pricing, 429 diagnostics, retry_after_seconds, issuer
@@ -2131,8 +2216,11 @@ resolution), §21 (summary/log-scan fixes), §22 (type-level variant
 disambiguation), §23 (denomination normalization + issue-level variant
 preference), §24 (diagnostic logging + accurate rejection reasons), §25
 (grade normalization), §26 (low reasoning effort + ai_incomplete), §27
-(issue-classifier keyword gap), and §28 (trailing-parenthetical
-denomination titles) are all implemented, tested, and pushed. The core
-Numista matching pipeline is now validated by at least one fully
-successful real, live scan (Hong Kong $2) - remaining work is cleanup on
-edge cases like this one, not pipeline-blocking bugs.
+(issue-classifier keyword gap), §28 (trailing-parenthetical denomination
+titles), and §29b (`canonicalize_denomination` penny-bug fix) are all
+implemented, tested, and pushed. §29a (leaderboard badge architecture) is
+investigated and reported, with a recommended fix **not yet built**. The
+core Numista matching pipeline is validated by at least one fully
+successful real, live scan (Hong Kong $2) - remaining Numista work is
+cleanup on edge cases, not pipeline-blocking bugs; the badge/leaderboard
+work is a separate, still-open architectural item.
