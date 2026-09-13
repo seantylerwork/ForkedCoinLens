@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `3c2a4f3` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `55bc51e` (origin/seperate).
 
 ---
 
@@ -1488,7 +1488,104 @@ giving the first real confirmation of the still-unverified
 
 ---
 
-## 23. Pending external actions
+## 23. Follow-up fix: canonical denomination matching + issue-level variant preference
+
+**Trigger**: the §22 fix worked (type 5628 selected correctly for one real
+scan), and the very next real UK 2012 20p scan narrowed the problem
+further. OpenAI returned denomination `"Twenty pence"` (word form, not
+`"20 pence"`). The scorer's denomination check was a raw substring match,
+so `"twenty pence"` never matched any Numista title text at all - not
+"20 Pence", not "2 Pence", not "50 Pence" - meaning all three scored
+identically on country+year alone, and the correct type 5628 stayed
+ambiguous with an unrelated type 4039 ("2 Pence"). Separately, once 5628
+itself resolves, it has *three* 2012 issues (144284 ordinary, 520198 "BU",
+180337 "Proof") that also needed disambiguating.
+
+**Denomination normalization rule** (`server/app.py`):
+`normalize_numista_denomination(text)` canonicalizes to `"<digits>
+<unit>"` - a small number-word map (one..ninety, hundred, plus simple
+compounds like "twenty five") converts word numbers to digits, and a
+narrow currency-unit alias map collapses only semantically-safe
+singular/plural pairs (`penny`/`pence` -> `pence`, `cent`/`cents` ->
+`cent`, `dollar`/`dollars` -> `dollar`, etc.) - deliberately not a general
+NLP normalizer, and deliberately **exact-match, never fuzzy**: "2
+pence"/"20 pence"/"50 pence" always canonicalize to different strings.
+`_numista_title_denomination(title)` extracts a candidate's own
+denomination using Numista's `"<denomination> - <series>"` title
+convention (the part before the first `" - "`). The existing
+`denomination_in_title` scoring key (name kept for compatibility) now
+computes via canonical equality instead of a raw substring check.
+
+**Where it plugs in**: `resolve_numista_type_and_issue` gained a new
+narrowing step - inserted **before** the existing object_type-based
+variant narrowing from §22 - that, when `matches` are still tied after
+the year/issue gate, narrows to whichever have the exact canonical
+denomination the AI identified. This is what actually lets 5628 "outrank"
+4039: the score alone doesn't gate which candidates enter `matches` (only
+the coarse `NUMISTA_MATCH_MIN_SCORE`/top-3 cap does), so an explicit
+denomination-equality filter was needed, not just a corrected score.
+Mirrors the same "narrow by an exact categorical property, never by raw
+score" pattern already used for object_type.
+
+**Issue-level variant rule**: `_select_issue_for_year` now prefers,
+among same-year issues, whichever has no special `comment`/`finish`/
+`description` text (checked via `_looks_special_issue`, matching whole
+words only - `{"proof","bu","specimen","pattern","prooflike","matte"}` -
+so short keywords like "bu" can't false-positive inside unrelated words
+like "about"). Reuses the *same* `ai_indicates_special_variant()` check
+from §22's type-level logic: if the AI itself said proof/BU/special, the
+ordinary-preference narrowing is skipped entirely (never force-selects
+the ordinary issue on the AI's behalf). If narrowing still leaves more
+than one ordinary issue (or, when AI-indicated-special, more than one
+issue overall), returns `None` - which correctly makes that *type*
+register as "no matching issue" one level up, same effect as
+type-level ambiguity.
+
+**A pre-existing test's expectation was itself the bug being fixed**:
+`test_select_issue_falls_back_to_first_year_match_when_mint_unspecified`
+asserted that two indistinguishable issues (different mints, no mint info
+available) resolved by blindly picking the first one in list order -
+exactly the kind of silent guess this whole matching pipeline has been
+built to eliminate. Renamed and changed to assert `None` (ambiguous)
+instead, since that's now the correct, honest behavior.
+
+**UK 2012 20p regression result**: passes, at both levels -
+`test_uk_2012_20p_regression_with_ai_wording_twenty_pence_outranks_2_pence`
+confirms the score comparison (20 Pence scores 5, both 2 Pence and 50
+Pence score 3) *and* that `resolve_numista_type_and_issue` now resolves
+to type 5628 end-to-end from AI wording `"Twenty pence"`;
+`test_ordinary_grade_prefers_the_plain_circulation_issue_over_bu_and_proof`
+confirms issue 144284 wins over 520198 (BU) and 180337 (Proof) for an
+ordinary VF-25 identification.
+
+**Test totals**: 101/101 Python passing (89 → 101, 12 new). 31/31 JS
+passing (unaffected - no JS touched). Commit `55bc51e`, pushed.
+
+**Not changed** (confirmed): OpenAI prompt/schema, issuer lookup/cache,
+structured Numista search, candidate count, type-level special-variant
+filtering (§22, untouched logic, just reused its AI-intent check), auth,
+quota/rate-limit/retry-after logic (§18/§19), persistence,
+badges/leaderboard, PCGS, DB schema.
+
+**Exact next live scan expected path**: the same 2012 UK 20 pence coin (or
+any UK coin whose AI-reported denomination uses word form, e.g. "Twenty
+pence"/"Fifty pence") again. Render logs should now show, in order:
+`[numista] all candidates scored: ...` (2 Pence/20 Pence/50 Pence-style
+candidates with *different* scores this time, 20 Pence higher) ->
+`[numista] denomination disambiguation: narrowing to 1 candidate(s)
+matching denomination='20 pence', dropping: [...]` -> the existing
+`[numista] selected type+issue: type_id=5628 ...` -> and, if that type has
+multiple 2012 issues in real Numista data, a clean resolution to the
+ordinary one without an explicit new log line (the choice happens inside
+`_select_issue_for_year`, not separately logged at the level `resolve_numista_type_and_issue`
+logs at) -> finally, for the first time this session, a real
+`[numista] price response: type_id=5628 issue_id=...` line, confirming
+the still-unverified issue-price endpoint's actual response shape (open
+since §17).
+
+---
+
+## 24. Pending external actions
 
 1. ~~Run this in the Supabase SQL editor~~ — **now believed applied**: the
    real scan in §14 ran with `MOCK_MODE` off and reached
@@ -1583,11 +1680,17 @@ giving the first real confirmation of the still-unverified
     resolves to type 5628 and to get the first real confirmation of the
     issue-price endpoint's response shape.
 
-Everything through §22 (code, tests, all commits through `3c2a4f3`) is
+14. See §23 for the denomination-normalization + issue-level variant fix -
+    run its "exact next live scan expected path" (the same UK 20p) to
+    finally confirm an end-to-end confident valuation, including the
+    still-unverified issue-price endpoint response shape.
+
+Everything through §23 (code, tests, all commits through `55bc51e`) is
 committed and pushed to `origin/seperate`. §15 (rate limit) + §16
 (truncated response) are confirmed fixed by real, non-mock scans; §17-§20
 (Numista matching/pricing, 429 diagnostics, retry_after_seconds, issuer
-resolution), §21 (summary/log-scan fixes), and §22 (variant
-disambiguation) are all implemented, tested, and pushed - but no real scan
-has yet reached a confident valuation end-to-end (§22's next live scan is
-the one most likely to finally do so).
+resolution), §21 (summary/log-scan fixes), §22 (type-level variant
+disambiguation), and §23 (denomination normalization + issue-level
+variant preference) are all implemented, tested, and pushed - but no real
+scan has yet reached a confident valuation end-to-end (§23's next live
+scan is the one most likely to finally do so).
