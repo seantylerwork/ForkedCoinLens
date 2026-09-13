@@ -445,6 +445,8 @@ class CoinLensApiTests(unittest.TestCase):
             mock_post.return_value = mock.Mock(
                 ok=False,
                 status_code=429,
+                text='{"error": {"message": "Rate limit reached for requests"}}',
+                headers={},
                 json=lambda: {"error": {"message": "Rate limit reached for requests"}},
             )
             response = self.client.post(
@@ -457,6 +459,115 @@ class CoinLensApiTests(unittest.TestCase):
         self.assertEqual(response.status_code, 429)
         self.assertEqual(body["error"]["code"], "rate_limit")
         mock_update.assert_called_once_with("usage-1", {"status": "error"})
+
+    def test_identify_coin_logs_openai_429_headers_and_body(self):
+        """The diagnostic log must capture status, the standard rate-limit
+        headers (only the ones actually present), and the body - without
+        changing the existing 429 -> rate_limit contract."""
+        self._authenticate()
+        coinlens_app.OPENAI_API_KEY = "test-key"
+
+        rate_limit_headers = {
+            "x-request-id": "req_abc123",
+            "x-ratelimit-limit-requests": "3",
+            "x-ratelimit-remaining-requests": "0",
+            "x-ratelimit-reset-requests": "12.5s",
+            "x-ratelimit-limit-tokens": "10000",
+            "x-ratelimit-remaining-tokens": "4416",
+            "x-ratelimit-reset-tokens": "1s",
+            "retry-after": "13",
+        }
+        with mock.patch.object(coinlens_app.requests, "post") as mock_post, \
+             mock.patch.object(coinlens_app, "count_api_usage_since", return_value=0), \
+             mock.patch.object(coinlens_app, "insert_api_usage", return_value={"id": "usage-1"}), \
+             mock.patch.object(coinlens_app, "update_api_usage"):
+            mock_post.return_value = mock.Mock(
+                ok=False,
+                status_code=429,
+                text='{"error": {"message": "Rate limit reached for requests"}}',
+                headers=rate_limit_headers,
+                json=lambda: {"error": {"message": "Rate limit reached for requests"}},
+            )
+            with self.assertLogs(coinlens_app.app.logger, level="WARNING") as logs:
+                response = self.client.post(
+                    "/api/identify-coin",
+                    json={"front_image": JPEG_BASE64, "source": "camera"},
+                    headers=self.auth_headers,
+                )
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(response.get_json()["error"]["code"], "rate_limit")
+
+        error_log_lines = [line for line in logs.output if "OpenAI error response" in line]
+        self.assertEqual(len(error_log_lines), 1)
+        log_line = error_log_lines[0]
+        self.assertIn("http_status=429", log_line)
+        self.assertIn("Rate limit reached for requests", log_line)
+        for header_name, header_value in rate_limit_headers.items():
+            self.assertIn(header_name, log_line)
+            self.assertIn(header_value, log_line)
+
+    def test_identify_coin_openai_error_logging_omits_absent_headers(self):
+        """Only headers OpenAI actually sent should appear in the log -
+        never a synthesized/None entry for a header that wasn't present."""
+        self._authenticate()
+        coinlens_app.OPENAI_API_KEY = "test-key"
+
+        with mock.patch.object(coinlens_app.requests, "post") as mock_post, \
+             mock.patch.object(coinlens_app, "count_api_usage_since", return_value=0), \
+             mock.patch.object(coinlens_app, "insert_api_usage", return_value={"id": "usage-1"}), \
+             mock.patch.object(coinlens_app, "update_api_usage"):
+            mock_post.return_value = mock.Mock(
+                ok=False,
+                status_code=429,
+                text='{"error": {"message": "Rate limit reached"}}',
+                headers={"retry-after": "5"},
+                json=lambda: {"error": {"message": "Rate limit reached"}},
+            )
+            with self.assertLogs(coinlens_app.app.logger, level="WARNING") as logs:
+                self.client.post(
+                    "/api/identify-coin",
+                    json={"front_image": JPEG_BASE64, "source": "camera"},
+                    headers=self.auth_headers,
+                )
+
+        log_line = next(line for line in logs.output if "OpenAI error response" in line)
+        self.assertIn("retry-after", log_line)
+        self.assertNotIn("x-ratelimit-limit-requests", log_line)
+        self.assertNotIn("x-request-id", log_line)
+
+    def test_identify_coin_openai_error_logging_never_leaks_secrets_or_images(self):
+        """The diagnostic log is built only from the OpenAI response object -
+        assert the API key, the Authorization header value, and a
+        base64-image-shaped payload never appear in the log line, and that
+        a long base64-looking run in the body itself gets redacted."""
+        self._authenticate()
+        coinlens_app.OPENAI_API_KEY = "super-secret-openai-key"
+        fake_base64_blob = "A" * 500
+
+        with mock.patch.object(coinlens_app.requests, "post") as mock_post, \
+             mock.patch.object(coinlens_app, "count_api_usage_since", return_value=0), \
+             mock.patch.object(coinlens_app, "insert_api_usage", return_value={"id": "usage-1"}), \
+             mock.patch.object(coinlens_app, "update_api_usage"):
+            mock_post.return_value = mock.Mock(
+                ok=False,
+                status_code=400,
+                text=f'{{"error": {{"message": "bad request", "echo": "{fake_base64_blob}"}}}}',
+                headers={},
+                json=lambda: {"error": {"message": "bad request"}},
+            )
+            with self.assertLogs(coinlens_app.app.logger, level="WARNING") as logs:
+                self.client.post(
+                    "/api/identify-coin",
+                    json={"front_image": JPEG_BASE64, "source": "camera"},
+                    headers=self.auth_headers,
+                )
+
+        log_line = next(line for line in logs.output if "OpenAI error response" in line)
+        self.assertNotIn("super-secret-openai-key", log_line)
+        self.assertNotIn(f"Bearer {coinlens_app.OPENAI_API_KEY}", log_line)
+        self.assertNotIn(fake_base64_blob, log_line)
+        self.assertIn("<redacted-base64>", log_line)
 
     def test_identify_coin_logs_openai_token_usage_on_success(self):
         self._authenticate()

@@ -510,6 +510,46 @@ def extract_responses_output_text(data):
     return None
 
 
+# Diagnostics-only for a non-2xx OpenAI response (rate limits especially -
+# these carry no `usage` field at all, so without this a 429 previously
+# logged nothing but the generic CoinLensError). Never touches the request
+# side (headers, payload, images) - only OpenAI's own response.
+OPENAI_LOG_BODY_CHARS = 1500
+OPENAI_RATE_LIMIT_HEADERS = (
+    "x-request-id",
+    "x-ratelimit-limit-requests",
+    "x-ratelimit-remaining-requests",
+    "x-ratelimit-reset-requests",
+    "x-ratelimit-limit-tokens",
+    "x-ratelimit-remaining-tokens",
+    "x-ratelimit-reset-tokens",
+    "retry-after",
+)
+# Defense-in-depth beyond truncation: redacts any long base64-looking run
+# before logging, in case an error body ever echoed request content back.
+_BASE64_BLOB_RE = re.compile(r"[A-Za-z0-9+/]{100,}={0,2}")
+
+
+def _sanitize_log_text(text, limit=OPENAI_LOG_BODY_CHARS):
+    if not text:
+        return text
+    return _BASE64_BLOB_RE.sub("<redacted-base64>", text)[:limit]
+
+
+def _log_openai_error_response(upstream):
+    """Logs enough to diagnose a non-2xx OpenAI response - status, the
+    standard rate-limit headers (only the ones actually present), and a
+    sanitized/truncated body. Never logs the Authorization header, the API
+    key, or any request payload."""
+    present_headers = {
+        name: upstream.headers[name] for name in OPENAI_RATE_LIMIT_HEADERS if name in upstream.headers
+    }
+    app.logger.warning(
+        "[identify] OpenAI error response: http_status=%s headers=%s body=%s",
+        upstream.status_code, present_headers, _sanitize_log_text(upstream.text),
+    )
+
+
 def identify_coin_with_ai(front_image, back_image=None):
     if not OPENAI_API_KEY:
         raise CoinLensError("key_missing", "Server is missing OPENAI_API_KEY.", 500)
@@ -551,6 +591,9 @@ def identify_coin_with_ai(front_image, back_image=None):
         )
     except requests.RequestException:
         raise CoinLensError("upstream_failure", "AI provider request failed.", 502)
+
+    if not upstream.ok:
+        _log_openai_error_response(upstream)
 
     try:
         data = upstream.json()
