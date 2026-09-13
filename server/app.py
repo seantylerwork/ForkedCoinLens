@@ -45,7 +45,7 @@ USE_MOCK_COIN_RESPONSE = os.environ.get("USE_MOCK_COIN_RESPONSE", "false").lower
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
 # M6 cost protection: independent of any OpenAI-side spending limit.
-DAILY_SCAN_LIMIT = int(os.environ.get("DAILY_SCAN_LIMIT", "5"))
+DAILY_SCAN_LIMIT = int(os.environ.get("DAILY_SCAN_LIMIT", "20"))
 MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", str(8 * 1024 * 1024)))
 
 # V1: eBay listing generation is disabled by default (not part of the V1
@@ -530,7 +530,13 @@ def identify_coin_with_ai(front_image, back_image=None):
                 "strict": True,
             }
         },
-        "max_output_tokens": 1000,
+        # Reasoning-capable models spend part of this budget on hidden
+        # reasoning tokens (counted in usage.output_tokens) before emitting
+        # the final JSON - too low a cap can exhaust the whole budget on
+        # reasoning and leave zero visible output text. 2000 leaves headroom
+        # for that while still comfortably inside a low-tier TPM limit
+        # alongside the (now-resized, ~4-5K token) input images.
+        "max_output_tokens": 2000,
     }
 
     try:
@@ -551,15 +557,21 @@ def identify_coin_with_ai(front_image, back_image=None):
     except ValueError:
         raise CoinLensError("upstream_failure", "AI provider returned an unreadable response.", 502)
 
-    # Logged regardless of success/failure (when present) so a 429 can be
-    # diagnosed against the account's real per-request token cost instead of
-    # only the aggregate usage shown on OpenAI's dashboard.
+    # Logged regardless of success/failure (when present) so a 429 (real
+    # per-request token cost) or an empty/truncated response (hit
+    # max_output_tokens before emitting visible text - common with
+    # reasoning-capable models spending the budget on hidden reasoning
+    # tokens first) can both be diagnosed from Render logs instead of
+    # guessing.
     usage = data.get("usage") if isinstance(data, dict) else None
     if isinstance(usage, dict):
+        reasoning_tokens = (usage.get("output_tokens_details") or {}).get("reasoning_tokens") \
+            if isinstance(usage.get("output_tokens_details"), dict) else None
         app.logger.info(
-            "[identify] OpenAI usage: input_tokens=%s output_tokens=%s total_tokens=%s status=%s",
-            usage.get("input_tokens"), usage.get("output_tokens"), usage.get("total_tokens"),
-            upstream.status_code,
+            "[identify] OpenAI usage: input_tokens=%s output_tokens=%s (reasoning=%s) "
+            "total_tokens=%s response_status=%s http_status=%s",
+            usage.get("input_tokens"), usage.get("output_tokens"), reasoning_tokens,
+            usage.get("total_tokens"), data.get("status"), upstream.status_code,
         )
 
     if not upstream.ok:
@@ -575,6 +587,11 @@ def identify_coin_with_ai(front_image, back_image=None):
 
     text = extract_responses_output_text(data)
     if not text:
+        app.logger.warning(
+            "[identify] empty output_text: response_status=%s incomplete_details=%s",
+            data.get("status") if isinstance(data, dict) else None,
+            data.get("incomplete_details") if isinstance(data, dict) else None,
+        )
         raise CoinLensError("identification_failure", "AI provider returned an empty response.", 422)
 
     try:

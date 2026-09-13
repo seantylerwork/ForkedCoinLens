@@ -497,6 +497,83 @@ class CoinLensApiTests(unittest.TestCase):
             for message in logs.output
         ))
 
+    def test_identify_coin_sends_headroom_for_reasoning_tokens(self):
+        """max_output_tokens must leave room for reasoning-capable models to
+        spend part of the budget on hidden reasoning before the final JSON -
+        this is a regression guard for the 1000-token cap that produced an
+        empty response (see the truncation test below)."""
+        self._authenticate()
+        coinlens_app.OPENAI_API_KEY = "test-key"
+        self.mock_persisted_scan()
+
+        identification = {
+            "status": "identified", "coin_name": "2016 Canada 1 Dollar",
+            "country": "Canada", "denomination": "1 dollar", "year": "2016",
+            "mint_mark": None, "estimated_grade": "AU-50", "confidence": 90,
+            "description": "", "mint_errors": [], "varieties": None,
+            "error_premium": False, "special_notes": "", "unidentifiable_reason": None,
+            "alternatives": [],
+        }
+
+        with mock.patch.object(coinlens_app.requests, "post") as mock_post, \
+             mock.patch.object(coinlens_app, "count_api_usage_since", return_value=0), \
+             mock.patch.object(coinlens_app, "insert_api_usage", return_value={"id": "usage-1"}), \
+             mock.patch.object(coinlens_app, "update_api_usage"):
+            mock_post.return_value = mock.Mock(
+                ok=True, status_code=200, json=lambda: {"output_text": json.dumps(identification)},
+            )
+            self.client.post(
+                "/api/identify-coin",
+                json={"front_image": JPEG_BASE64, "source": "camera"},
+                headers=self.auth_headers,
+            )
+
+        sent_payload = mock_post.call_args.kwargs["json"]
+        self.assertGreaterEqual(sent_payload["max_output_tokens"], 2000)
+
+    def test_identify_coin_truncated_by_max_output_tokens_logs_incomplete_details(self):
+        """Reproduces the real production case: output_tokens hit the cap
+        exactly, all of it spent on hidden reasoning, so output_text is
+        empty. Must still surface as identification_failure (not a crash)
+        and log why, so a future occurrence is diagnosable from Render logs."""
+        self._authenticate()
+        coinlens_app.OPENAI_API_KEY = "test-key"
+
+        with mock.patch.object(coinlens_app.requests, "post") as mock_post, \
+             mock.patch.object(coinlens_app, "count_api_usage_since", return_value=0), \
+             mock.patch.object(coinlens_app, "insert_api_usage", return_value={"id": "usage-1"}), \
+             mock.patch.object(coinlens_app, "update_api_usage") as mock_update:
+            mock_post.return_value = mock.Mock(
+                ok=True,
+                status_code=200,
+                json=lambda: {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "max_output_tokens"},
+                    "output": [],
+                    "usage": {
+                        "input_tokens": 4584,
+                        "output_tokens": 1000,
+                        "total_tokens": 5584,
+                        "output_tokens_details": {"reasoning_tokens": 1000},
+                    },
+                },
+            )
+            with self.assertLogs(coinlens_app.app.logger, level="WARNING") as logs:
+                response = self.client.post(
+                    "/api/identify-coin",
+                    json={"front_image": JPEG_BASE64, "source": "camera"},
+                    headers=self.auth_headers,
+                )
+        body = response.get_json()
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(body["error"]["code"], "identification_failure")
+        self.assertTrue(any(
+            "incomplete_details" in message and "max_output_tokens" in message
+            for message in logs.output
+        ))
+        mock_update.assert_called_once_with("usage-1", {"status": "error"})
+
     # -- confidence-means-complete-identification (semantic fix) -----------
     # These exercise normalize_identification() directly with the shape a
     # real model response takes for each scenario, since the actual prompt
