@@ -551,6 +551,17 @@ def identify_coin_with_ai(front_image, back_image=None):
     except ValueError:
         raise CoinLensError("upstream_failure", "AI provider returned an unreadable response.", 502)
 
+    # Logged regardless of success/failure (when present) so a 429 can be
+    # diagnosed against the account's real per-request token cost instead of
+    # only the aggregate usage shown on OpenAI's dashboard.
+    usage = data.get("usage") if isinstance(data, dict) else None
+    if isinstance(usage, dict):
+        app.logger.info(
+            "[identify] OpenAI usage: input_tokens=%s output_tokens=%s total_tokens=%s status=%s",
+            usage.get("input_tokens"), usage.get("output_tokens"), usage.get("total_tokens"),
+            upstream.status_code,
+        )
+
     if not upstream.ok:
         message = (data.get("error") or {}).get("message", "") if isinstance(data, dict) else ""
         if upstream.status_code == 401:

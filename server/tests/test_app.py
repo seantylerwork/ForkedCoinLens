@@ -1,4 +1,5 @@
 ﻿import base64
+import json
 import os
 import sys
 import time
@@ -428,6 +429,73 @@ class CoinLensApiTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 502)
         self.assertEqual(body["error"]["code"], "malformed_ai_response")
+
+    # -- OpenAI rate limits: a real 429 from OpenAI itself (not our own
+    # quota_exceeded), and logging real token usage so a future rate-limit
+    # report can be diagnosed from Render logs instead of guessing. --------
+
+    def test_identify_coin_openai_rate_limit_returns_429(self):
+        self._authenticate()
+        coinlens_app.OPENAI_API_KEY = "test-key"
+
+        with mock.patch.object(coinlens_app.requests, "post") as mock_post, \
+             mock.patch.object(coinlens_app, "count_api_usage_since", return_value=0), \
+             mock.patch.object(coinlens_app, "insert_api_usage", return_value={"id": "usage-1"}), \
+             mock.patch.object(coinlens_app, "update_api_usage") as mock_update:
+            mock_post.return_value = mock.Mock(
+                ok=False,
+                status_code=429,
+                json=lambda: {"error": {"message": "Rate limit reached for requests"}},
+            )
+            response = self.client.post(
+                "/api/identify-coin",
+                json={"front_image": JPEG_BASE64, "source": "camera"},
+                headers=self.auth_headers,
+            )
+        body = response.get_json()
+
+        self.assertEqual(response.status_code, 429)
+        self.assertEqual(body["error"]["code"], "rate_limit")
+        mock_update.assert_called_once_with("usage-1", {"status": "error"})
+
+    def test_identify_coin_logs_openai_token_usage_on_success(self):
+        self._authenticate()
+        coinlens_app.OPENAI_API_KEY = "test-key"
+        self.mock_persisted_scan()
+
+        identification = {
+            "status": "identified", "coin_name": "2016 Canada 1 Dollar",
+            "country": "Canada", "denomination": "1 dollar", "year": "2016",
+            "mint_mark": None, "estimated_grade": "AU-50", "confidence": 90,
+            "description": "", "mint_errors": [], "varieties": None,
+            "error_premium": False, "special_notes": "", "unidentifiable_reason": None,
+            "alternatives": [],
+        }
+
+        with mock.patch.object(coinlens_app.requests, "post") as mock_post, \
+             mock.patch.object(coinlens_app, "count_api_usage_since", return_value=0), \
+             mock.patch.object(coinlens_app, "insert_api_usage", return_value={"id": "usage-1"}), \
+             mock.patch.object(coinlens_app, "update_api_usage"):
+            mock_post.return_value = mock.Mock(
+                ok=True,
+                status_code=200,
+                json=lambda: {
+                    "output_text": json.dumps(identification),
+                    "usage": {"input_tokens": 17321, "output_tokens": 210, "total_tokens": 17531},
+                },
+            )
+            with self.assertLogs(coinlens_app.app.logger, level="INFO") as logs:
+                response = self.client.post(
+                    "/api/identify-coin",
+                    json={"front_image": JPEG_BASE64, "back_image": JPEG_BASE64, "source": "camera"},
+                    headers=self.auth_headers,
+                )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(any(
+            "OpenAI usage" in message and "input_tokens=17321" in message
+            for message in logs.output
+        ))
 
     # -- confidence-means-complete-identification (semantic fix) -----------
     # These exercise normalize_identification() directly with the shape a

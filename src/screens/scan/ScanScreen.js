@@ -26,6 +26,7 @@ import {
   generateEbayListing,
   logScanToSheet,
 } from "../../api/client";
+import { prepareImageForIdentification } from "../../api/imagePrep";
 
 // V1: eBay listing generation is out of scope (server also short-circuits
 // /api/generate-ebay-listing via ENABLE_EBAY_LISTING). Kept as a single flag,
@@ -111,7 +112,7 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
       if (captureStage === "front") {
         setLoadingStep("Capturing the front of the coin...");
         const photo = await capturePhoto();
-        setFrontImage(photo.base64);
+        setFrontImage(await prepareImageForIdentification(photo));
         setCaptureStage("back");
         setLoadingStep("");
         return;
@@ -124,10 +125,11 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
       setPhase("loading");
       setLoadingStep("Capturing the back of the coin...");
       const photo = await capturePhoto();
-      setBackImage(photo.base64);
+      const backBase64 = await prepareImageForIdentification(photo);
+      setBackImage(backBase64);
 
       setLoadingStep("Identifying the coin from both sides...");
-      const coinLensResult = await identifyCoin(frontImage, photo.base64, "camera");
+      const coinLensResult = await identifyCoin(frontImage, backBase64, "camera");
       const legacyResult = toLegacyScanResult(coinLensResult);
       const { coinData } = legacyResult;
 
@@ -199,7 +201,8 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
     try {
       setPhase("loading");
       setLoadingStep("Identifying the coin...");
-      const coinLensResult = await identifyCoin(selectedUpload.base64, null, "gallery");
+      const uploadBase64 = await prepareImageForIdentification(selectedUpload);
+      const coinLensResult = await identifyCoin(uploadBase64, null, "gallery");
       const legacyResult = toLegacyScanResult(coinLensResult);
       const { coinData } = legacyResult;
 
