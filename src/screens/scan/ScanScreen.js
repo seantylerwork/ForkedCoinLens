@@ -562,7 +562,7 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
       <View style={styles.scannerOuter}>
         <View style={styles.scannerBoxWrapper}>
           <View style={styles.scannerBox}>
-            <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" onCameraReady={() => setCameraReady(true)} />
+            <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" zoom={0.3} onCameraReady={() => setCameraReady(true)} />
             <View style={[styles.corner, styles.cornerTL]} />
             <View style={[styles.corner, styles.cornerTR]} />
             <View style={[styles.corner, styles.cornerBL]} />
