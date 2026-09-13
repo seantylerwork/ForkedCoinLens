@@ -24,7 +24,6 @@ import {
   identifyCoin,
   toLegacyScanResult,
   generateEbayListing,
-  logScanToSheet,
 } from "../../api/client";
 import { prepareImageForIdentification } from "../../api/imagePrep";
 
@@ -139,7 +138,6 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
         return;
       }
 
-      logScanToSheet(coinData, user?.name);
       onScanSaved?.();
       setEbayListing(null);
       setListingError("");
@@ -212,7 +210,6 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
         return;
       }
 
-      logScanToSheet(coinData, user?.name);
       onScanSaved?.();
       setResult(legacyResult);
       setPhase("result");

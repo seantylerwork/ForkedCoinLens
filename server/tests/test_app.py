@@ -920,6 +920,29 @@ class CoinLensApiTests(unittest.TestCase):
         mock_insert.assert_not_called()
         mock_update.assert_called_once_with("usage-1", {"status": "uncertain"})
 
+    # -- build_coin_summary: the AI is prompted to embed its own "visual
+    # estimate, not a professional certified grade" disclaimer directly in
+    # estimated_grade - the summary must not append a second one on top. --
+
+    def test_build_coin_summary_does_not_duplicate_a_grade_disclaimer_the_ai_already_included(self):
+        identification = {
+            "year": "2012", "country": "United Kingdom", "denomination": "20 pence",
+            "estimated_grade": "VF-25 (visual estimate; not professionally certified)",
+            "mint_errors": [],
+        }
+        summary = coinlens_app.build_coin_summary(identification, {"status": "unavailable"})
+        self.assertIn("Estimated grade: VF-25 (visual estimate; not professionally certified).", summary)
+        self.assertEqual(summary.count("visual estimate"), 1)
+        self.assertNotIn("AI visual estimate, not a professional certified grade", summary)
+
+    def test_build_coin_summary_shows_a_bare_grade_when_ai_omitted_a_disclaimer(self):
+        identification = {
+            "year": "2020", "country": "Canada", "denomination": "1 dollar",
+            "estimated_grade": "MS-63", "mint_errors": [],
+        }
+        summary = coinlens_app.build_coin_summary(identification, {"status": "unavailable"})
+        self.assertIn("Estimated grade: MS-63.", summary)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1265,7 +1265,13 @@ def build_coin_summary(identification, valuation):
 
     grade = identification.get("estimated_grade")
     if grade and grade != "Unknown":
-        sentences.append(f"Estimated grade: {grade} (AI visual estimate, not a professional certified grade).")
+        # The AI is already prompted to embed its own "visual estimate, not
+        # a professional certified grade" disclaimer into estimated_grade
+        # itself (see IDENTIFICATION_PROMPT) - appending a second one here
+        # doubled it up in every real scan (e.g. "VF-25 (visual estimate;
+        # not professionally certified) (AI visual estimate, not a
+        # professional certified grade).").
+        sentences.append(f"Estimated grade: {grade}.")
 
     if valuation.get("status") == "available" and valuation.get("estimated_value") is not None:
         sentences.append(
