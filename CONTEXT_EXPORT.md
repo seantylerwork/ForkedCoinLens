@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `9bc4a87` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `fa2f3bc` (origin/seperate).
 
 ---
 
@@ -1257,7 +1257,88 @@ text/button on device.
 
 ---
 
-## 20. Pending external actions
+## 20. Follow-up fix: Numista issuer-code search + ambiguous-match guard
+
+**Trigger**: a real 2012 UK 20 pence scan narrowed §17's problem further.
+Free-text search (`q="United Kingdom 20 pence"`) returned 12 candidates,
+mostly **Isle of Man** 20 Pence types. The §17 issue-year validation
+worked exactly as designed - candidates 10799/92170/92171 each only had
+1982/1983 issues, none matched 2012, all correctly rejected, valuation
+correctly stayed unavailable. The remaining gap: free-text search itself
+wasn't giving the real UK match a fair shot at appearing as a plausible
+candidate at all.
+
+**Numista issuer endpoint/response shape found**: `GET
+https://api.numista.com/api/v3/issuers` returns issuer records shaped
+like `{"code": "...", "name": "..."}` (via a third-party SDK + community
+sources, matching the same `{"count":..., "<key>":[...]}` wrapper
+convention already empirically confirmed for `/types` search) - **not
+confirmed against a live response** in this session (no key here). The
+exact `/types` search `year` parameter's real name is also unconfirmed
+first-party (Numista's docs are Cloudflare-blocked, no live key) - a
+third-party Apify wrapper's own input schema uses `minYear`/`maxYear`
+naming, which hints the real param might not be a bare `year`. Given
+that risk, `year` is passed to `/types` search only as a low-risk
+*hint* - if Numista ignores or mis-handles it, the existing issue-level
+year check (confirmed correct, per this bug report) still catches
+everything; it isn't relied on as a correctness gate.
+
+**How issuer resolution works** (`server/app.py`):
+`resolve_numista_issuer_code(country_text)` normalizes the AI's country
+string (lowercase), applies a tiny alias map (`uk`→`united kingdom`,
+`usa`/`us`→`united states`), then looks it up in a name→code index built
+from `fetch_numista_issuers()` - **never a hardcoded issuer code**. The
+index is cached in-process for 24h (`_numista_issuer_name_index`, module
+globals, no DB table) so a scan doesn't refetch the full issuer list
+every time. Any failure (fetch error, no match) returns `None` and is
+treated as "use the fallback search," never a fatal error for the scan.
+
+**Primary (structured) search params**: `q=<denomination>`,
+`issuer=<resolved code>`, `year=<int>` (only if numeric), `category=coin`,
+`count=12` - country name deliberately **not** duplicated in `q` once an
+issuer code is supplied.
+
+**Fallback search params** (used when issuer resolution fails, or the
+structured search errors/returns zero candidates - logged either way with
+why): `q=<denomination>`, `year=<int>` (if available), `category=coin` -
+still no free-text country, so it can't reintroduce the original
+wrong-country-ranking problem; both paths feed the same unchanged
+scoring → shortlist → per-candidate `/issues` → require-a-year-match
+pipeline from §17.
+
+**New safety net**: `resolve_numista_type_and_issue` now inspects *every*
+shortlisted candidate's issues (not just the first hit) before deciding -
+if more than one has a real matching issue for the identified year, it
+returns unavailable rather than picking by score. "Confident" now means
+*exactly one* candidate survives the factual check.
+
+**Files changed**: `server/app.py` (issuer cache/resolution, rewritten
+`search_numista_types`, ambiguity check in `resolve_numista_type_and_issue`,
+`_numista_result_list` now also unwraps an `"issuers"` key),
+`server/tests/test_numista.py` (13 new tests).
+
+**Not changed** (confirmed): OpenAI identification, quota/rate-limit
+handling, the §19 retry-after work, Supabase persistence, auth, badges,
+leaderboard, PCGS, scan schema, mock mode (explicitly tested unaffected).
+
+**Tests**: 80/80 Python passing (67 → 80), 31/31 JS passing (unaffected,
+no JS touched). Commit `fa2f3bc`, pushed.
+
+**Exact next real scan to run**: the same 2012 UK 20 pence coin again (or
+any UK coin), and read Render logs in order: `[numista] issuer
+resolution: AI country='United Kingdom' resolved issuer code=...` (does a
+real code resolve, and is it right?), `[numista] search params: ...`
+(structured attempt), `[numista] candidate count=... (structured
+search)` (did issuer-scoped search actually surface the real UK 20p type
+this time, instead of Isle of Man?), then the existing `[numista] all
+candidates scored`/`issues inspected`/`selected type+issue` lines through
+to a price lookup - the first real end-to-end confirmation of the whole
+pipeline, including the still-unverified `/types/{id}/issues/{issue_id}/prices`
+response shape from §17.
+
+---
+
+## 21. Pending external actions
 
 1. ~~Run this in the Supabase SQL editor~~ — **now believed applied**: the
    real scan in §14 ran with `MOCK_MODE` off and reached
@@ -1334,9 +1415,15 @@ text/button on device.
     bucketed wait text and Try Again/Back to Home split actually appear
     correctly on device.
 
-Everything through §19 (code, tests, all commits through `9bc4a87`) is
+11. See §20 for the Numista issuer-code/structured-search fix - run the
+    "exact next real scan to run" there (a UK coin) to confirm structured
+    search actually surfaces the real match instead of Isle of Man
+    candidates, and to get the first real confirmation of the issue-price
+    endpoint's response shape.
+
+Everything through §20 (code, tests, all commits through `fa2f3bc`) is
 committed and pushed to `origin/seperate`. §15 (rate limit) + §16
-(truncated response) are confirmed fixed by real, non-mock scans; §17
-(Numista matching/pricing), §18 (429 diagnostics), and §19
-(retry_after_seconds propagation) are implemented and pushed but not yet
-exercised by a real scan/rate-limit hit.
+(truncated response) are confirmed fixed by real, non-mock scans; §17-§20
+(Numista matching/pricing, 429 diagnostics, retry_after_seconds, issuer
+resolution) are implemented and pushed but not yet exercised end-to-end
+by a real scan that reaches a confident valuation.
