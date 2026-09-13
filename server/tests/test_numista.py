@@ -465,6 +465,42 @@ class VariantDisambiguationTests(unittest.TestCase):
         self.assertFalse(coinlens_app.ai_indicates_special_variant(identification(description="An ordinary circulating coin.")))
 
 
+class GradeNormalizationTests(unittest.TestCase):
+    """Real production case: the AI's raw grade string ("F-12 (visual
+    estimate)") was compared for exact equality against Numista's own
+    short grade codes ("f", "vf", ...), which never matched, so every real
+    scan fell through to the crude "nearest available" (middle-indexed
+    priced entry) fallback - here it happened to return the same price as
+    the correct grade, masking the bug; that won't always be true."""
+
+    def test_common_numeric_grade_forms(self):
+        cases = {
+            "G-4": "g", "VG-8": "vg",
+            "F-12": "f", "F-15": "f",
+            "VF-20": "vf", "VF-25": "vf", "VF-30": "vf", "VF-35": "vf",
+            "XF-40": "xf", "XF-45": "xf", "EF-40": "xf", "EF-45": "xf",
+            "AU-50": "au", "AU-53": "au", "AU-55": "au", "AU-58": "au",
+            "MS-60+": "unc", "UNC": "unc", "MS-63": "unc",
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(coinlens_app.normalize_numista_grade(raw), expected)
+
+    def test_ignores_explanatory_parenthetical_suffixes(self):
+        self.assertEqual(coinlens_app.normalize_numista_grade("F-12 (visual estimate)"), "f")
+        self.assertEqual(
+            coinlens_app.normalize_numista_grade("VF-25 (visual estimate; not professionally certified)"), "vf",
+        )
+
+    def test_already_short_codes_are_a_safe_no_op(self):
+        for code in ("g", "vg", "f", "vf", "xf", "au", "unc"):
+            self.assertEqual(coinlens_app.normalize_numista_grade(code), code)
+
+    def test_blank_grade_normalizes_to_empty_string(self):
+        self.assertEqual(coinlens_app.normalize_numista_grade(None), "")
+        self.assertEqual(coinlens_app.normalize_numista_grade(""), "")
+
+
 class FetchNumistaPriceTests(unittest.TestCase):
     def test_requests_the_issue_scoped_price_endpoint(self):
         """Numista v3 prices a specific issue, not a whole type - regression
@@ -476,6 +512,49 @@ class FetchNumistaPriceTests(unittest.TestCase):
             coinlens_app.fetch_numista_price(999, "iss-2016", "AU-50")
         called_url = mock_get.call_args.args[0]
         self.assertEqual(called_url, f"{coinlens_app.NUMISTA_TYPES_URL}/999/issues/iss-2016/prices")
+
+    # -- Real production case: the UK 2012 20p price list. ----------------
+
+    UK_20P_PRICES = [
+        {"grade": "g", "price": 0.266846},
+        {"grade": "vg", "price": 0.266846},
+        {"grade": "f", "price": 0.280911},
+        {"grade": "vf", "price": 0.280911},
+        {"grade": "xf", "price": 0.359662},
+        {"grade": "au", "price": 0.406070},
+        {"grade": "unc", "price": 1.160200},
+    ]
+
+    def _price_response(self, prices):
+        response = mock.Mock(status_code=200, text=json.dumps({"prices": prices}))
+        response.json.return_value = {"prices": prices}
+        return response
+
+    def test_f12_grade_selects_the_f_entry_not_the_nearest_fallback(self):
+        """The exact live regression: requesting "F-12 (visual estimate)"
+        must select the "f" price (0.280911), not fall through to the
+        nearest-available fallback, which happened to also land on "vf"
+        (same price here) but is not guaranteed to for other coins."""
+        coinlens_app.NUMISTA_API_KEY = "test-key"
+        with mock.patch.object(coinlens_app.requests, "get", return_value=self._price_response(self.UK_20P_PRICES)):
+            result = coinlens_app.fetch_numista_price(5628, 144284, "F-12 (visual estimate)")
+
+        self.assertIsNotNone(result)
+        self.assertTrue(result["exact_grade_match"])
+        self.assertEqual(result["grade"], "f")
+        self.assertEqual(result["value"], 0.280911)
+
+    def test_normalized_grade_present_in_response_is_selected_over_nearest_fallback(self):
+        """General case (not just F-12): whenever the normalized requested
+        grade exists among the returned prices, it must win - the
+        nearest-available fallback is only for when it doesn't."""
+        coinlens_app.NUMISTA_API_KEY = "test-key"
+        with mock.patch.object(coinlens_app.requests, "get", return_value=self._price_response(self.UK_20P_PRICES)):
+            result = coinlens_app.fetch_numista_price(5628, 144284, "AU-55")
+
+        self.assertTrue(result["exact_grade_match"])
+        self.assertEqual(result["grade"], "au")
+        self.assertEqual(result["value"], 0.406070)
 
 
 class LookupNumistaIntegrationTests(unittest.TestCase):

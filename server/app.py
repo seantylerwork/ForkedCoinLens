@@ -1410,6 +1410,53 @@ def lookup_numista(identification):
     return merged
 
 
+# A real UK 2012 20p scan showed the AI's raw grade string ("F-12 (visual
+# estimate)") compared for exact equality against Numista's own short
+# grade codes ("g"/"vg"/"f"/"vf"/"xf"/"au"/"unc") - which never matches,
+# so every real scan fell through to the crude "nearest available" (just
+# the middle-indexed priced entry) fallback instead of the actual correct
+# grade. The price happened to be identical for F and VF on that coin,
+# masking the bug; that won't always be true.
+NUMISTA_GRADE_LETTER_ALIASES = {
+    "ag": "ag", "g": "g", "vg": "vg", "f": "f", "vf": "vf",
+    "xf": "xf", "ef": "xf", "au": "au", "unc": "unc", "ms": "unc", "bu": "unc",
+}
+
+# Standard Sheldon-scale numeric grade bands -> Numista's short grade
+# code. The number is the authoritative signal when present - XF and EF
+# are synonyms for the same 40-49 band, so a numeric lookup handles both
+# without needing every letter/number combination spelled out.
+_NUMISTA_GRADE_NUMBER_BANDS = (
+    (1, 3, "ag"), (4, 7, "g"), (8, 11, "vg"), (12, 19, "f"),
+    (20, 39, "vf"), (40, 49, "xf"), (50, 59, "au"), (60, 70, "unc"),
+)
+
+
+def normalize_numista_grade(grade):
+    """Canonicalizes a Sheldon-scale grade string (e.g. "F-12 (visual
+    estimate)", "VF-25 (visual estimate; not professionally certified)",
+    "AU-55", "MS-63", "UNC") to the short grade code Numista's own
+    price-list entries use. Explanatory parenthetical suffixes are
+    stripped first. Applying this to an already-short code (e.g. "vf") is
+    a safe no-op, so it can be used on both the requested grade and each
+    price entry's own grade for the comparison."""
+    if not grade:
+        return ""
+    text = re.sub(r"\(.*?\)", "", str(grade)).strip().lower()
+    match = re.match(r"([a-z]+)\s*-?\s*(\d+)", text)
+    if match:
+        value = int(match.group(2))
+        for low, high, code in _NUMISTA_GRADE_NUMBER_BANDS:
+            if low <= value <= high:
+                return code
+        return NUMISTA_GRADE_LETTER_ALIASES.get(match.group(1), match.group(1))
+
+    letters_only = re.match(r"([a-z]+)", text)
+    if letters_only:
+        return NUMISTA_GRADE_LETTER_ALIASES.get(letters_only.group(1), letters_only.group(1))
+    return text
+
+
 def fetch_numista_price(type_id, issue_id, grade):
     try:
         upstream = requests.get(
@@ -1442,10 +1489,10 @@ def fetch_numista_price(type_id, issue_id, grade):
         app.logger.info("[numista] price response had no usable 'prices' list: type_id=%s issue_id=%s", type_id, issue_id)
         return None
 
-    grade_text = _text_of(grade)
+    grade_text = normalize_numista_grade(grade)
     for entry in prices:
-        if isinstance(entry, dict) and _text_of(entry.get("grade")) == grade_text and entry.get("price") is not None:
-            app.logger.info("[numista] exact grade price match: type_id=%s issue_id=%s grade=%r price=%s", type_id, issue_id, grade, entry["price"])
+        if isinstance(entry, dict) and normalize_numista_grade(entry.get("grade")) == grade_text and entry.get("price") is not None:
+            app.logger.info("[numista] exact grade price match: type_id=%s issue_id=%s grade=%r normalized=%r price=%s", type_id, issue_id, grade, grade_text, entry["price"])
             return {"value": entry["price"], "grade": entry.get("grade"), "exact_grade_match": True}
 
     priced = [entry for entry in prices if isinstance(entry, dict) and entry.get("price") is not None]
