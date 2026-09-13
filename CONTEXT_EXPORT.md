@@ -4,7 +4,7 @@ Purpose: capture everything done in today's session — implementation,
 assumptions, and a live production bug — so it can be pasted as context into
 a future session without re-deriving it.
 
-Branch: `seperate`. Latest pushed commit: `fa2f3bc` (origin/seperate).
+Branch: `seperate`. Latest pushed commit: `124344c` (origin/seperate).
 
 ---
 
@@ -1338,7 +1338,68 @@ response shape from §17.
 
 ---
 
-## 21. Pending external actions
+## 21. Two small fixes: doubled grade disclaimer + redundant log-scan call
+
+**Trigger**: the user reported two issues from the same real UK 20p scan
+session: (1) the result summary showed the grade disclaimer twice back to
+back, e.g. "Estimated grade: VF-25 (visual estimate; not professionally
+certified) (AI visual estimate, not a professional certified grade)."; (2)
+`/api/log-scan` was still being called client-side after
+`/api/identify-coin` had already persisted the authoritative scan to
+Supabase - flagged as "legacy behavior worth auditing later... not
+blocking Numista testing," but grouped under "also fix these."
+
+**Fix 1 - doubled disclaimer** (`server/app.py`, `build_coin_summary`):
+`IDENTIFICATION_PROMPT` already instructs the AI to embed its own "visual
+estimate, not a professional certified grade" wording directly inside
+`estimated_grade` (confirmed - every real scan this session shows the AI
+doing exactly that, e.g. "VF-30 (visual estimate; not professionally
+certified)", "VF-20 (visual estimate; affected by heavy wear and
+damage)"). `build_coin_summary` was *also* appending its own hardcoded
+"(AI visual estimate, not a professional certified grade)" after the
+grade - stacking a second disclaimer on top of the AI's own. Now just
+emits `f"Estimated grade: {grade}."`, trusting the AI's own wording (which
+the prompt already requires). Mock mode is unaffected - it uses a
+separate hardcoded `MOCK_SUMMARY` constant, not `build_coin_summary` at
+all.
+
+**Fix 2 - redundant log-scan call** (`src/screens/scan/ScanScreen.js`):
+removed both `logScanToSheet(coinData, user?.name)` call sites (camera and
+gallery flows) and the now-unused `logScanToSheet` import from
+`../../api/client`. This was a pre-Supabase-migration write to a
+SheetDB-backed sheet (`POST /api/log-scan`), redundant since
+`/api/identify-coin`'s response already reflects the authoritative
+Supabase-persisted row (`scan_row` returned in the body, `onScanSaved?.()`
+already triggers the Supabase-backed `refreshScans()` in `Root.js`).
+
+**Side effect flagged, not fixed (out of scope)**: `AdminScreen.js` still
+does `GET /api/scans`, which reads the *same* SheetDB sheet `log-scan` used
+to write to - its "Total Scans"/per-user breakdown will stop growing with
+new scans as a result of Fix 2. This isn't a *new* inconsistency:
+`AdminScreen.js` was never part of the Supabase migration described in
+§1a (it still separately merges in legacy `AsyncStorage` scan history
+too) and was already out of step with the rest of the app, which reads
+scan history straight from Supabase (`src/api/scans.js`). A real fix would
+point `AdminScreen` at Supabase like everything else - not done here,
+flagged for whenever that screen gets attention. Neither the
+`/api/log-scan` nor `/api/scans` Flask routes themselves were touched or
+removed.
+
+**Tests added** (`server/tests/test_app.py`): `build_coin_summary` no
+longer duplicates a disclaimer the AI already included, and still shows a
+bare grade cleanly when the AI didn't include one.
+
+**Tests**: 82/82 Python passing (80 → 82), 31/31 JS passing (unaffected -
+`ScanScreen.js` isn't unit-tested, same reason as always: it imports
+React Native). Commit `124344c`, pushed.
+
+**Not changed**: OpenAI identification, Numista/PCGS, quota/rate-limit
+handling, retry-after work, Supabase persistence itself, auth, badges,
+leaderboard, scan schema.
+
+---
+
+## 22. Pending external actions
 
 1. ~~Run this in the Supabase SQL editor~~ — **now believed applied**: the
    real scan in §14 ran with `MOCK_MODE` off and reached
@@ -1421,9 +1482,17 @@ response shape from §17.
     candidates, and to get the first real confirmation of the issue-price
     endpoint's response shape.
 
-Everything through §20 (code, tests, all commits through `fa2f3bc`) is
+12. See §21 for the doubled-disclaimer and redundant-log-scan fixes - next
+    real scan's summary text should show the grade disclaimer once, and
+    Render logs should no longer show a `POST /api/log-scan` call
+    immediately after a successful `/api/identify-coin`. Separately, if
+    `AdminScreen.js` ever needs attention, it should be pointed at Supabase
+    like the rest of the app instead of SheetDB/AsyncStorage.
+
+Everything through §21 (code, tests, all commits through `124344c`) is
 committed and pushed to `origin/seperate`. §15 (rate limit) + §16
 (truncated response) are confirmed fixed by real, non-mock scans; §17-§20
 (Numista matching/pricing, 429 diagnostics, retry_after_seconds, issuer
 resolution) are implemented and pushed but not yet exercised end-to-end
-by a real scan that reaches a confident valuation.
+by a real scan that reaches a confident valuation. §21 (summary/log-scan
+fixes) is implemented, tested, and pushed.
