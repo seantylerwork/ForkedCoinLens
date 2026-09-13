@@ -752,11 +752,14 @@ class CoinLensApiTests(unittest.TestCase):
         sent_payload = mock_post.call_args.kwargs["json"]
         self.assertGreaterEqual(sent_payload["max_output_tokens"], 2000)
 
-    def test_identify_coin_truncated_by_max_output_tokens_logs_incomplete_details(self):
+    def test_identify_coin_truncated_by_max_output_tokens_is_ai_incomplete_not_identification_failure(self):
         """Reproduces the real production case: output_tokens hit the cap
         exactly, all of it spent on hidden reasoning, so output_text is
-        empty. Must still surface as identification_failure (not a crash)
-        and log why, so a future occurrence is diagnosable from Render logs."""
+        empty. This is a provider processing failure, not a genuine
+        "coin not recognized" - must surface as the distinct, retryable
+        ai_incomplete code (previously misreported as
+        identification_failure, which told the user to retake the photo
+        for a problem that was never about the image)."""
         self._authenticate()
         coinlens_app.OPENAI_API_KEY = "test-key"
 
@@ -773,9 +776,9 @@ class CoinLensApiTests(unittest.TestCase):
                     "output": [],
                     "usage": {
                         "input_tokens": 4584,
-                        "output_tokens": 1000,
-                        "total_tokens": 5584,
-                        "output_tokens_details": {"reasoning_tokens": 1000},
+                        "output_tokens": 2000,
+                        "total_tokens": 6584,
+                        "output_tokens_details": {"reasoning_tokens": 2000},
                     },
                 },
             )
@@ -787,13 +790,115 @@ class CoinLensApiTests(unittest.TestCase):
                 )
         body = response.get_json()
 
-        self.assertEqual(response.status_code, 422)
-        self.assertEqual(body["error"]["code"], "identification_failure")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(body["error"]["code"], "ai_incomplete")
+        self.assertNotEqual(body["error"]["code"], "identification_failure")
         self.assertTrue(any(
             "incomplete_details" in message and "max_output_tokens" in message
             for message in logs.output
         ))
         mock_update.assert_called_once_with("usage-1", {"status": "error"})
+
+    def test_identify_coin_incomplete_for_a_different_reason_still_falls_through(self):
+        """Only incomplete_details.reason == "max_output_tokens" gets the
+        dedicated ai_incomplete treatment - some other incomplete reason
+        (with no usable output_text) still falls through to the existing
+        generic empty-response handling, unchanged."""
+        self._authenticate()
+        coinlens_app.OPENAI_API_KEY = "test-key"
+
+        with mock.patch.object(coinlens_app.requests, "post") as mock_post, \
+             mock.patch.object(coinlens_app, "count_api_usage_since", return_value=0), \
+             mock.patch.object(coinlens_app, "insert_api_usage", return_value={"id": "usage-1"}), \
+             mock.patch.object(coinlens_app, "update_api_usage"):
+            mock_post.return_value = mock.Mock(
+                ok=True,
+                status_code=200,
+                json=lambda: {
+                    "status": "incomplete",
+                    "incomplete_details": {"reason": "content_filter"},
+                    "output": [],
+                },
+            )
+            response = self.client.post(
+                "/api/identify-coin",
+                json={"front_image": JPEG_BASE64, "source": "camera"},
+                headers=self.auth_headers,
+            )
+        body = response.get_json()
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(body["error"]["code"], "identification_failure")
+
+    def test_identify_coin_genuine_uncertain_identification_unchanged(self):
+        """Completed response + genuinely uncertain identification must
+        keep the existing 'Coin Not Recognized' flow (422/unidentifiable
+        via identifiable=False), completely distinct from ai_incomplete -
+        this is the "completed + uncertain" half of the required
+        distinction, using an otherwise-valid low-confidence response."""
+        self._authenticate()
+        coinlens_app.OPENAI_API_KEY = "test-key"
+
+        uncertain = {
+            "status": "uncertain", "coin_name": "Unidentified coin",
+            "country": "Unknown", "denomination": "Unknown", "year": "Unknown",
+            "mint_mark": None, "estimated_grade": "Unknown", "confidence": 10,
+            "description": "", "mint_errors": [], "varieties": None,
+            "error_premium": False, "special_notes": "",
+            "unidentifiable_reason": "The coin is too worn to identify confidently.",
+            "alternatives": [],
+        }
+        with mock.patch.object(coinlens_app.requests, "post") as mock_post, \
+             mock.patch.object(coinlens_app, "count_api_usage_since", return_value=0), \
+             mock.patch.object(coinlens_app, "insert_api_usage", return_value={"id": "usage-1"}), \
+             mock.patch.object(coinlens_app, "update_api_usage"):
+            mock_post.return_value = mock.Mock(
+                ok=True, status_code=200,
+                json=lambda: {"status": "completed", "output_text": json.dumps(uncertain)},
+            )
+            response = self.client.post(
+                "/api/identify-coin",
+                json={"front_image": JPEG_BASE64, "source": "camera"},
+                headers=self.auth_headers,
+            )
+        body = response.get_json()
+
+        self.assertEqual(response.status_code, 422)
+        self.assertFalse(body["identification"]["identifiable"])
+        self.assertNotEqual(body.get("error", {}).get("code"), "ai_incomplete")
+
+    def test_identify_coin_sends_low_reasoning_effort(self):
+        """The model's default reasoning effort consumed the entire
+        max_output_tokens budget on a real scan - explicitly request low
+        effort rather than relying on whatever the default is."""
+        self._authenticate()
+        coinlens_app.OPENAI_API_KEY = "test-key"
+        self.mock_persisted_scan()
+
+        identification = {
+            "status": "identified", "coin_name": "2012 United Kingdom 20 Pence",
+            "country": "United Kingdom", "denomination": "20 pence", "year": "2012",
+            "mint_mark": None, "estimated_grade": "VF-20", "confidence": 97,
+            "description": "", "mint_errors": [], "varieties": None,
+            "error_premium": False, "special_notes": "", "unidentifiable_reason": None,
+            "alternatives": [],
+        }
+        with mock.patch.object(coinlens_app.requests, "post") as mock_post, \
+             mock.patch.object(coinlens_app, "count_api_usage_since", return_value=0), \
+             mock.patch.object(coinlens_app, "insert_api_usage", return_value={"id": "usage-1"}), \
+             mock.patch.object(coinlens_app, "update_api_usage"):
+            mock_post.return_value = mock.Mock(
+                ok=True, status_code=200, json=lambda: {"status": "completed", "output_text": json.dumps(identification)},
+            )
+            self.client.post(
+                "/api/identify-coin",
+                json={"front_image": JPEG_BASE64, "source": "camera"},
+                headers=self.auth_headers,
+            )
+
+        sent_payload = mock_post.call_args.kwargs["json"]
+        self.assertEqual(sent_payload["reasoning"], {"effort": "low"})
+        self.assertEqual(sent_payload["max_output_tokens"], 2000)
 
     # -- confidence-means-complete-identification (semantic fix) -----------
     # These exercise normalize_identification() directly with the shape a

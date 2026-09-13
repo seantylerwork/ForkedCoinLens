@@ -599,6 +599,13 @@ def identify_coin_with_ai(front_image, back_image=None):
         # for that while still comfortably inside a low-tier TPM limit
         # alongside the (now-resized, ~4-5K token) input images.
         "max_output_tokens": 2000,
+        # A real scan still hit output_tokens=reasoning_tokens=2000 with
+        # status=incomplete/max_output_tokens - the model's default
+        # reasoning effort consumed the entire budget with nothing left
+        # for the visible JSON. Explicitly request low effort rather than
+        # relying on whatever the default happens to be; max_output_tokens
+        # is left at 2000 for now to isolate whether this alone fixes it.
+        "reasoning": {"effort": "low"},
     }
 
     try:
@@ -654,6 +661,25 @@ def identify_coin_with_ai(front_image, back_image=None):
                     details["retry_after_seconds"] = retry_after_seconds
             raise CoinLensError(code, "AI provider rate or quota limit reached.", 429, details=details)
         raise CoinLensError("upstream_failure", "AI provider request failed.", 502)
+
+    # A real scan showed OpenAI return HTTP 200 with status="incomplete",
+    # incomplete_details.reason="max_output_tokens" (the whole budget spent
+    # on reasoning, none left for the visible JSON) - and no output_text.
+    # That is a provider processing failure, not a genuine "coin not
+    # recognized": must not be reported as identification_failure/
+    # unidentifiable, which would tell the user to retake the photo when
+    # the image itself was never the problem. Checked before the generic
+    # empty-output-text fallback below, which remains for every other
+    # empty-response cause.
+    incomplete_details = data.get("incomplete_details") if isinstance(data, dict) else None
+    if data.get("status") == "incomplete" and isinstance(incomplete_details, dict) \
+            and incomplete_details.get("reason") == "max_output_tokens":
+        app.logger.warning(
+            "[identify] AI processing incomplete: incomplete_details=%s", incomplete_details,
+        )
+        raise CoinLensError(
+            "ai_incomplete", "The AI service couldn't finish processing this scan.", 503,
+        )
 
     text = extract_responses_output_text(data)
     if not text:

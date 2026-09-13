@@ -69,3 +69,29 @@ test('another normal retryable error (network) keeps its existing Try Again beha
   assert.equal(detail.retryable, true);
   assert.equal(detail.title, 'No Internet');
 });
+
+// -- ai_incomplete: OpenAI exhausted its reasoning budget before producing
+// visible output. This must read as a temporary processing failure, never
+// as "coin not recognized"/bad photo, and must stay retryable.
+
+test('ai_incomplete shows the AI-processing-interrupted message and stays retryable', () => {
+  const detail = makeErrorDetail(new ScanError('ai_incomplete', "The AI service couldn't finish processing this scan."));
+  assert.equal(detail.code, 'ai_incomplete');
+  assert.equal(detail.title, 'AI Processing Interrupted');
+  assert.equal(detail.body, "The AI service couldn't finish processing this scan.");
+  assert.equal(detail.retryable, true);
+});
+
+test('ai_incomplete never claims a lighting/image/unrecognized problem', () => {
+  const detail = makeErrorDetail(new ScanError('ai_incomplete', "The AI service couldn't finish processing this scan."));
+  const combinedText = `${detail.title} ${detail.body} ${detail.tip ?? ''}`.toLowerCase();
+  assert.doesNotMatch(combinedText, /lighting/);
+  assert.doesNotMatch(combinedText, /not recognized/);
+  assert.doesNotMatch(combinedText, /bad (image|photo)/);
+});
+
+test('ai_incomplete is distinct from identification_failure', () => {
+  const incomplete = makeErrorDetail(new ScanError('ai_incomplete', "The AI service couldn't finish processing this scan."));
+  const unrecognized = makeErrorDetail(new ScanError('identification_failure', 'AI provider returned an empty response.'));
+  assert.notEqual(incomplete.title, unrecognized.title);
+});

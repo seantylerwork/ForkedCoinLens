@@ -26,6 +26,11 @@ const ERROR_DISPLAY = {
   invalid_image: { icon: "!", title: "Unsupported Image", tip: "Try a clear JPEG or PNG photo." },
   missing_image: { icon: "!", title: "Photo Missing", tip: "Choose or capture a photo before scanning." },
   identification_failure: { icon: "!", title: "Coin Not Recognized", tip: "Try another photo with better lighting." },
+  // Distinct from identification_failure: the AI ran out of its output
+  // budget mid-processing (reasoning tokens consumed it all) before
+  // producing any result - the image itself was never evaluated, so this
+  // must not tell the user their photo/lighting was the problem.
+  ai_incomplete: { icon: "!", title: "AI Processing Interrupted", tip: null },
   malformed_ai_response: { icon: "!", title: "Bad Identification Data", tip: "This is rare. Try scanning again." },
   camera: { icon: "!", title: "Camera Not Ready", tip: "Wait a moment, then try again." },
   photo: { icon: "!", title: "Photo Capture Failed", tip: "Make sure nothing is blocking the camera lens." },
