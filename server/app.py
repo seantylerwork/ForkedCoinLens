@@ -1723,7 +1723,18 @@ def canonicalize_denomination(denomination, coin_name):
     text = f"{denomination or ''} {coin_name or ''}".lower()
     if "wheat" in text:
         return "wheat-penny"
-    if "cent" in text or "penny" in text:
+    # "cent" alone used to match here - a substring of "cents" - so ANY
+    # "N cents" denomination (Canada/Australia 5c, 10c, 25c, ...) was
+    # misclassified as "penny" before the more specific nickel/dime/
+    # quarter checks below ever got a chance. Only the literal word
+    # "penny", or a numeric value of exactly 1 ("1 cent"/"one cent" - the
+    # US penny), should land here; "5 cents"/"10 cents"/"25 cents" etc.
+    # without an explicit "nickel"/"dime"/"quarter" (or spelled-out
+    # "five/ten/twenty-five cent") now correctly fall through to the
+    # generic slug fallback below - matching the documented intent that a
+    # non-explicit foreign denomination shouldn't match a US-specific
+    # badge at all, rather than being force-mapped into a US-coin bucket.
+    if "penny" in text or re.search(r"\b(?:1|one)\s+cents?\b", text):
         return "penny"
     if "nickel" in text or "five cent" in text:
         return "nickel"

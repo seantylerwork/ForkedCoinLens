@@ -1049,5 +1049,55 @@ class CoinLensApiTests(unittest.TestCase):
         self.assertIn("Estimated grade: MS-63.", summary)
 
 
+class CanonicalizeDenominationTests(unittest.TestCase):
+    """Real production bug: "cent" is a substring of "cents", so any
+    "N cents" denomination (Canada/Australia 5c/10c/25c, etc.) was
+    misclassified as "penny" before the more specific nickel/dime/quarter
+    checks ever got a chance - e.g. a real "Canada 5 cents" scan persisted
+    denom_canonical="penny", which could falsely award type_penny/
+    var_penny_streak. Only the literal word "penny", or an explicit
+    numeric value of 1 ("1 cent"/"one cent" - the actual US penny), should
+    land here now."""
+
+    def test_explicit_penny_forms_still_recognized(self):
+        for denom in ("1 cent", "one cent", "penny", "1 Cent", "Penny"):
+            with self.subTest(denom=denom):
+                self.assertEqual(coinlens_app.canonicalize_denomination(denom, ""), "penny")
+
+    def test_wheat_penny_still_takes_precedence(self):
+        self.assertEqual(coinlens_app.canonicalize_denomination("1 cent", "1946 Lincoln Wheat Cent"), "wheat-penny")
+
+    def test_foreign_5_cents_is_not_penny(self):
+        self.assertNotEqual(coinlens_app.canonicalize_denomination("Canada 5 cents", ""), "penny")
+        self.assertNotEqual(coinlens_app.canonicalize_denomination("5 cents", ""), "penny")
+        self.assertNotEqual(coinlens_app.canonicalize_denomination("5 cent", ""), "penny")
+
+    def test_10_and_25_cents_are_not_penny(self):
+        self.assertNotEqual(coinlens_app.canonicalize_denomination("10 cents", ""), "penny")
+        self.assertNotEqual(coinlens_app.canonicalize_denomination("25 cents", ""), "penny")
+
+    def test_spelled_out_five_cents_still_maps_to_nickel(self):
+        # Unchanged, pre-existing behavior (the nickel branch itself was
+        # never touched) - spelled-out "five cent(s)" was always an
+        # explicit nickel signal in this taxonomy, unlike the bare digit
+        # form "5 cents", which has no explicit US-coin signal at all and
+        # correctly falls through to the generic slug fallback instead.
+        self.assertEqual(coinlens_app.canonicalize_denomination("five cents", ""), "nickel")
+        self.assertEqual(coinlens_app.canonicalize_denomination("nickel", ""), "nickel")
+
+    def test_2_dollars_still_maps_to_dollar(self):
+        self.assertEqual(coinlens_app.canonicalize_denomination("2 dollars", ""), "dollar")
+        self.assertEqual(coinlens_app.canonicalize_denomination("Hong Kong 2 dollars", ""), "dollar")
+
+    def test_existing_denominations_unaffected(self):
+        self.assertEqual(coinlens_app.canonicalize_denomination("dime", ""), "dime")
+        self.assertEqual(coinlens_app.canonicalize_denomination("quarter", ""), "quarter")
+        self.assertEqual(coinlens_app.canonicalize_denomination("half dollar", ""), "half-dollar")
+
+    def test_unmatched_denomination_falls_back_to_a_slug(self):
+        self.assertEqual(coinlens_app.canonicalize_denomination("Canada 5 cents", ""), "canada-5-cents")
+        self.assertEqual(coinlens_app.canonicalize_denomination("20 pence", ""), "20-pence")
+
+
 if __name__ == "__main__":
     unittest.main()
