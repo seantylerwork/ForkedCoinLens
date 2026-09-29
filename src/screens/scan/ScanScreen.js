@@ -57,6 +57,7 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
   const [ebayListing, setEbayListing] = useState(null);
   const [listingLoading, setListingLoading] = useState(false);
   const [listingError, setListingError] = useState("");
+  const [showDetails, setShowDetails] = useState(false);
   const [cameraReady, setCameraReady] = useState(false);
   const [flashActive, setFlashActive] = useState(false);
   const [isCapturing, setIsCapturing] = useState(false);
@@ -105,6 +106,7 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
     setListingError("");
     setListingLoading(false);
     setSelectedUpload(null);
+    setShowDetails(false);
   }
 
   async function capturePhoto() {
@@ -421,25 +423,8 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
 
           <ConfidenceMeter value={coinData.confidence} />
 
-          {Array.isArray(coinData.alternatives) && coinData.alternatives.length > 0 && (
-            <View style={styles.resultCard}>
-              <Text style={styles.resultCardTitle}>Could Also Be</Text>
-              {coinData.alternatives.map((alt, i) => (
-                <View key={i} style={styles.altRow}>
-                  <View style={styles.altInfo}>
-                    <Text style={styles.altCoin}>{alt.coin}</Text>
-                    <View style={styles.altBarTrack}>
-                      <View style={[styles.altBarFill, { width: `${alt.confidence}%` }]} />
-                    </View>
-                  </View>
-                  <Text style={styles.altPct}>{alt.confidence}%</Text>
-                </View>
-              ))}
-            </View>
-          )}
-
           <View style={styles.resultCard}>
-            <Text style={styles.resultCardTitle}>AI Identification</Text>
+            <Text style={styles.resultCardTitle}>Identification & Value</Text>
             {[["Country", coinData.country], ["Denomination", coinData.denomination],
               ["Year", coinData.year], ["Mint Mark", coinData.mint_mark],
               ["Grade", coinData.estimated_grade],
@@ -451,43 +436,9 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
                 </View>
               ) : null
             )}
-            {coinData.special_notes ? (
-              <Text style={[styles.resultSummary, { marginTop: 4 }]}>{coinData.special_notes}</Text>
-            ) : null}
-          </View>
 
-          {coinData.mint_errors?.length > 0 && (
-            <View style={[styles.resultCard, styles.errorCard]}>
-              <Text style={[styles.resultCardTitle, { color: "#FF6B35" }]}>Mint Errors Detected</Text>
-              {coinData.mint_errors.map((err, i) => (
-                <View key={i} style={styles.errorRow}>
-                  <Text style={styles.errorBullet}>-</Text>
-                  <Text style={styles.errorText}>{err}</Text>
-                </View>
-              ))}
-            </View>
-          )}
-
-          {numistaData && !numistaData.error && (
-            <View style={styles.resultCard}>
-              <Text style={styles.resultCardTitle}>Numista Specs</Text>
-              {[["Title", numistaData.title], ["Composition", numistaData.composition?.text],
-                ["Weight", numistaData.weight ? `${numistaData.weight}g` : null],
-                ["Diameter", numistaData.size ? `${numistaData.size}mm` : null]].map(([label, val]) =>
-                val ? (
-                  <View key={label} style={styles.resultRow}>
-                    <Text style={styles.resultLabel}>{label}</Text>
-                    <Text style={styles.resultValue}>{val}</Text>
-                  </View>
-                ) : null
-              )}
-            </View>
-          )}
-
-          {valueEstimate && (
-            <View style={styles.resultCard}>
-              <Text style={styles.resultCardTitle}>Estimated Value</Text>
-              {valueEstimate.low != null && valueEstimate.high != null ? (
+            {valueEstimate ? (
+              valueEstimate.low != null && valueEstimate.high != null ? (
                 <View style={styles.valueRangeRow}>
                   <View style={styles.valueBox}>
                     <Text style={styles.valueBoxLabel}>Low</Text>
@@ -508,83 +459,144 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
                     </Text>
                   </View>
                 </View>
-              )}
-              {valueEstimate.source ? (
-                <View style={styles.resultRow}>
-                  <Text style={styles.resultLabel}>Source</Text>
-                  <Text style={styles.resultValue}>{valueEstimate.source}</Text>
-                </View>
-              ) : null}
-              {valueEstimate.condition_assumed ? (
-                <View style={styles.resultRow}>
-                  <Text style={styles.resultLabel}>Condition assumed</Text>
-                  <Text style={styles.resultValue}>{valueEstimate.condition_assumed}</Text>
-                </View>
-              ) : null}
-              {valueEstimate.error_value_note ? (
-                <Text style={[styles.resultSummary, { color: "#FF6B35", fontWeight: "700" }]}>{valueEstimate.error_value_note}</Text>
-              ) : null}
-              {valueEstimate.reasoning ? (
-                <Text style={styles.resultSummary}>{valueEstimate.reasoning}</Text>
-              ) : null}
-            </View>
-          )}
-
-          {(!valueEstimate) && (
-            <View style={styles.resultCard}>
-              <Text style={styles.resultCardTitle}>Estimated Value</Text>
-              <Text style={styles.resultSummary}>Not available for this coin and grade yet.</Text>
-            </View>
-          )}
-
-          {pcgsData && !pcgsData.error && (
-            <View style={styles.resultCard}>
-              <Text style={styles.resultCardTitle}>PCGS Value</Text>
-              {[["Grade", pcgsData.grade], ["Price", pcgsData.price ? `$${pcgsData.price}` : null],
-                ["Designation", pcgsData.designation]].map(([label, val]) =>
-                val ? (
-                  <View key={label} style={styles.resultRow}>
-                    <Text style={styles.resultLabel}>{label}</Text>
-                    <Text style={styles.resultValue}>{val}</Text>
-                  </View>
-                ) : null
-              )}
-            </View>
-          )}
-
-          <View style={styles.resultCard}>
-            <Text style={styles.resultCardTitle}>Summary</Text>
-            <Text style={styles.resultSummary}>{summary}</Text>
+              )
+            ) : (
+              <Text style={styles.resultSummary}>Value not available for this coin and grade yet.</Text>
+            )}
           </View>
 
-          {EBAY_LISTING_ENABLED && (
-            <View style={styles.resultCard}>
-              <Text style={styles.resultCardTitle}>eBay Listing Draft</Text>
-              {ebayListing ? (
-                <>
-                  <Text style={styles.resultSummary}><Text style={styles.resultLabel}>Title: </Text>{ebayListing.title}</Text>
-                  {ebayListing.subtitle ? <Text style={styles.resultSummary}><Text style={styles.resultLabel}>Subtitle: </Text>{ebayListing.subtitle}</Text> : null}
-                  {ebayListing.description ? <Text style={styles.resultSummary}>{ebayListing.description}</Text> : null}
-                  {Array.isArray(ebayListing.item_specifics) && ebayListing.item_specifics.length > 0 ? (
-                    <View style={styles.listingSpecList}>
-                      {ebayListing.item_specifics.map((spec, i) => (
-                        <View key={`${spec.label}-${i}`} style={styles.listingSpecRow}>
-                          <Text style={styles.resultLabel}>{spec.label}</Text>
-                          <Text style={styles.resultValue}>{spec.value}</Text>
+          <TouchableOpacity style={styles.secondaryBtn} onPress={() => setShowDetails(v => !v)}>
+            <Text style={styles.secondaryBtnText}>{showDetails ? "Hide Full Details" : "Show Full Details"}</Text>
+          </TouchableOpacity>
+
+          {showDetails && (
+            <>
+              {Array.isArray(coinData.alternatives) && coinData.alternatives.length > 0 && (
+                <View style={styles.resultCard}>
+                  <Text style={styles.resultCardTitle}>Could Also Be</Text>
+                  {coinData.alternatives.map((alt, i) => (
+                    <View key={i} style={styles.altRow}>
+                      <View style={styles.altInfo}>
+                        <Text style={styles.altCoin}>{alt.coin}</Text>
+                        <View style={styles.altBarTrack}>
+                          <View style={[styles.altBarFill, { width: `${alt.confidence}%` }]} />
                         </View>
-                      ))}
+                      </View>
+                      <Text style={styles.altPct}>{alt.confidence}%</Text>
+                    </View>
+                  ))}
+                </View>
+              )}
+
+              {coinData.mint_errors?.length > 0 && (
+                <View style={[styles.resultCard, styles.errorCard]}>
+                  <Text style={[styles.resultCardTitle, { color: "#FF6B35" }]}>Mint Errors Detected</Text>
+                  {coinData.mint_errors.map((err, i) => (
+                    <View key={i} style={styles.errorRow}>
+                      <Text style={styles.errorBullet}>-</Text>
+                      <Text style={styles.errorText}>{err}</Text>
+                    </View>
+                  ))}
+                </View>
+              )}
+
+              {numistaData && !numistaData.error && (
+                <View style={styles.resultCard}>
+                  <Text style={styles.resultCardTitle}>Numista Specs</Text>
+                  {[["Title", numistaData.title], ["Composition", numistaData.composition?.text],
+                    ["Weight", numistaData.weight ? `${numistaData.weight}g` : null],
+                    ["Diameter", numistaData.size ? `${numistaData.size}mm` : null]].map(([label, val]) =>
+                    val ? (
+                      <View key={label} style={styles.resultRow}>
+                        <Text style={styles.resultLabel}>{label}</Text>
+                        <Text style={styles.resultValue}>{val}</Text>
+                      </View>
+                    ) : null
+                  )}
+                </View>
+              )}
+
+              {valueEstimate && (valueEstimate.source || valueEstimate.condition_assumed || valueEstimate.error_value_note || valueEstimate.reasoning) && (
+                <View style={styles.resultCard}>
+                  <Text style={styles.resultCardTitle}>Value Details</Text>
+                  {valueEstimate.source ? (
+                    <View style={styles.resultRow}>
+                      <Text style={styles.resultLabel}>Source</Text>
+                      <Text style={styles.resultValue}>{valueEstimate.source}</Text>
                     </View>
                   ) : null}
-                  {ebayListing.shipping_notes ? <Text style={styles.resultSummary}>Shipping notes: {ebayListing.shipping_notes}</Text> : null}
-                </>
-              ) : (
-                <Text style={styles.resultSummary}>Create a polished eBay title, description, item specifics, and shipping notes for this coin.</Text>
+                  {valueEstimate.condition_assumed ? (
+                    <View style={styles.resultRow}>
+                      <Text style={styles.resultLabel}>Condition assumed</Text>
+                      <Text style={styles.resultValue}>{valueEstimate.condition_assumed}</Text>
+                    </View>
+                  ) : null}
+                  {valueEstimate.error_value_note ? (
+                    <Text style={[styles.resultSummary, { color: "#FF6B35", fontWeight: "700" }]}>{valueEstimate.error_value_note}</Text>
+                  ) : null}
+                  {valueEstimate.reasoning ? (
+                    <Text style={styles.resultSummary}>{valueEstimate.reasoning}</Text>
+                  ) : null}
+                </View>
               )}
-              {listingError ? <Text style={styles.authError}>{listingError}</Text> : null}
-              <TouchableOpacity style={[styles.secondaryBtn, listingLoading && styles.secondaryBtnDisabled]} onPress={handleCreateEbayListing} disabled={listingLoading}>
-                {listingLoading ? <ActivityIndicator color="#000" /> : <Text style={styles.secondaryBtnText}>{ebayListing ? "Refresh eBay Listing" : "Create Ideal eBay Listing"}</Text>}
-              </TouchableOpacity>
-            </View>
+
+              {pcgsData && !pcgsData.error && (
+                <View style={styles.resultCard}>
+                  <Text style={styles.resultCardTitle}>PCGS Value</Text>
+                  {[["Grade", pcgsData.grade], ["Price", pcgsData.price ? `$${pcgsData.price}` : null],
+                    ["Designation", pcgsData.designation]].map(([label, val]) =>
+                    val ? (
+                      <View key={label} style={styles.resultRow}>
+                        <Text style={styles.resultLabel}>{label}</Text>
+                        <Text style={styles.resultValue}>{val}</Text>
+                      </View>
+                    ) : null
+                  )}
+                </View>
+              )}
+
+              {coinData.special_notes ? (
+                <View style={styles.resultCard}>
+                  <Text style={styles.resultCardTitle}>Notes</Text>
+                  <Text style={styles.resultSummary}>{coinData.special_notes}</Text>
+                </View>
+              ) : null}
+
+              <View style={styles.resultCard}>
+                <Text style={styles.resultCardTitle}>Summary</Text>
+                <Text style={styles.resultSummary}>{summary}</Text>
+              </View>
+
+              {EBAY_LISTING_ENABLED && (
+                <View style={styles.resultCard}>
+                  <Text style={styles.resultCardTitle}>eBay Listing Draft</Text>
+                  {ebayListing ? (
+                    <>
+                      <Text style={styles.resultSummary}><Text style={styles.resultLabel}>Title: </Text>{ebayListing.title}</Text>
+                      {ebayListing.subtitle ? <Text style={styles.resultSummary}><Text style={styles.resultLabel}>Subtitle: </Text>{ebayListing.subtitle}</Text> : null}
+                      {ebayListing.description ? <Text style={styles.resultSummary}>{ebayListing.description}</Text> : null}
+                      {Array.isArray(ebayListing.item_specifics) && ebayListing.item_specifics.length > 0 ? (
+                        <View style={styles.listingSpecList}>
+                          {ebayListing.item_specifics.map((spec, i) => (
+                            <View key={`${spec.label}-${i}`} style={styles.listingSpecRow}>
+                              <Text style={styles.resultLabel}>{spec.label}</Text>
+                              <Text style={styles.resultValue}>{spec.value}</Text>
+                            </View>
+                          ))}
+                        </View>
+                      ) : null}
+                      {ebayListing.shipping_notes ? <Text style={styles.resultSummary}>Shipping notes: {ebayListing.shipping_notes}</Text> : null}
+                    </>
+                  ) : (
+                    <Text style={styles.resultSummary}>Create a polished eBay title, description, item specifics, and shipping notes for this coin.</Text>
+                  )}
+                  {listingError ? <Text style={styles.authError}>{listingError}</Text> : null}
+                  <TouchableOpacity style={[styles.secondaryBtn, listingLoading && styles.secondaryBtnDisabled]} onPress={handleCreateEbayListing} disabled={listingLoading}>
+                    {listingLoading ? <ActivityIndicator color="#000" /> : <Text style={styles.secondaryBtnText}>{ebayListing ? "Refresh eBay Listing" : "Create Ideal eBay Listing"}</Text>}
+                  </TouchableOpacity>
+                </View>
+              )}
+            </>
           )}
 
           <TouchableOpacity style={styles.primaryBtn} onPress={startNewScan}>
@@ -602,7 +614,7 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
       <View style={styles.scannerOuter}>
         <View style={styles.scannerBoxWrapper}>
           <View style={styles.scannerBox}>
-            <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" zoom={0.3} onCameraReady={() => setCameraReady(true)} />
+            <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" onCameraReady={() => setCameraReady(true)} />
             <View style={[styles.corner, styles.cornerTL]} />
             <View style={[styles.corner, styles.cornerTR]} />
             <View style={[styles.corner, styles.cornerBL]} />
