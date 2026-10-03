@@ -1054,11 +1054,69 @@ class CoinLensApiTests(unittest.TestCase):
         self.assertFalse(body["identification"]["identifiable"])
         self.assertNotEqual(body.get("error", {}).get("code"), "ai_incomplete")
 
+    def _sent_identify_payload(self, model, reasoning_effort="low"):
+        """Posts one identify request with OPENAI_MODEL/OPENAI_REASONING_EFFORT
+        pinned and returns the JSON payload sent to OpenAI."""
+        self._authenticate()
+        coinlens_app.OPENAI_API_KEY = "test-key"
+        self.mock_persisted_scan()
+        with mock.patch.object(coinlens_app, "OPENAI_MODEL", model), \
+             mock.patch.object(coinlens_app, "OPENAI_REASONING_EFFORT", reasoning_effort), \
+             mock.patch.object(coinlens_app.requests, "post") as mock_post, \
+             mock.patch.object(coinlens_app, "count_api_usage_since", return_value=0), \
+             mock.patch.object(coinlens_app, "insert_api_usage", return_value={"id": "usage-1"}), \
+             mock.patch.object(coinlens_app, "update_api_usage"):
+            mock_post.return_value = mock.Mock(
+                ok=True, status_code=200,
+                json=lambda: {"status": "completed", "output_text": json.dumps(self._canada_dollar())},
+            )
+            self.client.post(
+                "/api/identify-coin",
+                json={"front_image": JPEG_BASE64, "source": "camera"},
+                headers=self.auth_headers,
+            )
+        return mock_post.call_args.kwargs["json"]
+
+    def test_identify_coin_omits_reasoning_for_gpt_4o_mini(self):
+        payload = self._sent_identify_payload("gpt-4o-mini")
+        self.assertEqual(payload["model"], "gpt-4o-mini")
+        self.assertNotIn("reasoning", payload)
+
+    def test_identify_coin_omits_reasoning_for_other_non_reasoning_models(self):
+        for model in ("gpt-4.1", "GPT-4o", "gpt-3.5-turbo"):
+            with self.subTest(model):
+                self.assertNotIn("reasoning", self._sent_identify_payload(model))
+
+    def test_identify_coin_sends_low_reasoning_effort_for_a_reasoning_model(self):
+        payload = self._sent_identify_payload("gpt-5-mini")
+        self.assertEqual(payload["reasoning"], {"effort": "low"})
+
+    def test_identify_coin_omits_reasoning_when_effort_is_none_or_empty(self):
+        for effort in ("none", "NONE", "", "  "):
+            with self.subTest(effort=effort):
+                self.assertNotIn("reasoning", self._sent_identify_payload("gpt-5-mini", effort))
+
+    def test_health_reports_effective_reasoning_effort(self):
+        cases = [("gpt-5-mini", "low", "low"), ("gpt-5-mini", "Medium", "medium"),
+                 ("gpt-4o-mini", "low", None), ("gpt-5-mini", "none", None), ("gpt-5-mini", "", None)]
+        for model, effort, expected in cases:
+            with self.subTest(model=model, effort=effort):
+                with mock.patch.object(coinlens_app, "OPENAI_MODEL", model), \
+                     mock.patch.object(coinlens_app, "OPENAI_REASONING_EFFORT", effort):
+                    body = self.client.get("/api/health").get_json()
+                self.assertEqual(body["openai_model"], model)
+                self.assertEqual(body["openai_reasoning_effort"], expected)
+
     def test_identify_coin_sends_low_reasoning_effort(self):
         """The model's default reasoning effort consumed the entire
         max_output_tokens budget on a real scan - explicitly request low
-        effort rather than relying on whatever the default is."""
+        effort rather than relying on whatever the default is. Pinned to a
+        reasoning model: non-reasoning models never get the parameter."""
         self._authenticate()
+        for name, value in (("OPENAI_MODEL", "gpt-5-mini"), ("OPENAI_REASONING_EFFORT", "low")):
+            patcher = mock.patch.object(coinlens_app, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         coinlens_app.OPENAI_API_KEY = "test-key"
         self.mock_persisted_scan()
 

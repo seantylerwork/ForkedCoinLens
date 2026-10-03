@@ -55,6 +55,13 @@ USE_MOCK_COIN_RESPONSE = os.environ.get("USE_MOCK_COIN_RESPONSE", "false").lower
 # capability reasons) without a code change.
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-4o-mini")
 
+# Reasoning effort sent with the identification request. Only reasoning
+# models accept the "reasoning" parameter - non-reasoning models (gpt-4*,
+# gpt-3.5*) reject it with HTTP 400, so it is omitted for them. Empty or
+# "none" turns it off for every model.
+OPENAI_REASONING_EFFORT = os.environ.get("OPENAI_REASONING_EFFORT", "low")
+NON_REASONING_MODEL_PREFIXES = ("gpt-4", "gpt-3.5")
+
 # M6 cost protection: independent of any OpenAI-side spending limit.
 DAILY_SCAN_LIMIT = int(os.environ.get("DAILY_SCAN_LIMIT", "20"))
 MAX_IMAGE_BYTES = int(os.environ.get("MAX_IMAGE_BYTES", str(8 * 1024 * 1024)))
@@ -169,6 +176,17 @@ def handle_unexpected_error(_error):
     return error_response(CoinLensError("server_error", "Unexpected server failure.", 500))
 
 
+def effective_reasoning_effort(model=None):
+    """The reasoning effort to send for ``model`` (default OPENAI_MODEL), or
+    None when the "reasoning" key must be left out of the request."""
+    effort = (OPENAI_REASONING_EFFORT or "").strip().lower()
+    if effort in ("", "none"):
+        return None
+    if (model or OPENAI_MODEL).strip().lower().startswith(NON_REASONING_MODEL_PREFIXES):
+        return None
+    return effort
+
+
 def mock_reasons():
     """Every setting currently forcing mock coin responses (empty list =
     real identification)."""
@@ -203,6 +221,7 @@ def health():
         "has_service_role_key": bool(supabase_admin.SUPABASE_SERVICE_ROLE_KEY),
         "supabase_host": urlparse(supabase_admin.SUPABASE_URL).hostname if supabase_admin.SUPABASE_URL else None,
         "openai_model": OPENAI_MODEL,
+        "openai_reasoning_effort": effective_reasoning_effort(),
         "daily_scan_limit": DAILY_SCAN_LIMIT,
         "git_commit": git_commit[:7] if git_commit else None,
         "git_branch": _env_or_none("RENDER_GIT_BRANCH"),
@@ -958,14 +977,16 @@ def identify_coin_with_ai(front_image, back_image=None):
         # for that while still comfortably inside a low-tier TPM limit
         # alongside the (now-resized, ~4-5K token) input images.
         "max_output_tokens": 2000,
-        # A real scan still hit output_tokens=reasoning_tokens=2000 with
-        # status=incomplete/max_output_tokens - the model's default
-        # reasoning effort consumed the entire budget with nothing left
-        # for the visible JSON. Explicitly request low effort rather than
-        # relying on whatever the default happens to be; max_output_tokens
-        # is left at 2000 for now to isolate whether this alone fixes it.
-        "reasoning": {"effort": "low"},
     }
+    # A real scan still hit output_tokens=reasoning_tokens=2000 with
+    # status=incomplete/max_output_tokens - the model's default reasoning
+    # effort consumed the entire budget with nothing left for the visible
+    # JSON. Explicitly request low effort (OPENAI_REASONING_EFFORT) rather
+    # than relying on whatever the default happens to be - but only for
+    # models that accept the parameter (see effective_reasoning_effort).
+    reasoning_effort = effective_reasoning_effort(OPENAI_MODEL)
+    if reasoning_effort:
+        payload["reasoning"] = {"effort": reasoning_effort}
 
     try:
         upstream = requests.post(
