@@ -7,6 +7,7 @@ import json
 import logging
 import time
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 import requests
 from dotenv import load_dotenv
@@ -14,6 +15,7 @@ from flask import Flask, Response, g, jsonify, request
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 
+import supabase_admin
 from auth import require_auth
 from require_user import require_user
 from badges import evaluate_badges
@@ -45,7 +47,9 @@ PCGS_BEARER_TOKEN = os.environ.get("PCGS_BEARER_TOKEN", "")
 SHEETDB_URL = os.environ.get("SHEETDB_URL", "")
 ADMIN_CODE = os.environ.get("ADMIN_CODE", "")
 MOCK_MODE = os.environ.get("MOCK_MODE", "false").lower() == "true"
-USE_MOCK_COIN_RESPONSE = os.environ.get("USE_MOCK_COIN_RESPONSE", "false").lower() == "true" or MOCK_MODE
+# Kept as its own raw flag (mock_coin_enabled() already ORs it with
+# MOCK_MODE) so /api/health can report exactly which setting turned mock on.
+USE_MOCK_COIN_RESPONSE = os.environ.get("USE_MOCK_COIN_RESPONSE", "false").lower() == "true"
 
 # Configurable so the identification model can be changed (e.g. for cost or
 # capability reasons) without a code change.
@@ -87,8 +91,16 @@ CORS(app)
 app.config["MAX_CONTENT_LENGTH"] = int(os.environ.get("MAX_CONTENT_LENGTH_BYTES", str(24 * 1024 * 1024)))
 
 logging.basicConfig(level=os.environ.get("LOG_LEVEL", "INFO"))
-app.logger.handlers = logging.getLogger("gunicorn.error").handlers or app.logger.handlers
-app.logger.setLevel(logging.getLogger("gunicorn.error").level or logging.INFO)
+_gunicorn_error_logger = logging.getLogger("gunicorn.error")
+if _gunicorn_error_logger.handlers:
+    # Under gunicorn, app.logger writes through gunicorn's own handlers. It
+    # must not also propagate to the root handler basicConfig added above, or
+    # every app log line appears twice (once as "INFO:app:..."). Outside
+    # gunicorn (local runs, tests) there are no gunicorn handlers, so app logs
+    # keep reaching the root handler as before.
+    app.logger.handlers = _gunicorn_error_logger.handlers
+    app.logger.propagate = False
+app.logger.setLevel(_gunicorn_error_logger.level or logging.INFO)
 
 
 class CoinLensError(Exception):
@@ -157,16 +169,43 @@ def handle_unexpected_error(_error):
     return error_response(CoinLensError("server_error", "Unexpected server failure.", 500))
 
 
+def mock_reasons():
+    """Every setting currently forcing mock coin responses (empty list =
+    real identification)."""
+    reasons = []
+    if MOCK_MODE:
+        reasons.append("MOCK_MODE")
+    if USE_MOCK_COIN_RESPONSE:
+        reasons.append("USE_MOCK_COIN_RESPONSE")
+    if not OPENAI_API_KEY:
+        reasons.append("no OPENAI_API_KEY")
+    return reasons
+
+
+def _env_or_none(name):
+    return os.environ.get(name, "").strip() or None
+
+
 @app.route("/api/health", methods=["GET"])
 def health():
+    # Unauthenticated: only names, booleans, hostnames and limits - never a
+    # key, token or other secret value.
+    git_commit = _env_or_none("RENDER_GIT_COMMIT")
     body = {
         "ok": True,
         "status": "ok",
         "mock_mode": should_use_mock_coin_response(),
+        "mock_reason": mock_reasons(),
         "has_openai_key": bool(OPENAI_API_KEY),
         "has_numista_key": bool(NUMISTA_API_KEY),
         "has_pcgs_token": bool(PCGS_BEARER_TOKEN),
         "has_sheetdb": bool(SHEETDB_URL),
+        "has_service_role_key": bool(supabase_admin.SUPABASE_SERVICE_ROLE_KEY),
+        "supabase_host": urlparse(supabase_admin.SUPABASE_URL).hostname if supabase_admin.SUPABASE_URL else None,
+        "openai_model": OPENAI_MODEL,
+        "daily_scan_limit": DAILY_SCAN_LIMIT,
+        "git_commit": git_commit[:7] if git_commit else None,
+        "git_branch": _env_or_none("RENDER_GIT_BRANCH"),
     }
     if should_use_mock_coin_response():
         log_mock_response("/api/health")
@@ -753,10 +792,19 @@ def normalize_identification(data):
     identifiable = status == "identified" and confidence >= MIN_IDENTIFICATION_CONFIDENCE
     unidentifiable_reason = data.get("unidentifiable_reason") or "The coin could not be identified confidently."
 
+    # Diagnostics only (the identify-coin outcome log line): which step
+    # rejected the scan, and the model's own reason before any override.
+    rejection = None
+    if status != "identified":
+        rejection = {"stage": "model_uncertain", "reasons": []}
+    elif confidence < MIN_IDENTIFICATION_CONFIDENCE:
+        rejection = {"stage": "low_confidence", "reasons": []}
+
     if identifiable:
         evidence_failures = identification_evidence_failures(data)
         if evidence_failures:
             identifiable = False
+            rejection = {"stage": "gate", "reasons": evidence_failures}
             app.logger.info(
                 "[identify] evidence gate rejected model status=%s confidence=%s country=%r denomination=%r "
                 "year=%r: %s",
@@ -788,6 +836,7 @@ def normalize_identification(data):
             "confidence": confidence,
             "alternatives": _optional_list(data.get("alternatives")),
             "observations": observations,
+            "rejection": {**rejection, "model_reason": data.get("unidentifiable_reason")},
         }
 
     country = str(data.get("country") or "Unknown").strip() or "Unknown"
@@ -813,6 +862,7 @@ def normalize_identification(data):
         "confidence": confidence,
         "alternatives": _optional_list(data.get("alternatives")),
         "observations": observations,
+        "rejection": None,
     }
 
 
@@ -2400,6 +2450,29 @@ def check_and_reserve_quota(user_id):
     return usage_row.get("id"), remaining
 
 
+OUTCOME_MODEL_REASON_CHARS = 200
+
+
+def log_identify_outcome(identification, source, image_count):
+    """Exactly one summary line per identification attempt, so rejection
+    causes can be counted from Render logs with a single search."""
+    rejected = identification.get("identifiable") is False
+    rejection = identification.get("rejection") if rejected else None
+    if rejected and not isinstance(rejection, dict):
+        # Defensive: a result that didn't come from normalize_identification.
+        rejection = {"stage": "model_uncertain", "reasons": [], "model_reason": identification.get("unidentifiable_reason")}
+
+    line = (
+        f"[identify] outcome={'rejected' if rejected else 'identified'} source={source} images={image_count} "
+        f"stage={rejection['stage'] if rejected else 'none'} confidence={identification.get('confidence')} "
+        f"reasons={'; '.join(rejection.get('reasons') or []) if rejected else ''}"
+    )
+    if rejected:
+        model_reason = str(rejection.get("model_reason") or "")[:OUTCOME_MODEL_REASON_CHARS]
+        line += f" model_reason={model_reason!r}"
+    app.logger.info(line)
+
+
 @app.route("/api/identify-coin", methods=["POST"])
 @require_auth
 def identify_coin():
@@ -2423,6 +2496,7 @@ def identify_coin():
         raise
 
     identification = result.get("identification", {})
+    log_identify_outcome(identification, source, image_count=2 if back_image else 1)
     if identification.get("identifiable") is False:
         update_api_usage(usage_id, {"status": "uncertain"})
         body = dict(result)
