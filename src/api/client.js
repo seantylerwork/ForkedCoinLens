@@ -120,20 +120,6 @@ export async function logScanToSheet(coinData, userName = "") {
   }).catch(() => {});
 }
 
-export async function verifyAdminCode(code) {
-  try {
-    const res = await apiFetch(`/api/verify-admin-code`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ code }),
-    });
-    const data = await res.json();
-    return !!data.valid;
-  } catch {
-    return false;
-  }
-}
-
 export async function generateEbayListing(coinLensResultOrCoinData, numistaData, valueEstimate, summary) {
   const payload = coinLensResultOrCoinData?.identification
     ? coinLensResultOrCoinData

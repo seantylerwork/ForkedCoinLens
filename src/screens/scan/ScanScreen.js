@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
   Animated,
+  Easing,
   Image,
   SafeAreaView,
   ScrollView,
@@ -12,6 +13,7 @@ import {
 } from "react-native";
 import { CameraView, useCameraPermissions } from "expo-camera";
 import * as ImagePicker from "expo-image-picker";
+import { LinearGradient } from "expo-linear-gradient";
 import ConfidenceMeter from "../../components/ConfidenceMeter";
 import GoldCoin from "../../components/GoldCoin";
 import Header from "../../components/Header";
@@ -38,14 +40,24 @@ import { prepareImageForIdentification } from "../../api/imagePrep";
 // not a deletion, so the feature - and the UI below - can come back later.
 const EBAY_LISTING_ENABLED = false;
 
-const BLUR_LAYERS = [
-  { offset: -20, opacity: 0.05, height: 3 },
-  { offset: -11, opacity: 0.18, height: 2 },
-  { offset: -5,  opacity: 0.35, height: 2 },
-  { offset: 5,   opacity: 0.35, height: 2 },
-  { offset: 11,  opacity: 0.18, height: 2 },
-  { offset: 20,  opacity: 0.05, height: 3 },
-];
+// The scan-line sweep: a thin bright core line with a soft gradient glow
+// around it, rather than the old stack of flat stepped-opacity rectangles
+// (which rendered as hard-edged bands instead of a smooth blur). The trail
+// length is tied to the line's current speed (via scanAnim.interpolate
+// below) - with the inOut easing on the drive animation, speed is lowest
+// right at the top/bottom turnaround, so the trail naturally shrinks to
+// almost nothing exactly as the line reaches the edge instead of an abrupt
+// cut when it reverses.
+const SCAN_LINE_HEIGHT = 2;
+const SCAN_TRAIL_MIN = 8;
+const SCAN_TRAIL_MAX = 64;
+// Speed shape for Easing.inOut(Easing.quad): ~0 at the ends, peaking at the
+// midpoint. sin(pi*x) at x=0,0.25,0.5,0.75,1 approximates that curve closely
+// enough for a visual trail without needing the exact derivative.
+const SCAN_TRAIL_INPUT_RANGE = [0, 0.25, 0.5, 0.75, 1];
+const SCAN_TRAIL_OUTPUT_RANGE = [0, 0.707, 1, 0.707, 0].map(
+  t => SCAN_TRAIL_MIN + (SCAN_TRAIL_MAX - SCAN_TRAIL_MIN) * t
+);
 
 export default function ScanScreen({ navigate, user, onScanSaved }) {
   const [permission, requestPermission] = useCameraPermissions();
@@ -62,6 +74,9 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
   const [flashActive, setFlashActive] = useState(false);
   const [isCapturing, setIsCapturing] = useState(false);
   const [selectedUpload, setSelectedUpload] = useState(null);
+  // Which way the scan line is currently sweeping, so its trailing glow can
+  // render on the correct side (behind the direction of travel).
+  const [sweepingDown, setSweepingDown] = useState(true);
   const scanAnim = useRef(new Animated.Value(0)).current;
   const flashAnim = useRef(new Animated.Value(0)).current;
   const cameraRef = useRef(null);
@@ -76,14 +91,33 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
   const captureMeta = getCaptureStageMeta(captureStage);
 
   useEffect(() => {
-    const anim = Animated.loop(
-      Animated.sequence([
-        Animated.timing(scanAnim, { toValue: 1, duration: 1800, useNativeDriver: true }),
-        Animated.timing(scanAnim, { toValue: 0, duration: 1800, useNativeDriver: true }),
-      ])
-    );
-    anim.start();
-    return () => anim.stop();
+    let active = true;
+
+    // A manual back-and-forth loop (rather than Animated.loop) so the
+    // direction is known in JS state - needed to render the trailing glow
+    // on the correct side, which a plain Animated.Value can't expose.
+    function sweep(down) {
+      if (!active) return;
+      setSweepingDown(down);
+      Animated.timing(scanAnim, {
+        toValue: down ? 1 : 0,
+        duration: 1800,
+        easing: Easing.inOut(Easing.quad),
+        // The trail length below is derived from this same value as a
+        // `height` interpolation, which the native driver can't run - both
+        // interpolations have to stay on the JS thread to share one value.
+        useNativeDriver: false,
+      }).start(({ finished }) => {
+        if (finished) sweep(!down);
+      });
+    }
+
+    scanAnim.setValue(0);
+    sweep(true);
+    return () => {
+      active = false;
+      scanAnim.stopAnimation();
+    };
   }, []);
 
   function beginScanSession() {
@@ -272,12 +306,12 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
 
           <View style={styles.scanChoiceOptions}>
             <TouchableOpacity style={styles.scanChoiceCard} onPress={uploadPhoto}>
-              <Text style={styles.scanChoiceIcon}>+</Text>
+              <Text style={styles.scanChoiceIcon}>🖼️</Text>
               <View style={styles.cardText}>
                 <Text style={styles.cardLabel}>Upload Photo</Text>
                 <Text style={styles.cardDesc}>Pick an existing coin photo</Text>
               </View>
-              <Text style={styles.cardArrow}>&gt;</Text>
+              <Text style={styles.cardArrow}>›</Text>
             </TouchableOpacity>
 
             {selectedUpload ? (
@@ -298,12 +332,12 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
             ) : null}
 
             <TouchableOpacity style={styles.scanChoiceCard} onPress={() => { beginScanSession(); setCaptureStage("front"); setPhase("scanning"); }}>
-              <Text style={styles.scanChoiceIcon}>[]</Text>
+              <Text style={styles.scanChoiceIcon}>📷</Text>
               <View style={styles.cardText}>
                 <Text style={styles.cardLabel}>Take Photo</Text>
                 <Text style={styles.cardDesc}>Use your camera for a new scan</Text>
               </View>
-              <Text style={styles.cardArrow}>&gt;</Text>
+              <Text style={styles.cardArrow}>›</Text>
             </TouchableOpacity>
           </View>
         </ScrollView>
@@ -608,6 +642,11 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
   }
 
   // Scanning view
+  const trailHeight = scanAnim.interpolate({
+    inputRange: SCAN_TRAIL_INPUT_RANGE,
+    outputRange: SCAN_TRAIL_OUTPUT_RANGE,
+  });
+
   return (
     <SafeAreaView style={styles.safeArea}>
       <Header title="Scan Coin" onBack={() => navigate("home")} />
@@ -619,21 +658,34 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
             <View style={[styles.corner, styles.cornerTR]} />
             <View style={[styles.corner, styles.cornerBL]} />
             <View style={[styles.corner, styles.cornerBR]} />
-            {BLUR_LAYERS.map(({ offset, opacity, height }, i) => (
-              <Animated.View key={i} style={{
-                position: "absolute", left: 0, right: 0, height,
-                backgroundColor: GOLD, opacity,
+            <View style={styles.scanCrosshair} pointerEvents="none">
+              <View style={styles.scanCrosshairH} />
+              <View style={styles.scanCrosshairV} />
+            </View>
+            <Animated.View
+              pointerEvents="none"
+              style={{
+                position: "absolute", left: 0, right: 0, top: 0, height: SCAN_LINE_HEIGHT,
                 transform: [{ translateY: scanAnim.interpolate({
-                  inputRange: [0, 1], outputRange: [offset, BOX_SIZE - 3 + offset],
+                  inputRange: [0, 1], outputRange: [0, BOX_SIZE - SCAN_LINE_HEIGHT],
                 })}],
-              }} />
-            ))}
-            <Animated.View style={[styles.scanLineSolid, {
-              position: "absolute", left: 0, right: 0,
-              transform: [{ translateY: scanAnim.interpolate({
-                inputRange: [0, 1], outputRange: [0, BOX_SIZE - 3],
-              })}],
-            }]} />
+              }}
+            >
+              {sweepingDown ? (
+                // Moving down: the glow trails behind, above the line. Its
+                // bottom edge must stay pinned to the line as height
+                // changes, so top tracks -height rather than a fixed value.
+                <Animated.View style={{ position: "absolute", left: 0, right: 0, top: Animated.multiply(trailHeight, -1), height: trailHeight }}>
+                  <LinearGradient colors={["transparent", "rgba(255,215,0,0.5)"]} style={StyleSheet.absoluteFill} />
+                </Animated.View>
+              ) : (
+                // Moving up: the glow trails behind, below the line.
+                <Animated.View style={{ position: "absolute", left: 0, right: 0, top: SCAN_LINE_HEIGHT, height: trailHeight }}>
+                  <LinearGradient colors={["rgba(255,215,0,0.5)", "transparent"]} style={StyleSheet.absoluteFill} />
+                </Animated.View>
+              )}
+              <View style={styles.scanLineSolid} />
+            </Animated.View>
           </View>
         </View>
         <Text style={styles.scanHint}>{captureMeta.title}</Text>

@@ -43,7 +43,6 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 NUMISTA_API_KEY = os.environ.get("NUMISTA_API_KEY", "")
 PCGS_BEARER_TOKEN = os.environ.get("PCGS_BEARER_TOKEN", "")
 SHEETDB_URL = os.environ.get("SHEETDB_URL", "")
-ADMIN_CODE = os.environ.get("ADMIN_CODE", "")
 MOCK_MODE = os.environ.get("MOCK_MODE", "false").lower() == "true"
 USE_MOCK_COIN_RESPONSE = os.environ.get("USE_MOCK_COIN_RESPONSE", "false").lower() == "true" or MOCK_MODE
 
@@ -2563,14 +2562,6 @@ def test_scan():
 
     app.logger.info("test_scan created scan id=%s for user_id=%s", row.get("id"), g.user_id)
     return jsonify(row), 201
-
-
-@app.route("/api/verify-admin-code", methods=["POST"])
-def verify_admin_code():
-    payload = request.get_json(force=True, silent=True) or {}
-    submitted = str(payload.get("code", "")).strip()
-    valid = bool(ADMIN_CODE) and submitted == ADMIN_CODE
-    return jsonify({"valid": valid})
 
 
 if __name__ == "__main__":

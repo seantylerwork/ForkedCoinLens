@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 import { ActivityIndicator, View } from "react-native";
 import { GOLD } from "./theme/colors";
-import { isAdminUser, mapSupabaseUser, friendlyAuthError } from "../authLogic";
+import { isAdminUser, mapSupabaseUser, mergeProfileRole, friendlyAuthError } from "../authLogic";
 import { supabase } from "./api/supabase";
 import { fetchMyScans } from "./api/scans";
+import { fetchMyProfile } from "./api/profile";
 import styles from "./theme/styles";
 import AuthScreen from "./screens/auth/AuthScreen";
 import HomeScreen from "./screens/home/HomeScreen";
@@ -34,34 +35,58 @@ export default function App() {
     }
   }, []);
 
+  // The role on a freshly-mapped user is always 'member' (see
+  // mapSupabaseUser); this fills in the real value from the user's own
+  // profiles row, which only the Supabase dashboard or the server's
+  // service-role key can set to 'admin'. A failure here (RLS hiccup, no
+  // network) leaves the safe 'member' default in place rather than granting
+  // admin.
+  const refreshUserRole = useCallback(async (userId) => {
+    try {
+      const profile = await fetchMyProfile();
+      setUser(current => (current && current.id === userId ? mergeProfileRole(current, profile?.role) : current));
+    } catch {
+      // Leave the default role as-is.
+    }
+  }, []);
+
   useEffect(() => {
     let mounted = true;
 
     supabase.auth.getSession().then(({ data }) => {
       if (!mounted) return;
-      setUser(mapSupabaseUser(data.session?.user));
+      const mapped = mapSupabaseUser(data.session?.user);
+      setUser(mapped);
       setAuthReady(true);
-      if (data.session?.user) refreshScans();
+      if (data.session?.user) {
+        refreshScans();
+        refreshUserRole(mapped.id);
+      }
     });
 
     const { data: subscription } = supabase.auth.onAuthStateChange((_event, session) => {
       if (!mounted) return;
-      setUser(mapSupabaseUser(session?.user));
-      if (session?.user) refreshScans();
-      else setUserScans([]);
+      const mapped = mapSupabaseUser(session?.user);
+      setUser(mapped);
+      if (session?.user) {
+        refreshScans();
+        refreshUserRole(mapped.id);
+      } else {
+        setUserScans([]);
+      }
     });
 
     return () => {
       mounted = false;
       subscription.subscription.unsubscribe();
     };
-  }, [refreshScans]);
+  }, [refreshScans, refreshUserRole]);
 
-  async function signUp(name, email, password, role = "member") {
+  async function signUp(name, email, password) {
     const { data, error } = await supabase.auth.signUp({
       email,
       password,
-      options: { data: { display_name: name, name, role } },
+      options: { data: { display_name: name, name } },
     });
     if (error) throw new Error(friendlyAuthError(error));
     if (!data.session) {
@@ -107,12 +132,12 @@ export default function App() {
 
   if (!user) return <AuthScreen onSignIn={signIn} onSignUp={signUp} onGuest={continueAsGuest} />;
 
-  if (screen === "home") return <HomeScreen navigate={navigate} />;
+  if (screen === "home") return <HomeScreen navigate={navigate} userScans={userScans} />;
   if (screen === "scan") return <ScanScreen navigate={navigate} user={user} onScanSaved={refreshScans} />;
   if (screen === "badges") return <BadgesScreen navigate={navigate} />;
   if (screen === "leaderboard") return <LeaderboardScreen navigate={navigate} user={user} />;
   if (screen === "account") return <AccountScreen navigate={navigate} user={user} userScans={userScans} onSignOut={signOut} />;
   if (screen === "admin" && isAdminUser(user)) return <AdminScreen navigate={navigate} />;
   if (screen === "stats") return <StatsScreen key={user.id} navigate={navigate} userScans={userScans} />;
-  return <HomeScreen navigate={navigate} />;
+  return <HomeScreen navigate={navigate} userScans={userScans} />;
 }

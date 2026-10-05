@@ -20,7 +20,9 @@ export default function BadgesScreen({ navigate }) {
           setEarned(new Set(earned_badge_ids || []));
           setLoadError("");
         }
-      } catch {
+      } catch (error) {
+        // TEMP DIAGNOSTIC - remove once badges loading is confirmed working.
+        console.log("[BadgesScreen] fetchMyBadges failed:", error?.code, error?.message || error);
         if (mounted) setLoadError("Couldn't load your badges. Pull to refresh.");
       } finally {
         if (mounted) setLoading(false);

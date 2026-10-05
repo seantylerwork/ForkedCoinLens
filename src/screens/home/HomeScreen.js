@@ -3,12 +3,17 @@ import GoldCoin from "../../components/GoldCoin";
 import Header from "../../components/Header";
 import styles from "../../theme/styles";
 
-export default function HomeScreen({ navigate }) {
+const RECENT_SCANS_LIMIT = 3;
+
+export default function HomeScreen({ navigate, userScans }) {
   const cards = [
     { label: "Scan Coin", icon: "🔍", screen: "scan", desc: "Guess your coin with AI" },
     { label: "Badges", icon: "🏅", screen: "badges", desc: "View your achievements" },
     { label: "Leaderboard", icon: "🏆", screen: "leaderboard", desc: "See top collectors" },
   ];
+
+  // userScans is oldest-first (for badge streak logic); show newest-first here.
+  const recentScans = [...(userScans || [])].reverse().slice(0, RECENT_SCANS_LIMIT);
 
   return (
     <SafeAreaView style={styles.safeArea}>
@@ -27,16 +32,16 @@ export default function HomeScreen({ navigate }) {
         ))}
 
         <Text style={styles.sectionTitle}>Recently Scanned Coins</Text>
-        {[
-          { name: "1965 Quarter", detail: "George Washington · Silver-clad" },
-          { name: "1982 Penny", detail: "Abraham Lincoln · Zinc/Copper" },
-          { name: "2000 Sacagawea Dollar", detail: "Sacagawea · Gold-colored" },
-        ].map((coin, i) => (
-          <View key={i} style={styles.recentItem}>
+        {recentScans.length === 0 ? (
+          <Text style={styles.searchEmpty}>No coins scanned yet - tap Scan Coin to get started.</Text>
+        ) : recentScans.map((scan) => (
+          <View key={scan.id} style={styles.recentItem}>
             <GoldCoin size={40} />
             <View style={styles.recentText}>
-              <Text style={styles.recentName}>{coin.name}</Text>
-              <Text style={styles.recentDetail}>{coin.detail}</Text>
+              <Text style={styles.recentName}>{scan.coin_name}</Text>
+              <Text style={styles.recentDetail}>
+                {[scan.country, scan.denomination].filter(Boolean).join(" · ") || "Details unavailable"}
+              </Text>
             </View>
           </View>
         ))}

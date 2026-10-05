@@ -171,14 +171,38 @@ const styles = StyleSheet.create({
   cornerTR: { top: 0, right: 0, borderTopWidth: 3, borderRightWidth: 3 },
   cornerBL: { bottom: 0, left: 0, borderBottomWidth: 3, borderLeftWidth: 3 },
   cornerBR: { bottom: 0, right: 0, borderBottomWidth: 3, borderRightWidth: 3 },
+  // A small static crosshair at the box's center, helping the user center
+  // the coin - independent of the corners (frame alignment) and the scan
+  // line (purely decorative motion).
+  scanCrosshair: {
+    position: "absolute",
+    top: BOX_SIZE / 2 - 9,
+    left: BOX_SIZE / 2 - 9,
+    width: 18,
+    height: 18,
+  },
+  scanCrosshairH: {
+    position: "absolute",
+    top: 8, left: 0,
+    width: 18, height: 2,
+    borderRadius: 1,
+    backgroundColor: "rgba(255,215,0,0.6)",
+  },
+  scanCrosshairV: {
+    position: "absolute",
+    top: 0, left: 8,
+    width: 2, height: 18,
+    borderRadius: 1,
+    backgroundColor: "rgba(255,215,0,0.6)",
+  },
+  // The soft glow around this line now comes from a LinearGradient layered
+  // behind it (see ScanScreen) - a native shadow on a 2px bar rendered as a
+  // hard, lopsided smudge (especially Android's elevation shadow), not a
+  // smooth glow.
   scanLineSolid: {
-    height: 3,
+    width: "100%",
+    height: 2,
     backgroundColor: GOLD,
-    shadowColor: GOLD,
-    shadowOffset: { width: 0, height: 0 },
-    shadowOpacity: 1,
-    shadowRadius: 10,
-    elevation: 8,
   },
   scanHint: { fontSize: 15, color: "rgba(255,215,0,0.8)", fontWeight: "600", textAlign: "center" },
   scanSubHint: { fontSize: 13, color: "rgba(255,255,255,0.7)", textAlign: "center", lineHeight: 20, maxWidth: 300, marginTop: -8 },
@@ -468,10 +492,6 @@ const styles = StyleSheet.create({
     paddingVertical: 14, alignItems: "center",
   },
   adminPanelBtnText: { fontSize: 16, fontWeight: "700", color: "#FFA500" },
-
-  // Auth extras
-  inputAdmin: { borderColor: "rgba(255,165,0,0.5)" },
-  adminCodeToggle: { fontSize: 13, color: "rgba(255,215,0,0.4)", textAlign: "center", textDecorationLine: "underline" },
 
   // Admin screen
   adminBadge: { alignSelf: "center", backgroundColor: "rgba(255,165,0,0.12)", borderRadius: 20, borderWidth: 1, borderColor: "rgba(255,165,0,0.5)", paddingHorizontal: 18, paddingVertical: 6 },

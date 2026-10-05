@@ -67,7 +67,7 @@ export default function StatsScreen({ navigate }) {
                 <View style={{ flex: 1 }}>
                   <Text style={styles.statCoinName}>{coin}</Text>
                   <Text style={styles.statCoinSub}>
-                    {count} scanned ? {valuedCount
+                    {count} scanned · {valuedCount
                       ? formatScanValue(totalValue / valuedCount) + " avg (" + valuedCount + " valued)"
                       : "Value unavailable"}
                   </Text>
@@ -92,7 +92,7 @@ export default function StatsScreen({ navigate }) {
               />
               {query.length > 0 && (
                 <TouchableOpacity onPress={() => setQuery("")} accessibilityRole="button" accessibilityLabel="Clear search">
-                  <Text style={styles.searchClear}>?</Text>
+                  <Text style={styles.searchClear}>×</Text>
                 </TouchableOpacity>
               )}
             </View>
@@ -108,7 +108,7 @@ export default function StatsScreen({ navigate }) {
                     {scan.time && !Number.isNaN(Date.parse(scan.time))
                       ? new Date(scan.time).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" })
                       : "Date unavailable"}
-                    {" ? " + formatScanValue(scan.value)}
+                    {" · " + formatScanValue(scan.value)}
                   </Text>
                 </View>
               </View>

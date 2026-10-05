@@ -61,7 +61,7 @@ export default function AdminScreen({ navigate }) {
           <Text style={styles.adminBadgeText}>🛡 Administrator</Text>
         </View>
 
-        <View style={styles.statsRow}>
+        <View style={styles.statsGrid}>
           <View style={styles.statBox}>
             <Text style={styles.statNumber}>{scans.length}</Text>
             <Text style={styles.statLabel}>Total{"\n"}Scans</Text>

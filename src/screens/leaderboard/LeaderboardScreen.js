@@ -80,7 +80,9 @@ export default function LeaderboardScreen({ navigate, user }) {
           setFlashedName(changedName);
           setTimeout(() => setFlashedName(null), 800);
         }
-      } catch {
+      } catch (error) {
+        // TEMP DIAGNOSTIC - remove once leaderboard loading is confirmed working.
+        console.log("[LeaderboardScreen] fetchLeaderboard failed:", error?.code, error?.message || error);
         if (mounted) setLoadError("Couldn't load the leaderboard. Pull to refresh.");
       } finally {
         if (mounted) setLoading(false);
@@ -135,7 +137,7 @@ export default function LeaderboardScreen({ navigate, user }) {
               <Text style={[styles.lbName, entry.isMe && styles.lbNameMe]}>
                 {entry.name}{entry.isMe ? "  (you)" : ""}
               </Text>
-              <Text style={styles.lbSub}>{category.format(entry[category.field])}</Text>
+              <Text style={styles.lbSub}>{entry.memberDays}d as a member</Text>
             </View>
             <View style={[styles.lbBadge, entry.rank === 1 && styles.lbBadgeGold]}>
               <Text style={[styles.lbBadgeText, entry.rank === 1 && styles.lbBadgeTextGold]}>

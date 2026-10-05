@@ -12,7 +12,6 @@ import {
 } from "react-native";
 import GoldCoin from "../../components/GoldCoin";
 import styles from "../../theme/styles";
-import { verifyAdminCode } from "../../api/client";
 
 function PasswordInput({ label, value, onChangeText, autoComplete }) {
   const [visible, setVisible] = useState(false);
@@ -49,8 +48,6 @@ export default function AuthScreen({ onSignIn, onSignUp, onGuest }) {
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
-  const [adminCode, setAdminCode] = useState("");
-  const [showAdminField, setShowAdminField] = useState(false);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
   const [offerSignUp, setOfferSignUp] = useState(false);
@@ -60,8 +57,6 @@ export default function AuthScreen({ onSignIn, onSignUp, onGuest }) {
     setConfirmPassword("");
     setError("");
     setOfferSignUp(false);
-    setShowAdminField(false);
-    setAdminCode("");
   }
 
   async function handleSubmit() {
@@ -75,12 +70,7 @@ export default function AuthScreen({ onSignIn, onSignUp, onGuest }) {
         if (password.length < 6) throw new Error("Password must be at least 6 characters.");
         if (!confirmPassword) throw new Error("Please confirm your password.");
         if (password !== confirmPassword) throw new Error("Passwords do not match.");
-        let role = "member";
-        if (adminCode) {
-          if (!(await verifyAdminCode(adminCode))) throw new Error("Invalid admin code.");
-          role = "admin";
-        }
-        await onSignUp(name.trim(), email.trim().toLowerCase(), password, role);
+        await onSignUp(name.trim(), email.trim().toLowerCase(), password);
       } else {
         if (!email.trim() || !password) throw new Error("Enter your email and password.");
         await onSignIn(email.trim().toLowerCase(), password);
@@ -104,7 +94,7 @@ export default function AuthScreen({ onSignIn, onSignUp, onGuest }) {
 
           <View style={styles.authTabRow}>
             {["signin", "signup"].map(t => (
-              <TouchableOpacity key={t} style={[styles.authTab, tab === t && styles.authTabActive]} onPress={() => { setTab(t); setConfirmPassword(""); setError(""); setShowAdminField(false); setAdminCode(""); }}>
+              <TouchableOpacity key={t} style={[styles.authTab, tab === t && styles.authTabActive]} onPress={() => { setTab(t); setConfirmPassword(""); setError(""); }}>
                 <Text style={[styles.authTabText, tab === t && styles.authTabTextActive]}>{t === "signin" ? "Sign In" : "Sign Up"}</Text>
               </TouchableOpacity>
             ))}
@@ -118,15 +108,6 @@ export default function AuthScreen({ onSignIn, onSignUp, onGuest }) {
             <PasswordInput key={tab} label="Password" value={password} onChangeText={setPassword} autoComplete={tab === "signup" ? "new-password" : "current-password"} />
             {tab === "signup" && (
               <PasswordInput label="Confirm Password" value={confirmPassword} onChangeText={setConfirmPassword} autoComplete="new-password" />
-            )}
-            {tab === "signup" && (
-              showAdminField ? (
-                <TextInput style={[styles.input, styles.inputAdmin]} placeholder="Admin code" placeholderTextColor="rgba(255,165,0,0.4)" value={adminCode} onChangeText={setAdminCode} autoCapitalize="none" />
-              ) : (
-                <TouchableOpacity onPress={() => setShowAdminField(true)}>
-                  <Text style={styles.adminCodeToggle}>Have an admin code?</Text>
-                </TouchableOpacity>
-              )
             )}
             {error ? <Text style={styles.authError}>{error}</Text> : null}
             {offerSignUp ? (

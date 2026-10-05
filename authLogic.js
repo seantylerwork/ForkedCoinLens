@@ -7,6 +7,12 @@ function isAdminUser(user) {
   return normalizeRole(user.role) === 'admin';
 }
 
+// auth user_metadata is writable by the signed-in user themselves
+// (supabase.auth.updateUser), so it must never be trusted for admin status -
+// every mapped user starts as 'member' here. The real role comes only from
+// the profiles table (see mergeProfileRole), which has no client UPDATE
+// policy and so can only be changed via the Supabase dashboard or the
+// server's service-role key.
 function mapSupabaseUser(supabaseUser) {
   if (!supabaseUser) return null;
   const metadata = supabaseUser.user_metadata || {};
@@ -14,9 +20,16 @@ function mapSupabaseUser(supabaseUser) {
     id: supabaseUser.id,
     name: metadata.display_name || metadata.name || supabaseUser.email || 'Member',
     email: supabaseUser.email || '',
-    role: normalizeRole(metadata.role) === 'admin' ? 'admin' : 'member',
+    role: 'member',
     createdAt: supabaseUser.created_at ? new Date(supabaseUser.created_at).getTime() : Date.now(),
   };
+}
+
+// Applies the authoritative role from the user's profiles row (fetched
+// separately, after auth) onto an already-mapped user.
+function mergeProfileRole(user, profileRole) {
+  if (!user) return user;
+  return { ...user, role: normalizeRole(profileRole) === 'admin' ? 'admin' : 'member' };
 }
 
 const FRIENDLY_AUTH_ERRORS = [
@@ -34,5 +47,6 @@ function friendlyAuthError(error) {
 module.exports = {
   isAdminUser,
   mapSupabaseUser,
+  mergeProfileRole,
   friendlyAuthError,
 };

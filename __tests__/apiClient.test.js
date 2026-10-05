@@ -105,11 +105,6 @@ for (const options of [{ token: null }, { sessionError: true }]) {
     assert.equal(calls.length, 0);
   });
 }
-test("public admin-code verification works before sign-in", async () => {
-  const { api, calls } = client({ token: null, data: { valid: true } });
-  assert.equal(await api.verifyAdminCode("test-code"), true);
-  assert.equal(calls.length, 1);
-});
 test("mvp string source signature remains supported", async () => {
   const { api, calls } = client();
   await api.identifyCoin("front", "back", "camera");
