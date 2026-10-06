@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import { SafeAreaView, ScrollView, Text, TouchableOpacity, View } from "react-native";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { RefreshControl, SafeAreaView, ScrollView, Text, TouchableOpacity, View } from "react-native";
 import Header from "../../components/Header";
 import styles from "../../theme/styles";
 import { fetchLeaderboard } from "../../api/scans";
@@ -51,48 +51,54 @@ export default function LeaderboardScreen({ navigate, user }) {
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
   const previousCountsRef = useRef({});
+  const requestId = useRef(0);
+  const hasLoadedOnce = useRef(false);
   const category = LB_CATEGORIES.find(c => c.key === cat);
 
-  useEffect(() => {
-    let mounted = true;
+  // silent=true (the 15s auto-refresh) updates data without flipping
+  // `loading`, so it doesn't flash the pull-to-refresh spinner on its own -
+  // that should only appear for the initial load and an explicit pull.
+  const refreshLeaderboard = useCallback(async ({ silent = false } = {}) => {
+    const current = ++requestId.current;
+    if (!silent) setLoading(true);
+    try {
+      const data = await fetchLeaderboard();
+      if (current !== requestId.current) return;
 
-    async function load() {
-      try {
-        const data = await fetchLeaderboard();
-        if (!mounted) return;
-
-        const previous = previousCountsRef.current;
-        const next = {};
-        let changedName = null;
-        data.forEach(row => {
-          const key = row.user_id || row.display_name;
-          next[key] = row.scan_count;
-          if (previous[key] != null && row.scan_count > previous[key]) {
-            changedName = row.display_name;
-          }
-        });
-        previousCountsRef.current = next;
-
-        setRows(data.map(row => mapRpcRow(row, user.id, user.name)));
-        setLastUpdated(new Date());
-        setLoadError("");
-        if (changedName) {
-          setFlashedName(changedName);
-          setTimeout(() => setFlashedName(null), 800);
+      const previous = previousCountsRef.current;
+      const next = {};
+      let changedName = null;
+      data.forEach(row => {
+        const key = row.user_id || row.display_name;
+        next[key] = row.scan_count;
+        if (previous[key] != null && row.scan_count > previous[key]) {
+          changedName = row.display_name;
         }
-      } catch (error) {
-        // TEMP DIAGNOSTIC - remove once leaderboard loading is confirmed working.
-        console.log("[LeaderboardScreen] fetchLeaderboard failed:", error?.code, error?.message || error);
-        if (mounted) setLoadError("Couldn't load the leaderboard. Pull to refresh.");
-      } finally {
-        if (mounted) setLoading(false);
+      });
+      previousCountsRef.current = next;
+
+      setRows(data.map(row => mapRpcRow(row, user.id, user.name)));
+      setLastUpdated(new Date());
+      setLoadError("");
+      if (changedName) {
+        setFlashedName(changedName);
+        setTimeout(() => setFlashedName(null), 800);
+      }
+    } catch {
+      if (current === requestId.current) setLoadError("Couldn't load the leaderboard. Pull to refresh.");
+    } finally {
+      if (current === requestId.current) {
+        setLoading(false);
+        hasLoadedOnce.current = true;
       }
     }
+  }, [user.id, user.name]);
 
-    load();
-    const id = setInterval(load, REFRESH_INTERVAL_MS);
-    return () => { mounted = false; clearInterval(id); };
-  }, [user.id]);
+  useEffect(() => {
+    void refreshLeaderboard();
+    const id = setInterval(() => refreshLeaderboard({ silent: true }), REFRESH_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [refreshLeaderboard]);
 
   const all = rows
     .map(withAvgValue)
@@ -107,7 +113,10 @@ export default function LeaderboardScreen({ navigate, user }) {
   return (
     <SafeAreaView style={styles.safeArea}>
       <Header title="Leaderboard" onBack={() => navigate("home")} />
-      <ScrollView contentContainerStyle={styles.accountContainer}>
+      <ScrollView
+        contentContainerStyle={styles.accountContainer}
+        refreshControl={<RefreshControl refreshing={loading} onRefresh={() => refreshLeaderboard()} tintColor="#FFD700" />}
+      >
         <View style={styles.lbLiveRow}>
           <View style={styles.lbLiveDot} />
           <Text style={styles.lbLiveText}>LIVE</Text>
@@ -122,7 +131,7 @@ export default function LeaderboardScreen({ navigate, user }) {
           ))}
         </View>
 
-        {loading ? (
+        {loading && !hasLoadedOnce.current ? (
           <Text style={styles.searchEmpty}>Loading leaderboard…</Text>
         ) : loadError ? (
           <Text style={styles.searchEmpty}>{loadError}</Text>

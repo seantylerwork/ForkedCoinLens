@@ -286,6 +286,24 @@ const styles = StyleSheet.create({
   recentName: { fontSize: 16, fontWeight: "700", color: GOLD },
   recentDetail: { fontSize: 13, color: "rgba(255,215,0,0.5)", marginTop: 2 },
 
+  // Ad banner - reserved space only, no ad network wired up yet.
+  adBanner: {
+    minHeight: 50,
+    borderTopWidth: 1,
+    borderTopColor: "rgba(255,215,0,0.15)",
+    backgroundColor: "#0a0a0a",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 10,
+  },
+  adBannerText: {
+    fontSize: 11,
+    fontWeight: "600",
+    color: "rgba(255,215,0,0.35)",
+    letterSpacing: 1,
+    textTransform: "uppercase",
+  },
+
   // Shared
   bigIcon: { fontSize: 80, textAlign: "center" },
   pageTitle: { fontSize: 32, fontWeight: "800", color: GOLD, marginTop: 8 },

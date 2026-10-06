@@ -59,7 +59,7 @@ const SCAN_TRAIL_OUTPUT_RANGE = [0, 0.707, 1, 0.707, 0].map(
   t => SCAN_TRAIL_MIN + (SCAN_TRAIL_MAX - SCAN_TRAIL_MIN) * t
 );
 
-export default function ScanScreen({ navigate, user, onScanSaved }) {
+export default function ScanScreen({ navigate, user, onScanSaved, isGuest }) {
   const [permission, requestPermission] = useCameraPermissions();
   const [phase, setPhase] = useState("choose"); // choose | scanning | loading | result | error | unidentifiable
   const [captureStage, setCaptureStage] = useState("front");
@@ -107,8 +107,13 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
         // `height` interpolation, which the native driver can't run - both
         // interpolations have to stay on the JS thread to share one value.
         useNativeDriver: false,
-      }).start(({ finished }) => {
-        if (finished) sweep(!down);
+      }).start(() => {
+        // Always continue, even if this leg was interrupted (finished:
+        // false) rather than completing naturally - e.g. a re-render during
+        // a scan error/retry cycle. Only `active` (set false on unmount)
+        // should ever permanently stop the sweep; anything else should
+        // self-heal into the next leg instead of silently dying.
+        sweep(!down);
       });
     }
 
@@ -141,6 +146,23 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
     setListingLoading(false);
     setSelectedUpload(null);
     setShowDetails(false);
+  }
+
+  // Guest mode lets someone capture photos (so "Use as Guest" isn't a dead
+  // button), but identification always requires a signed-in user server-side
+  // - so rather than let a guest take both photos and then hit a generic
+  // auth error, this intercepts right before the identify call with an
+  // honest, actionable prompt. "Back to Home" in guest mode routes to
+  // exitGuest(), which lands them on the sign-in screen.
+  function promptGuestSignIn() {
+    setErrorDetail({
+      icon: "!",
+      title: "Sign In to See Results",
+      body: "Your photo looks good! Sign in or create a free account to identify this coin and see its value.",
+      tip: null,
+      retryable: false,
+    });
+    setPhase("error");
   }
 
   async function capturePhoto() {
@@ -191,6 +213,10 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
       if (!identifyArgs) {
         throw new ScanError("photo", "Both sides of the coin are needed. Please start the scan again.");
       }
+      if (isGuest) {
+        promptGuestSignIn();
+        return;
+      }
       setLoadingStep("Identifying the coin from both sides...");
       const coinLensResult = await identifyCoin(...identifyArgs);
       const legacyResult = toLegacyScanResult(coinLensResult);
@@ -200,7 +226,7 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
       if (!isCurrentScan(scanIdRef.current, scanId)) return;
 
       if (coinData.identifiable === false) {
-        setErrorDetail({ icon: "!", title: "Coin Not Recognized", body: coinData.unidentifiable_reason || "CoinLens could not identify this coin.", tip: null });
+        setErrorDetail({ icon: "!", title: "Coin Not Recognized", body: coinData.unidentifiable_reason || "Obverse could not identify this coin.", tip: null });
         setPhase("unidentifiable");
         return;
       }
@@ -233,36 +259,47 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
   }, [flashActive, flashAnim]);
 
   async function uploadPhoto() {
-    const permissionResult = await ImagePicker.requestMediaLibraryPermissionsAsync(false);
-    if (!permissionResult.granted) {
-      setErrorDetail(makeErrorDetail(new ScanError(
-        "permission",
-        permissionResult.canAskAgain
-          ? "Photo access is needed to upload a coin image. Tap Upload Photo again to retry."
-          : "Photo access is blocked. Enable Photos access for CoinLens in your device settings."
-      )));
+    try {
+      const permissionResult = await ImagePicker.requestMediaLibraryPermissionsAsync(false);
+      if (!permissionResult.granted) {
+        setErrorDetail(makeErrorDetail(new ScanError(
+          "permission",
+          permissionResult.canAskAgain
+            ? "Photo access is needed to upload a coin image. Tap Upload Photo again to retry."
+            : "Photo access is blocked. Enable Photos access for Obverse in your device settings."
+        )));
+        setPhase("error");
+        return;
+      }
+
+      const photo = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ["images"],
+        allowsMultipleSelection: false,
+        base64: true,
+        quality: 0.92,
+      });
+
+      if (photo.canceled || !photo.assets?.[0]?.base64) {
+        return;
+      }
+
+      setSelectedUpload(photo.assets[0]);
+    } catch (e) {
+      // Without this, a thrown permission/picker error silently does
+      // nothing - the button looks unresponsive instead of showing a cause.
+      setErrorDetail(makeErrorDetail(e));
       setPhase("error");
-      return;
     }
-
-    const photo = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ["images"],
-      allowsMultipleSelection: false,
-      base64: true,
-      quality: 0.92,
-    });
-
-    if (photo.canceled || !photo.assets?.[0]?.base64) {
-      return;
-    }
-
-    setSelectedUpload(photo.assets[0]);
   }
 
   async function startUploadedPhotoScan() {
     if (!selectedUpload?.base64) {
       setErrorDetail(makeErrorDetail(new ScanError("photo", "Choose a photo before starting the scan.")));
       setPhase("error");
+      return;
+    }
+    if (isGuest) {
+      promptGuestSignIn();
       return;
     }
 
@@ -405,7 +442,7 @@ export default function ScanScreen({ navigate, user, onScanSaved }) {
   }
 
   if (phase === "unidentifiable") {
-    const ed = errorDetail ?? { icon: "!", title: "Coin Not Recognized", body: "CoinLens could not identify this coin.", tip: null };
+    const ed = errorDetail ?? { icon: "!", title: "Coin Not Recognized", body: "Obverse could not identify this coin.", tip: null };
     return (
       <SafeAreaView style={styles.safeArea}>
         <Header title="Scan Coin" onBack={() => navigate("home")} />

@@ -100,7 +100,13 @@ export default function App() {
   }
 
   async function signOut() {
-    await supabase.auth.signOut();
+    try {
+      await supabase.auth.signOut();
+    } catch {
+      // Local session state is cleared below regardless - a thrown error
+      // here (e.g. network failure invalidating the remote session) must
+      // not leave Sign Out looking like it did nothing.
+    }
     setScreen("home");
   }
 
@@ -127,7 +133,7 @@ export default function App() {
   }
 
   if (isGuest) {
-    return <ScanScreen navigate={(target) => (target === "home" ? exitGuest() : navigate(target))} user={{ name: "Guest" }} />;
+    return <ScanScreen navigate={(target) => (target === "home" ? exitGuest() : navigate(target))} user={{ name: "Guest" }} isGuest />;
   }
 
   if (!user) return <AuthScreen onSignIn={signIn} onSignUp={signUp} onGuest={continueAsGuest} />;

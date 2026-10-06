@@ -17,7 +17,7 @@ export default function HomeScreen({ navigate, userScans }) {
 
   return (
     <SafeAreaView style={styles.safeArea}>
-      <Header title="CoinLens" showCoin onAccount={() => navigate("account")} />
+      <Header title="Obverse" showCoin onAccount={() => navigate("account")} />
       <ScrollView contentContainerStyle={styles.homeContainer}>
         <Text style={styles.homeGreeting}>What would you like to do?</Text>
         {cards.map(card => (
@@ -46,6 +46,11 @@ export default function HomeScreen({ navigate, userScans }) {
           </View>
         ))}
       </ScrollView>
+
+      {/* Reserved banner ad space - placeholder only, no ad network wired up. */}
+      <View style={styles.adBanner}>
+        <Text style={styles.adBannerText}>Advertisement</Text>
+      </View>
     </SafeAreaView>
   );
 }

@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { SafeAreaView, ScrollView, Text, View } from "react-native";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { RefreshControl, SafeAreaView, ScrollView, Text, View } from "react-native";
 import Header from "../components/Header";
 import styles from "../theme/styles";
 import { BADGES, BADGE_CATEGORIES } from "./badges";
@@ -9,37 +9,42 @@ export default function BadgesScreen({ navigate }) {
   const [earned, setEarned] = useState(new Set());
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState("");
+  const requestId = useRef(0);
+  const hasLoadedOnce = useRef(false);
 
-  useEffect(() => {
-    let mounted = true;
-
-    async function load() {
-      try {
-        const { earned_badge_ids } = await fetchMyBadges();
-        if (mounted) {
-          setEarned(new Set(earned_badge_ids || []));
-          setLoadError("");
-        }
-      } catch (error) {
-        // TEMP DIAGNOSTIC - remove once badges loading is confirmed working.
-        console.log("[BadgesScreen] fetchMyBadges failed:", error?.code, error?.message || error);
-        if (mounted) setLoadError("Couldn't load your badges. Pull to refresh.");
-      } finally {
-        if (mounted) setLoading(false);
+  const refreshBadges = useCallback(async () => {
+    const current = ++requestId.current;
+    setLoading(true);
+    try {
+      const { earned_badge_ids } = await fetchMyBadges();
+      if (current === requestId.current) {
+        setEarned(new Set(earned_badge_ids || []));
+        setLoadError("");
+      }
+    } catch {
+      if (current === requestId.current) setLoadError("Couldn't load your badges. Pull to refresh.");
+    } finally {
+      if (current === requestId.current) {
+        setLoading(false);
+        hasLoadedOnce.current = true;
       }
     }
-
-    load();
-    return () => { mounted = false; };
   }, []);
+
+  useEffect(() => {
+    void refreshBadges();
+  }, [refreshBadges]);
 
   const earnedCount = earned.size;
 
   return (
     <SafeAreaView style={styles.safeArea}>
       <Header title="Badges" onBack={() => navigate("home")} />
-      <ScrollView contentContainerStyle={styles.badgesScroll}>
-        {loading ? (
+      <ScrollView
+        contentContainerStyle={styles.badgesScroll}
+        refreshControl={<RefreshControl refreshing={loading} onRefresh={refreshBadges} tintColor="#FFD700" />}
+      >
+        {loading && !hasLoadedOnce.current ? (
           <Text style={styles.searchEmpty}>Loading badges…</Text>
         ) : loadError ? (
           <Text style={styles.searchEmpty}>{loadError}</Text>

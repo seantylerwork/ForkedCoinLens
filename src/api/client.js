@@ -17,7 +17,7 @@ function resolveApiBaseUrl() {
 }
 
 export const API_BASE_URL = resolveApiBaseUrl();
-console.log("CoinLens API base URL:", API_BASE_URL);
+console.log("Obverse API base URL:", API_BASE_URL);
 
 // General Flask fetch wrapper. Protected scan and listing requests use
 // authenticatedRequest below to reject missing sessions before network access. Reads the
@@ -43,7 +43,7 @@ function throwForErrorResponse(res, data) {
   if (res.ok) return;
 
   const code = data?.error?.code || (res.status === 401 ? "auth_invalid" : res.status >= 500 ? "server_error" : "unknown");
-  const message = data?.error?.message || `CoinLens request failed (HTTP ${res.status}).`;
+  const message = data?.error?.message || `Obverse request failed (HTTP ${res.status}).`;
   const retryAfterSeconds = typeof data?.error?.retry_after_seconds === "number"
     ? data.error.retry_after_seconds
     : undefined;
@@ -81,7 +81,7 @@ export async function authenticatedRequest(path, { method = "GET", body, acceptR
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
   } catch {
-    throw new ScanError("network", "No internet connection. Could not reach CoinLens.");
+    throw new ScanError("network", "No internet connection. Could not reach Obverse.");
   }
 
   const data = await readJsonResponse(res);
@@ -140,7 +140,7 @@ export async function getMe() {
   try {
     res = await apiFetch(`/api/me`);
   } catch {
-    throw new ScanError("network", "No internet connection. Could not reach CoinLens.");
+    throw new ScanError("network", "No internet connection. Could not reach Obverse.");
   }
   const data = await readJsonResponse(res);
   throwForErrorResponse(res, data);
@@ -156,7 +156,7 @@ export async function fetchMyBadges() {
   try {
     res = await apiFetch(`/api/badges/me`);
   } catch {
-    throw new ScanError("network", "No internet connection. Could not reach CoinLens.");
+    throw new ScanError("network", "No internet connection. Could not reach Obverse.");
   }
   const data = await readJsonResponse(res);
   throwForErrorResponse(res, data);
@@ -171,7 +171,7 @@ export async function postTestScan() {
   try {
     res = await apiFetch(`/api/test-scan`, { method: "POST" });
   } catch {
-    throw new ScanError("network", "No internet connection. Could not reach CoinLens.");
+    throw new ScanError("network", "No internet connection. Could not reach Obverse.");
   }
   const data = await readJsonResponse(res);
   try {

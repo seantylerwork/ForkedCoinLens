@@ -31,7 +31,7 @@ export const BADGES = [
   { id: "worth_500000", icon: "🦅", name: "Half Million",       desc: "Reach $500,000 in collection value", category: "Net Worth" },
   { id: "worth_1m",     icon: "👁️", name: "The Million",        desc: "Reach $1,000,000 in collection value",category:"Net Worth" },
   // — Membership milestones
-  { id: "mem_join", icon: "👋", name: "Welcome",                desc: "Join CoinLens",                      category: "Member" },
+  { id: "mem_join", icon: "👋", name: "Welcome",                desc: "Join Obverse",                       category: "Member" },
   { id: "mem_7",    icon: "📅", name: "One Week",               desc: "Be a member for 7 days",             category: "Member" },
   { id: "mem_30",   icon: "📆", name: "One Month",              desc: "Be a member for 30 days",            category: "Member" },
   { id: "mem_180",  icon: "🗓️", name: "Half Year",              desc: "Be a member for 180 days",           category: "Member" },

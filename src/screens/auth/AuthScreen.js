@@ -89,7 +89,7 @@ export default function AuthScreen({ onSignIn, onSignUp, onGuest }) {
         <ScrollView contentContainerStyle={styles.authContainer} keyboardShouldPersistTaps="handled">
           <View style={styles.authLogoRow}>
             <GoldCoin size={52} />
-            <Text style={styles.authAppTitle}>CoinLens</Text>
+            <Text style={styles.authAppTitle}>Obverse</Text>
           </View>
 
           <View style={styles.authTabRow}>
@@ -122,7 +122,7 @@ export default function AuthScreen({ onSignIn, onSignUp, onGuest }) {
             </TouchableOpacity>
             <TouchableOpacity style={styles.guestBtn} onPress={onGuest}>
               <Text style={styles.guestBtnText}>Use as Guest</Text>
-              <Text style={styles.guestBtnSubtext}>Scan a coin without an account — everything else requires signing in.</Text>
+              <Text style={styles.guestBtnSubtext}>Try the camera without an account — sign in to identify a coin and see its value.</Text>
             </TouchableOpacity>
           </View>
         </ScrollView>
