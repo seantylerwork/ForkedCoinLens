@@ -110,6 +110,79 @@ class CoinLensApiTests(unittest.TestCase):
         self.assertEqual(body["has_numista_key"], False)
         self.assertEqual(body["has_pcgs_token"], False)
         self.assertEqual(body["has_sheetdb"], False)
+        self.assertEqual(body["mock_reason"], ["MOCK_MODE", "no OPENAI_API_KEY"])
+
+    # -- /api/health diagnostics ------------------------------------------
+
+    HEALTH_SECRETS = {
+        "openai": "sk-test-openai-secret-value",
+        "numista": "numista-secret-value",
+        "pcgs": "pcgs-secret-value",
+        "service_role": "service-role-secret-value",
+        "sheetdb": "https://sheetdb.io/api/v1/secret-sheet-id",
+    }
+
+    def _get_health(self, openai_key="", mock_mode=False, use_mock=False, service_role_key="",
+                    supabase_url="https://abcdefgh.supabase.co", render_env=None):
+        coinlens_app.OPENAI_API_KEY = openai_key
+        coinlens_app.MOCK_MODE = mock_mode
+        coinlens_app.USE_MOCK_COIN_RESPONSE = use_mock
+        coinlens_app.NUMISTA_API_KEY = self.HEALTH_SECRETS["numista"]
+        coinlens_app.PCGS_BEARER_TOKEN = self.HEALTH_SECRETS["pcgs"]
+        coinlens_app.SHEETDB_URL = self.HEALTH_SECRETS["sheetdb"]
+        coinlens_app.DAILY_SCAN_LIMIT = 7
+        env = {"RENDER_GIT_COMMIT": "", "RENDER_GIT_BRANCH": ""}
+        env.update(render_env or {})
+        with mock.patch.object(coinlens_app.supabase_admin, "SUPABASE_URL", supabase_url), \
+             mock.patch.object(coinlens_app.supabase_admin, "SUPABASE_SERVICE_ROLE_KEY", service_role_key), \
+             mock.patch.object(coinlens_app, "OPENAI_MODEL", "gpt-5-mini"), \
+             mock.patch.dict(os.environ, env):
+            response = self.client.get("/api/health")
+        self.assertEqual(response.status_code, 200)
+        return response
+
+    def test_health_reports_each_mock_cause_with_every_diagnostic_field(self):
+        key = self.HEALTH_SECRETS["openai"]
+        cases = [
+            ("not mock", dict(openai_key=key), []),
+            ("MOCK_MODE", dict(openai_key=key, mock_mode=True), ["MOCK_MODE"]),
+            ("USE_MOCK_COIN_RESPONSE", dict(openai_key=key, use_mock=True), ["USE_MOCK_COIN_RESPONSE"]),
+            ("no OPENAI_API_KEY", dict(openai_key=""), ["no OPENAI_API_KEY"]),
+            ("all causes", dict(openai_key="", mock_mode=True, use_mock=True),
+             ["MOCK_MODE", "USE_MOCK_COIN_RESPONSE", "no OPENAI_API_KEY"]),
+        ]
+        for label, kwargs, expected_reasons in cases:
+            with self.subTest(label):
+                response = self._get_health(
+                    service_role_key=self.HEALTH_SECRETS["service_role"],
+                    render_env={"RENDER_GIT_COMMIT": "0123456789abcdef0123", "RENDER_GIT_BRANCH": "main"},
+                    **kwargs,
+                )
+                body = response.get_json()
+                self.assertEqual(body["mock_reason"], expected_reasons)
+                self.assertEqual(body["mock_mode"], bool(expected_reasons))
+                self.assertEqual(body["openai_model"], "gpt-5-mini")
+                self.assertIs(body["has_service_role_key"], True)
+                self.assertEqual(body["supabase_host"], "abcdefgh.supabase.co")
+                self.assertEqual(body["git_commit"], "0123456")
+                self.assertEqual(body["git_branch"], "main")
+                self.assertEqual(body["daily_scan_limit"], 7)
+                for secret in self.HEALTH_SECRETS.values():
+                    self.assertNotIn(secret, response.get_data(as_text=True))
+
+    def test_health_reports_null_git_fields_and_missing_supabase_config(self):
+        response = self._get_health(openai_key=self.HEALTH_SECRETS["openai"], service_role_key="", supabase_url="")
+        body = response.get_json()
+
+        self.assertIsNone(body["git_commit"])
+        self.assertIsNone(body["git_branch"])
+        self.assertIs(body["has_service_role_key"], False)
+        self.assertIsNone(body["supabase_host"])
+
+    def test_health_supabase_host_drops_path_and_query(self):
+        response = self._get_health(supabase_url="https://abcdefgh.supabase.co/rest/v1?apikey=leak")
+        self.assertEqual(response.get_json()["supabase_host"], "abcdefgh.supabase.co")
+        self.assertNotIn("leak", response.get_data(as_text=True))
 
     def test_identify_coin_missing_image(self):
         self._authenticate()
@@ -740,6 +813,98 @@ class CoinLensApiTests(unittest.TestCase):
             for message in logs.output
         ))
 
+    # -- one outcome summary line per identify attempt ---------------------
+
+    def _identify_with_model_output(self, model_output, source="camera", back_image=True):
+        """Runs the real identify route (normalize + evidence gate) against a
+        mocked OpenAI response and returns (response, outcome log lines)."""
+        self._authenticate()
+        coinlens_app.OPENAI_API_KEY = "test-key"
+        self.mock_persisted_scan()
+        payload = {"front_image": JPEG_BASE64, "source": source}
+        if back_image:
+            payload["back_image"] = JPEG_BASE64
+
+        with mock.patch.object(coinlens_app.requests, "post") as mock_post, \
+             mock.patch.object(coinlens_app, "count_api_usage_since", return_value=0), \
+             mock.patch.object(coinlens_app, "insert_api_usage", return_value={"id": "usage-1"}), \
+             mock.patch.object(coinlens_app, "update_api_usage"):
+            mock_post.return_value = mock.Mock(
+                ok=True, status_code=200,
+                json=lambda: {"status": "completed", "output_text": json.dumps(model_output)},
+            )
+            with self.assertLogs(coinlens_app.app.logger, level="INFO") as logs:
+                response = self.client.post("/api/identify-coin", json=payload, headers=self.auth_headers)
+
+        outcome_lines = [record.getMessage() for record in logs.records
+                         if record.getMessage().startswith("[identify] outcome=")]
+        return response, outcome_lines
+
+    def _canada_dollar(self, **overrides):
+        identification = {
+            "status": "identified", "coin_name": "2016 Canada 1 Dollar",
+            "country": "Canada", "denomination": "1 dollar", "year": "2016",
+            "mint_mark": None, "variant": "ordinary", "estimated_grade": "AU-50", "confidence": 90,
+            "description": "", "mint_errors": [], "varieties": None,
+            "error_premium": False, "special_notes": "", "unidentifiable_reason": None,
+            "alternatives": [],
+            "observations": grounded_observations(
+                "ELIZABETH II D G REGINA", "CANADA DOLLAR 2016", ["2016"], "CANADA", "DOLLAR", "2016",
+            ),
+        }
+        identification.update(overrides)
+        return identification
+
+    def test_identify_outcome_line_for_identified_scan(self):
+        response, lines = self._identify_with_model_output(self._canada_dollar())
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(lines, [
+            "[identify] outcome=identified source=camera images=2 stage=none confidence=90 reasons="
+        ])
+
+    def test_identify_outcome_line_for_model_uncertain_scan(self):
+        reason = "The date is too worn to read. " * 20
+        response, lines = self._identify_with_model_output(
+            self._canada_dollar(status="uncertain", confidence=25, year="Unknown", unidentifiable_reason=reason),
+            source="gallery", back_image=False,
+        )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(len(lines), 1)
+        self.assertTrue(lines[0].startswith(
+            "[identify] outcome=rejected source=gallery images=1 stage=model_uncertain confidence=25 reasons= "
+            "model_reason='The date is too worn"
+        ))
+        self.assertIn(f"model_reason={reason[:200]!r}", lines[0])
+        self.assertNotIn(reason[:201], lines[0])
+
+    def test_identify_outcome_line_for_low_confidence_scan(self):
+        response, lines = self._identify_with_model_output(self._canada_dollar(confidence=30))
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(lines, [
+            "[identify] outcome=rejected source=camera images=2 stage=low_confidence confidence=30 reasons= "
+            "model_reason=''"
+        ])
+
+    def test_identify_outcome_line_for_gate_rejection(self):
+        observations = grounded_observations(
+            "ELIZABETH II D G REGINA", "DOLLAR 2016", ["2016"], "", "DOLLAR", "2016",
+        )
+        observations["country_evidence"] = {"basis": "design_recognition", "visible_text": ""}
+        response, lines = self._identify_with_model_output(self._canada_dollar(observations=observations))
+
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(lines, [
+            "[identify] outcome=rejected source=camera images=2 stage=gate confidence=90 "
+            "reasons=country is not supported by legible evidence (basis=design_recognition) model_reason=''"
+        ])
+        # The response is unchanged apart from the extra diagnostics record.
+        body = response.get_json()
+        self.assertFalse(body["identification"]["identifiable"])
+        self.assertEqual(body["identification"]["rejection"]["stage"], "gate")
+
     def test_identify_coin_sends_headroom_for_reasoning_tokens(self):
         """max_output_tokens must leave room for reasoning-capable models to
         spend part of the budget on hidden reasoning before the final JSON -
@@ -889,11 +1054,69 @@ class CoinLensApiTests(unittest.TestCase):
         self.assertFalse(body["identification"]["identifiable"])
         self.assertNotEqual(body.get("error", {}).get("code"), "ai_incomplete")
 
+    def _sent_identify_payload(self, model, reasoning_effort="low"):
+        """Posts one identify request with OPENAI_MODEL/OPENAI_REASONING_EFFORT
+        pinned and returns the JSON payload sent to OpenAI."""
+        self._authenticate()
+        coinlens_app.OPENAI_API_KEY = "test-key"
+        self.mock_persisted_scan()
+        with mock.patch.object(coinlens_app, "OPENAI_MODEL", model), \
+             mock.patch.object(coinlens_app, "OPENAI_REASONING_EFFORT", reasoning_effort), \
+             mock.patch.object(coinlens_app.requests, "post") as mock_post, \
+             mock.patch.object(coinlens_app, "count_api_usage_since", return_value=0), \
+             mock.patch.object(coinlens_app, "insert_api_usage", return_value={"id": "usage-1"}), \
+             mock.patch.object(coinlens_app, "update_api_usage"):
+            mock_post.return_value = mock.Mock(
+                ok=True, status_code=200,
+                json=lambda: {"status": "completed", "output_text": json.dumps(self._canada_dollar())},
+            )
+            self.client.post(
+                "/api/identify-coin",
+                json={"front_image": JPEG_BASE64, "source": "camera"},
+                headers=self.auth_headers,
+            )
+        return mock_post.call_args.kwargs["json"]
+
+    def test_identify_coin_omits_reasoning_for_gpt_4o_mini(self):
+        payload = self._sent_identify_payload("gpt-4o-mini")
+        self.assertEqual(payload["model"], "gpt-4o-mini")
+        self.assertNotIn("reasoning", payload)
+
+    def test_identify_coin_omits_reasoning_for_other_non_reasoning_models(self):
+        for model in ("gpt-4.1", "GPT-4o", "gpt-3.5-turbo"):
+            with self.subTest(model):
+                self.assertNotIn("reasoning", self._sent_identify_payload(model))
+
+    def test_identify_coin_sends_low_reasoning_effort_for_a_reasoning_model(self):
+        payload = self._sent_identify_payload("gpt-5-mini")
+        self.assertEqual(payload["reasoning"], {"effort": "low"})
+
+    def test_identify_coin_omits_reasoning_when_effort_is_none_or_empty(self):
+        for effort in ("none", "NONE", "", "  "):
+            with self.subTest(effort=effort):
+                self.assertNotIn("reasoning", self._sent_identify_payload("gpt-5-mini", effort))
+
+    def test_health_reports_effective_reasoning_effort(self):
+        cases = [("gpt-5-mini", "low", "low"), ("gpt-5-mini", "Medium", "medium"),
+                 ("gpt-4o-mini", "low", None), ("gpt-5-mini", "none", None), ("gpt-5-mini", "", None)]
+        for model, effort, expected in cases:
+            with self.subTest(model=model, effort=effort):
+                with mock.patch.object(coinlens_app, "OPENAI_MODEL", model), \
+                     mock.patch.object(coinlens_app, "OPENAI_REASONING_EFFORT", effort):
+                    body = self.client.get("/api/health").get_json()
+                self.assertEqual(body["openai_model"], model)
+                self.assertEqual(body["openai_reasoning_effort"], expected)
+
     def test_identify_coin_sends_low_reasoning_effort(self):
         """The model's default reasoning effort consumed the entire
         max_output_tokens budget on a real scan - explicitly request low
-        effort rather than relying on whatever the default is."""
+        effort rather than relying on whatever the default is. Pinned to a
+        reasoning model: non-reasoning models never get the parameter."""
         self._authenticate()
+        for name, value in (("OPENAI_MODEL", "gpt-5-mini"), ("OPENAI_REASONING_EFFORT", "low")):
+            patcher = mock.patch.object(coinlens_app, name, value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
         coinlens_app.OPENAI_API_KEY = "test-key"
         self.mock_persisted_scan()
 
